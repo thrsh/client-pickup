@@ -1,0 +1,46 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    @apply bg-ledger-paper;
+  }
+  body {
+    @apply bg-white text-ink-900 font-body antialiased;
+    min-height: 100vh;
+  }
+  h1, h2, h3, h4 {
+    @apply font-display;
+  }
+  ::selection {
+    @apply bg-ledger-stamp/20;
+  }
+}
+
+@layer components {
+  .perforated {
+    background-image: radial-gradient(circle, rgba(18,35,61,0.16) 1.4px, transparent 1.4px);
+    background-size: 10px 10px;
+    background-position: center;
+  }
+
+  .stamp {
+    @apply relative inline-flex items-center gap-1.5 rounded-sm border-2 px-2.5 py-0.5 font-mono text-[11px] font-semibold uppercase tracking-widest;
+    transform: rotate(-2deg);
+  }
+}
+
+/* subtle focus ring for accessibility */
+:focus-visible {
+  outline: 2px solid #0f8c82;
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
