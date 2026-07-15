@@ -2,14 +2,10 @@ import React, { useEffect, useRef, useState } from 'react'
 import {
   Search,
   X,
-  Loader2,
-  Package,
-  Truck,
   MapPin,
   ArrowRight,
   Clock,
   Navigation,
-  CheckCircle2,
   Frown,
   Sparkles
 } from 'lucide-react'
@@ -17,15 +13,13 @@ import { supabase } from '../lib/supabaseClient'
 import { Input } from '../components/ui/input'
 
 const SUGGESTION_MIN_CHARS = 3
-const MAX_RESERVE_BATCH = 500
+const MAX_RESULTS = 500
 
 export default function PublicSearch() {
   const [payeeQuery, setPayeeQuery] = useState('')
   const [payorQuery, setPayorQuery] = useState('')
   const [matchedCount, setMatchedCount] = useState(0)
-  const [matchedIds, setMatchedIds] = useState([])
   const [loading, setLoading] = useState(false)
-  const [hasSearched, setHasSearched] = useState(false)
 
   const [payeeSuggestions, setPayeeSuggestions] = useState([])
   const [showPayeeSuggestions, setShowPayeeSuggestions] = useState(false)
@@ -34,12 +28,6 @@ export default function PublicSearch() {
   const [payorSuggestions, setPayorSuggestions] = useState([])
   const [showPayorSuggestions, setShowPayorSuggestions] = useState(false)
   const payorBoxRef = useRef(null)
-
-  const [showConfirm, setShowConfirm] = useState(false)
-  const [collectorName, setCollectorName] = useState('')
-  const [reserving, setReserving] = useState(false)
-  const [reserveError, setReserveError] = useState('')
-  const [successInfo, setSuccessInfo] = useState(null)
 
   // Live suggestions effects
   useEffect(() => {
@@ -77,36 +65,31 @@ export default function PublicSearch() {
     return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [])
 
-  // Search logic and Supabase queries
+  // Search logic and Supabase queries (read-only: no reservation RPCs)
   async function fetchMatchCount(payeeTerm, payorTerm) {
     const payee = payeeTerm.trim()
     const payor = payorTerm.trim()
 
     if (!payee && !payor) {
       setMatchedCount(0)
-      setMatchedIds([])
       setLoading(false)
       return
     }
 
     setLoading(true)
-    setReserveError('')
-
-    await supabase.rpc('reclaim_expired_reservations')
 
     let req = supabase
       .from('checks')
-      .select('id', { count: 'exact' })
+      .select('id', { count: 'exact', head: true })
       .eq('status', 'available')
-      .limit(MAX_RESERVE_BATCH)
+      .limit(MAX_RESULTS)
 
     if (payee) req = req.ilike('payee', `%${payee}%`)
     if (payor) req = req.ilike('payor', payor)
 
-    const { data, count: total, error } = await req
+    const { count: total, error } = await req
 
     if (!error) {
-      setMatchedIds((data || []).map((r) => r.id))
       setMatchedCount(total || 0)
     }
     setLoading(false)
@@ -148,8 +131,6 @@ export default function PublicSearch() {
     if (!payeeQuery.trim() || !payorQuery.trim()) return
     setShowPayeeSuggestions(false)
     setShowPayorSuggestions(false)
-    setHasSearched(true)
-    setSuccessInfo(null)
     fetchMatchCount(payeeQuery, payorQuery)
   }
 
@@ -178,69 +159,22 @@ export default function PublicSearch() {
     setShowPayeeSuggestions(false)
     setShowPayorSuggestions(false)
     setMatchedCount(0)
-    setMatchedIds([])
-    setHasSearched(false)
-  }
-
-  function openConfirm() {
-    if (matchedCount === 0) return
-    setReserveError('')
-    setShowConfirm(true)
-  }
-
-  async function confirmPickup() {
-    if (!collectorName.trim()) {
-      setReserveError('Please enter your name to continue.')
-      return
-    }
-    setReserving(true)
-    setReserveError('')
-
-    const { data, error } = await supabase.rpc('create_reservation', {
-      p_check_ids: matchedIds,
-      p_collector_name: collectorName.trim(),
-    })
-
-    setReserving(false)
-
-    if (error) {
-      setReserveError(error.message || 'Something went wrong. Please try again.')
-      return
-    }
-
-    const result = Array.isArray(data) ? data[0] : data
-    setSuccessInfo({
-      count: matchedCount,
-      expiresAt: result?.expires_at,
-      collectorName: collectorName.trim(),
-    })
-    setShowConfirm(false)
-    setCollectorName('')
-    fetchMatchCount(payeeQuery, payorQuery)
   }
 
   const hasQueryText = !!(payeeQuery.trim() && payorQuery.trim())
 
   return (
-    <div className="psp-page rider-app min-h-screen pb-32 relative overflow-hidden">
+    <div className="psp-page rider-app min-h-screen pb-16 relative overflow-hidden">
       <PageStyles />
       <BackgroundGeometry />
 
       <div className="relative z-10">
-
         <div className="mx-auto max-w-5xl px-4 pt-6 sm:px-6 sm:pt-10">
           <Hero />
-
-          {successInfo && <SuccessManifest info={successInfo} onDismiss={() => setSuccessInfo(null)} />}
 
           {/* Symmetrical Floating Rider Search Dock */}
           <div className="relative z-20 -mt-8 mb-10 mx-auto max-w-4xl rounded-2xl bg-white p-2 shadow-[0_12px_36px_rgba(13,148,136,0.14)] ring-1 ring-slate-100 sm:-mt-12">
             <div className="rounded-xl bg-slate-50 p-6 sm:p-8">
-              <div className="mb-6 flex items-center justify-center gap-2">
-              
-               
-              </div>
-
               <div className="flex flex-col gap-6 sm:flex-row sm:items-start">
                 <div ref={payeeBoxRef} className="relative flex-1">
                   <label className="mb-2 block text-center text-[12px] font-semibold uppercase tracking-wide text-[var(--ink)]/55">
@@ -352,7 +286,7 @@ export default function PublicSearch() {
                   disabled={!hasQueryText}
                   className="group flex w-full items-center justify-center gap-2 rounded-xl bg-[var(--accent)] px-8 py-4 text-base font-semibold text-white shadow-lg shadow-[var(--accent)]/30 transition-all hover:-translate-y-0.5 hover:bg-[var(--accent-dark)] hover:shadow-[var(--accent)]/50 disabled:pointer-events-none disabled:opacity-50 disabled:shadow-none sm:w-auto"
                 >
-                  View available checks
+                  Check availability
                   <ArrowRight className="h-5 w-5 transition-transform group-hover:translate-x-1" />
                 </button>
               </div>
@@ -368,51 +302,6 @@ export default function PublicSearch() {
             )}
           </div>
         </div>
-
-        {/* Sticky Bottom Action Bar — teal, light teal, orange */}
-        {hasSearched && !loading && matchedCount > 0 && !successInfo && (
-          <div className="slide-up fixed inset-x-0 bottom-0 z-40 bg-gradient-to-r from-[var(--brand-dark)] via-[var(--brand)] to-[var(--brand-dark)] px-4 pb-6 pt-5 shadow-[0_-16px_40px_rgba(13,148,136,0.35)] sm:pb-5">
-            <div className="absolute inset-x-0 top-0 h-[3px] bg-[var(--brand-light)]"></div>
-            <div className="mx-auto flex max-w-4xl flex-col items-center justify-between gap-4 sm:flex-row">
-              <div className="flex w-full items-center gap-4 sm:w-auto">
-                <div className="relative flex h-14 w-14 shrink-0 items-center justify-center rounded-full bg-[var(--brand-light)]/15 ring-1 ring-[var(--brand-light)]/40">
-                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[var(--brand-light)] opacity-20"></span>
-                  <Package className="h-7 w-7 text-[var(--brand-light)]" />
-                </div>
-                <div>
-                  <p className="text-xs font-semibold text-white uppercase tracking-wide">Ready for pickup</p>
-                  <p className="font-display text-2xl font-extrabold text-white">
-                    {matchedCount} Check{matchedCount === 1 ? '' : 's'}
-                  </p>
-                </div>
-              </div>
-              <button
-                onClick={openConfirm}
-                className="flex w-full items-center justify-center gap-2 rounded-xl bg-[var(--accent)] px-10 py-4 text-base font-semibold text-white shadow-xl shadow-black/25 transition-all hover:-translate-y-0.5 hover:bg-[var(--accent-dark)] active:scale-95 sm:w-auto"
-              >
-                <Truck className="h-5 w-5" />
-                Reserve now
-              </button>
-            </div>
-          </div>
-        )}
-
-        {showConfirm && (
-      <ConfirmModal
-  count={matchedCount}
-  payee={payeeQuery}
-  payor={payorQuery}
-  collectorName={collectorName}
-  onCollectorNameChange={setCollectorName}
-  onCancel={() => {
-    setShowConfirm(false)
-    setReserveError('')
-  }}
-  onConfirm={confirmPickup}
-  reserving={reserving}
-  error={reserveError}
-/>
-        )}
       </div>
     </div>
   )
@@ -429,12 +318,12 @@ function PageStyles() {
 
       :root {
         --paper: #f8fafc;
-        --ink: #334155;          /* Modern Gray */
-        --ink-dark: #0f172a;     /* Deep Gray/Black */
-        --brand: #0d9488;        /* Teal */
+        --ink: #334155;
+        --ink-dark: #0f172a;
+        --brand: #0d9488;
         --brand-dark: #0f766e;
-        --brand-light: #ccfbf1;  /* Light Teal */
-        --accent: #f97316;       /* Orange */
+        --brand-light: #ccfbf1;
+        --accent: #f97316;
         --accent-dark: #ea580c;
         --accent-soft: #ffedd5;
 
@@ -455,21 +344,6 @@ function PageStyles() {
       }
 
       @media (prefers-reduced-motion: no-preference) {
-        .radar-sweep {
-          animation: radar 3s linear infinite;
-          transform-origin: center;
-        }
-        @keyframes radar {
-          from { transform: rotate(0deg); }
-          to { transform: rotate(360deg); }
-        }
-
-        .pulse-marker { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
-        @keyframes pulse {
-          0%, 100% { opacity: 1; transform: scale(1); }
-          50% { opacity: .7; transform: scale(1.15); box-shadow: 0 0 20px rgba(13, 148, 136, 0.5); }
-        }
-
         .slide-up { animation: slideUp 0.5s cubic-bezier(0.16, 1, 0.3, 1); }
         @keyframes slideUp {
           from { transform: translateY(40px); opacity: 0; }
@@ -480,12 +354,6 @@ function PageStyles() {
         @keyframes scaleIn {
           from { transform: scale(0.95); opacity: 0; }
           to { transform: scale(1); opacity: 1; }
-        }
-
-        .animate-float { animation: float 6s ease-in-out infinite; }
-        @keyframes float {
-          0%, 100% { transform: translateY(0px); }
-          50% { transform: translateY(-10px); }
         }
       }
 
@@ -502,14 +370,6 @@ function PageStyles() {
 }
 
 function BackgroundGeometry() {
-  // NOTE: SVG's `points` attribute on <polygon> only accepts plain numbers
-  // (user units), not percentage strings like "40%". The previous version
-  // used percentages here, which is invalid syntax — browsers silently drop
-  // any polygon with a malformed points list, so none of these shapes were
-  // ever painted and the page looked plain white. Fixing this by giving the
-  // <svg> a 0–100 viewBox (stretched to fill via preserveAspectRatio="none")
-  // and using plain numbers 0–100, which behaves exactly like percentages
-  // of the container but is valid SVG.
   return (
     <div className="absolute inset-0 z-0 pointer-events-none overflow-hidden">
       <svg
@@ -518,13 +378,10 @@ function BackgroundGeometry() {
         preserveAspectRatio="none"
         xmlns="http://www.w3.org/2000/svg"
       >
-        {/* Large subtle shapes */}
         <polygon points="0,0 40,0 0,60" fill="var(--brand-light)" opacity="0.3" />
         <polygon points="100,0 100,30 70,0" fill="var(--accent-soft)" opacity="0.5" />
         <polygon points="0,100 30,100 0,70" fill="#e2e8f0" opacity="0.4" />
         <polygon points="100,100 60,100 100,50" fill="var(--brand-light)" opacity="0.2" />
-
-        {/* Floating background triangles */}
         <polygon points="15,20 20,30 10,30" fill="var(--brand)" opacity="0.05" />
         <polygon points="85,40 90,30 80,30" fill="var(--accent)" opacity="0.05" />
         <polygon points="20,80 25,70 15,70" fill="var(--ink)" opacity="0.04" />
@@ -542,16 +399,15 @@ function Hero() {
       <div className="grid grid-cols-1 md:grid-cols-2 gap-8 items-center h-full">
         <div className="relative z-10 flex flex-col justify-center px-6 pb-14 pt-12 sm:px-12 sm:pb-20 sm:pt-16 md:pr-0">
           <div className="mb-6 inline-flex self-start items-center gap-2 rounded-full bg-[var(--brand-light)]/20 px-4 py-2 text-xs font-semibold uppercase tracking-wider text-[var(--brand-light)] backdrop-blur-md border border-[var(--brand-light)]/30">
-          
             Credit Solutions & Business Alliances, Inc.
           </div>
           <h1 className="font-display text-4xl font-extrabold leading-tight sm:text-5xl lg:text-6xl">
-            Scan &amp; Collect
+            Check
             <br />
-            <span className="text-[var(--accent)]">Checks</span>
+            <span className="text-[var(--accent)]">Availability</span>
           </h1>
           <p className="mt-6 max-w-sm text-base font-medium leading-relaxed text-[var(--brand-light)]">
-            Enter the details below to instantly scan the depot for ready packages. No login required.
+            Enter the details below to instantly see whether a check is ready at the depot. No login required.
           </p>
         </div>
 
@@ -560,6 +416,7 @@ function Hero() {
     </div>
   )
 }
+
 function RouteGraphic() {
   return (
     <div className="relative hidden h-full w-full items-center justify-center overflow-hidden md:flex">
@@ -580,37 +437,6 @@ function RouteGraphic() {
           transform: 'translate(42%, -2%)',
         }}
       />
-    </div>
-  )
-}
-
-function SuccessManifest({ info, onDismiss }) {
-  return (
-    <div className="slide-up relative z-20 mb-10 overflow-hidden rounded-2xl border border-[var(--brand)]/30 bg-white shadow-xl shadow-[var(--brand)]/10">
-      <div className="absolute right-0 top-0 h-full w-32 bg-gradient-to-l from-[var(--brand-light)] to-transparent opacity-50"></div>
-      <div className="flex items-start p-6 sm:p-8 relative z-10">
-        <div className="mr-5 flex h-14 w-14 shrink-0 items-center justify-center rounded-full bg-[var(--brand)] shadow-lg shadow-[var(--brand)]/30">
-          <CheckCircle2 className="h-7 w-7 text-white" />
-        </div>
-        <div className="flex-1">
-          <h3 className="font-display text-xl font-extrabold text-[var(--ink-dark)]">
-            {info.count} Check{info.count === 1 ? '' : 's'} Reserved!
-          </h3>
-          <p className="mt-1 text-base font-medium text-slate-600">
-            Assigned to <span className="font-semibold text-[var(--ink-dark)] bg-[var(--brand-light)]/50 px-2 py-0.5 rounded">{info.collectorName}</span>.
-          </p>
-          <div className="mt-4 flex items-center gap-3 rounded-xl bg-[var(--accent-soft)] p-4 text-sm font-semibold text-[var(--accent-dark)] border border-[var(--accent)]/20">
-            <Clock className="h-5 w-5 shrink-0" />
-            Pick up within 1 hour {info.expiresAt ? `(by ${new Date(info.expiresAt).toLocaleTimeString()})` : ''} or the reservation expires.
-          </div>
-        </div>
-        <button
-          onClick={onDismiss}
-          className="ml-4 rounded-full bg-slate-100 p-2.5 text-slate-500 transition hover:bg-slate-200 hover:text-[var(--ink-dark)]"
-        >
-          <X className="h-5 w-5" />
-        </button>
-      </div>
     </div>
   )
 }
@@ -686,12 +512,10 @@ function ManifestCountCard({ loading, count, payee, payor }) {
     )
   }
 
-  // "Success" State Graphic
   return (
     <div className="slide-up relative overflow-hidden rounded-2xl bg-white shadow-xl border border-[var(--brand-light)]">
       <div className="absolute top-0 h-1.5 w-full bg-gradient-to-r from-[var(--brand)] to-[var(--accent)]"></div>
 
-      {/* Decorative background blobs */}
       <div className="absolute -left-20 -top-20 h-64 w-64 rounded-full bg-[var(--brand-light)] opacity-40 blur-3xl pointer-events-none"></div>
       <div className="absolute -right-20 -bottom-20 h-64 w-64 rounded-full bg-[var(--accent-soft)] opacity-40 blur-3xl pointer-events-none"></div>
 
@@ -701,7 +525,7 @@ function ManifestCountCard({ loading, count, payee, payor }) {
         </div>
 
         <h2 className="font-display text-3xl font-extrabold text-[var(--ink-dark)] mt-2">
-          Checks ready for pickup
+          Checks available
         </h2>
 
         <div className="my-6">
@@ -710,127 +534,26 @@ function ManifestCountCard({ loading, count, payee, payor }) {
           </span>
         </div>
 
-       <div className="flex flex-col items-center gap-3 mt-2 w-full">
-  <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">Check details</p>
-  <div className="w-full max-w-md grid grid-cols-2 gap-0 rounded-xl bg-slate-50 shadow-inner border border-slate-200 overflow-hidden">
-    <div className="flex flex-col items-center gap-1 px-5 py-4 border-r border-slate-200">
-      <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-       
-        Payee
-      </span>
-      <span className="text-sm font-semibold text-[var(--ink)] text-center break-words">{payee}</span>
-    </div>
-    <div className="flex flex-col items-center gap-1 px-5 py-4">
-      <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-     
-        Payor
-      </span>
-      <span className="text-sm font-semibold text-[var(--ink)] text-center break-words">{payor}</span>
-    </div>
-  </div>
-  <div className="flex items-center gap-1.5 text-xs font-medium text-slate-400">
-    <Clock className="h-3.5 w-3.5" />
-    Queried {new Date().toLocaleString()}
-  </div>
-</div>
-      </div>
-    </div>
-  )
-}
-function ConfirmModal({ count, payee, payor, collectorName, onCollectorNameChange, onCancel, onConfirm, reserving, error }) {
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-[var(--ink-dark)]/70 p-4 backdrop-blur-sm">
-      <div className="slide-up flex w-full max-w-md flex-col overflow-hidden rounded-2xl bg-white shadow-2xl border border-white/20 relative">
-
-        {/* Top Header Accent Line */}
-        <div className="h-1.5 w-full bg-gradient-to-r from-[var(--brand)] to-[var(--accent)]"></div>
-
-        {/* Modal Header */}
-        <div className="px-8 py-6 text-center border-b border-slate-100 relative overflow-hidden bg-white">
-          <svg className="absolute top-0 right-0 w-32 h-32 text-[var(--brand-light)] opacity-30 pointer-events-none" viewBox="0 0 100 100" fill="currentColor">
-            <polygon points="100,0 100,100 0,0" />
-          </svg>
-          <h2 className="font-display text-2xl font-extrabold text-[var(--ink-dark)] relative z-10">Confirm reservation</h2>
-          <p className="mt-2 text-sm text-slate-500 font-medium relative z-10">
-            You are about to secure these items for exactly 1 hour.
-          </p>
-        </div>
-
-        {/* Modal Body */}
-        <div className="px-8 py-8 bg-slate-50">
-          {/* Summary card: count + payee/payor + timestamp */}
-          <div className="mb-8 overflow-hidden rounded-2xl bg-white shadow-sm border border-slate-200 relative">
-            <div className="absolute -left-6 -top-6 h-20 w-20 rounded-full bg-[var(--brand-light)]/50 blur-xl pointer-events-none"></div>
-            <div className="absolute -right-6 -top-6 h-20 w-20 rounded-full bg-[var(--accent-soft)]/50 blur-xl pointer-events-none"></div>
-
-            <div className="relative z-10 flex flex-col items-center pt-6 pb-5">
-              <span className="text-xs font-semibold uppercase tracking-widest text-slate-400 mb-1">Total checks to claim</span>
-              <span className="font-display text-5xl font-extrabold text-[var(--brand)]">{count}</span>
+        <div className="flex flex-col items-center gap-3 mt-2 w-full">
+          <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">Check details</p>
+          <div className="w-full max-w-md grid grid-cols-2 gap-0 rounded-xl bg-slate-50 shadow-inner border border-slate-200 overflow-hidden">
+            <div className="flex flex-col items-center gap-1 px-5 py-4 border-r border-slate-200">
+              <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                Payee
+              </span>
+              <span className="text-sm font-semibold text-[var(--ink)] text-center break-words">{payee}</span>
             </div>
-
-            <div className="relative z-10 grid grid-cols-2 border-t border-slate-100">
-              <div className="flex flex-col items-center gap-1 px-4 py-4 border-r border-slate-100">
-                <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-            
-                  Payee
-                </span>
-                <span className="text-sm font-semibold text-[var(--ink)] text-center break-words">{payee}</span>
-              </div>
-              <div className="flex flex-col items-center gap-1 px-4 py-4">
-                <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-               
-                  Payor
-                </span>
-                <span className="text-sm font-semibold text-[var(--ink)] text-center break-words">{payor}</span>
-              </div>
-            </div>
-
-            <div className="relative z-10 flex items-center justify-center gap-1.5 border-t border-slate-100 bg-slate-50/60 py-2.5 text-xs font-medium text-slate-400">
-              <Clock className="h-3.5 w-3.5" />
-              Reserving on {new Date().toLocaleString(undefined, {
-                dateStyle: 'medium',
-                timeStyle: 'short',
-              })}
+            <div className="flex flex-col items-center gap-1 px-5 py-4">
+              <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                Payor
+              </span>
+              <span className="text-sm font-semibold text-[var(--ink)] text-center break-words">{payor}</span>
             </div>
           </div>
-
-          <div className="space-y-3">
-            <label className="block text-center text-xs font-semibold uppercase tracking-widest text-[var(--ink)]/60">
-              Enter Collector's Full name
-            </label>
-            <Input
-              value={collectorName}
-              onChange={(e) => onCollectorNameChange(e.target.value)}
-              placeholder="e.g. John Doe"
-              className="text-center text-lg font-semibold h-16 rounded-2xl border-slate-200 bg-white shadow-sm focus-visible:ring-2 focus-visible:ring-[var(--brand)] focus-visible:border-[var(--brand)] transition-all"
-              autoFocus
-            />
+          <div className="flex items-center gap-1.5 text-xs font-medium text-slate-400">
+            <Clock className="h-3.5 w-3.5" />
+            Queried {new Date().toLocaleString()}
           </div>
-
-          {error && (
-            <p className="mt-4 flex items-center justify-center gap-2 rounded-lg bg-red-50 p-3 text-sm font-semibold text-red-600 border border-red-100 scale-in text-center">
-              <X className="h-5 w-5 shrink-0"/> {error}
-            </p>
-          )}
-        </div>
-
-        {/* Modal Actions */}
-        <div className="flex flex-col gap-3 px-8 py-6 bg-white border-t border-slate-100">
-          <button
-            onClick={onConfirm}
-            disabled={reserving}
-            className="flex w-full items-center justify-center gap-2 rounded-xl bg-[var(--accent)] hover:bg-[var(--accent-dark)] py-4 text-lg font-semibold text-white shadow-lg shadow-[var(--accent)]/40 transition-all hover:-translate-y-0.5 disabled:transform-none disabled:opacity-60"
-          >
-            {reserving ? <Loader2 className="h-5 w-5 animate-spin" /> : <CheckCircle2 className="h-6 w-6" />}
-            Confirm pickup
-          </button>
-          <button
-            onClick={onCancel}
-            disabled={reserving}
-            className="w-full bg-transparent py-3 text-sm font-semibold text-slate-500 transition-colors hover:text-[var(--ink-dark)] disabled:opacity-50"
-          >
-            Cancel
-          </button>
         </div>
       </div>
     </div>
@@ -845,7 +568,7 @@ function PromptState() {
       </div>
       <h3 className="font-display text-2xl font-extrabold text-[var(--ink-dark)]">Ready to scan</h3>
       <p className="mt-3 max-w-sm text-base font-medium text-slate-500">
-        Enter the payee and payor details above to locate items available for pickup at the depot.
+        Enter the payee and payor details above to check whether items are available for pickup at the depot.
       </p>
     </div>
   )
