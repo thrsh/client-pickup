@@ -11,6 +11,9 @@ import {
   Loader2,
   Stamp,
   Sparkles,
+  Download,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react'
 import { supabase } from '../../lib/supabaseClient'
 import { Button } from '../../components/ui/button'
@@ -28,6 +31,8 @@ const REQUIRED_FIELDS = [
 ]
 
 const ACCEPTED_EXTENSIONS = ['.csv', '.xlsx', '.xls']
+const PREVIEW_ROW_LIMIT = 5
+const EXPANDED_PREVIEW_CAP = 200
 
 // best-effort auto-detection of column headers
 function guessColumn(headers, field) {
@@ -49,6 +54,23 @@ function formatFileSize(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
+function downloadTemplate() {
+  const csvContent = [
+    'Payee,Payor,Check No,Check Date,Amount',
+    'Jane Doe,Acme Corp,00123,2024-01-15,250.00',
+    'John Smith,Acme Corp,00124,2024-02-03,1050.75',
+  ].join('\n')
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = 'check-import-template.csv'
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  URL.revokeObjectURL(url)
+}
+
 export default function AdminUpload() {
   const [fileName, setFileName] = useState('')
   const [fileSize, setFileSize] = useState(0)
@@ -61,37 +83,50 @@ export default function AdminUpload() {
   const [parseError, setParseError] = useState('')
   const [isDragging, setIsDragging] = useState(false)
   const [importedCount, setImportedCount] = useState(null) // set once import succeeds
+  const [showAllRows, setShowAllRows] = useState(false)
   const inputRef = useRef(null)
   const { push } = useToast()
 
   const hasFile = headers.length > 0
   const mappingComplete = REQUIRED_FIELDS.every(({ key }) => mapping[key])
 
-  // Lightweight data-quality pass so the admin can spot obviously broken
-  // rows (blank payee, zero/unparseable amount, bad date) before importing,
-  // without changing what actually gets imported.
-  const dataQuality = useMemo(() => {
-    if (!mappingComplete || rawRows.length === 0) return null
+  // Per-row quality flags so the preview table can point at the exact
+  // cells that look wrong, not just show an aggregate count.
+  const rowFlags = useMemo(() => {
+    if (!mappingComplete || rawRows.length === 0) return []
 
-    const colIndex = (field) => headers.indexOf(mapping[field])
-    const payeeIdx = colIndex('payee')
-    const amountIdx = colIndex('amount')
-    const dateIdx = colIndex('check_date')
+    const payeeIdx = headers.indexOf(mapping.payee)
+    const amountIdx = headers.indexOf(mapping.amount)
+    const dateIdx = headers.indexOf(mapping.check_date)
 
-    let missingPayee = 0
-    let missingAmount = 0
-    let missingDate = 0
-
-    for (const row of rawRows) {
-      if (!String(row[payeeIdx] ?? '').trim()) missingPayee++
-      const parsedAmount = Number(String(row[amountIdx] ?? '0').replace(/[^0-9.-]/g, '')) || 0
-      if (parsedAmount === 0) missingAmount++
-      if (!normalizeDate(row[dateIdx])) missingDate++
-    }
-
-    return { missingPayee, missingAmount, missingDate }
+    return rawRows.map((row) => {
+      const parsedAmount =
+        Number(String(row[amountIdx] ?? '0').replace(/[^0-9.-]/g, '')) || 0
+      return {
+        payee: !String(row[payeeIdx] ?? '').trim(),
+        amount: parsedAmount === 0,
+        check_date: !normalizeDate(row[dateIdx]),
+      }
+    })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mappingComplete, rawRows, headers, mapping])
+
+  const dataQuality = useMemo(() => {
+    if (rowFlags.length === 0) return null
+    return {
+      missingPayee: rowFlags.filter((f) => f.payee).length,
+      missingAmount: rowFlags.filter((f) => f.amount).length,
+      missingDate: rowFlags.filter((f) => f.check_date).length,
+    }
+  }, [rowFlags])
+
+  const totalIssues = dataQuality
+    ? dataQuality.missingPayee + dataQuality.missingAmount + dataQuality.missingDate
+    : 0
+
+  const previewRows = showAllRows
+    ? rawRows.slice(0, EXPANDED_PREVIEW_CAP)
+    : rawRows.slice(0, PREVIEW_ROW_LIMIT)
 
   function resetFileState() {
     setFileName('')
@@ -103,6 +138,7 @@ export default function AdminUpload() {
     setParseError('')
     setImportProgress(0)
     setImportedCount(null)
+    setShowAllRows(false)
     if (inputRef.current) inputRef.current.value = ''
   }
 
@@ -121,6 +157,7 @@ export default function AdminUpload() {
 
     setParseError('')
     setImportedCount(null)
+    setShowAllRows(false)
     setFileName(file.name)
     setFileSize(file.size)
 
@@ -249,10 +286,6 @@ export default function AdminUpload() {
     }
   }
 
-  const totalIssues = dataQuality
-    ? dataQuality.missingPayee + dataQuality.missingAmount + dataQuality.missingDate
-    : 0
-
   return (
     <div>
       <div className="mb-6">
@@ -276,48 +309,61 @@ export default function AdminUpload() {
           ) : (
             <>
               {!hasFile ? (
-                <label
-                  htmlFor="file-upload"
-                  onDragOver={(e) => {
-                    e.preventDefault()
-                    setIsDragging(true)
-                  }}
-                  onDragLeave={() => setIsDragging(false)}
-                  onDrop={handleDrop}
-                  className={cn(
-                    'flex cursor-pointer flex-col items-center gap-2 rounded-lg border-2 border-dashed py-12 text-center transition',
-                    isDragging
-                      ? 'border-ledger-stamp bg-ledger-stamp/5'
-                      : 'border-ink-200 hover:border-ledger-stamp/50 hover:bg-ink-50/40'
-                  )}
-                >
-                  <span
+                <>
+                  <label
+                    htmlFor="file-upload"
+                    onDragOver={(e) => {
+                      e.preventDefault()
+                      setIsDragging(true)
+                    }}
+                    onDragLeave={() => setIsDragging(false)}
+                    onDrop={handleDrop}
                     className={cn(
-                      'flex h-12 w-12 items-center justify-center rounded-full transition',
-                      isDragging ? 'bg-ledger-stamp/15 text-ledger-stampDark' : 'bg-ink-50 text-ink-300'
+                      'flex cursor-pointer flex-col items-center gap-2 rounded-lg border-2 border-dashed py-12 text-center transition',
+                      isDragging
+                        ? 'border-teal-500 bg-teal-50'
+                        : 'border-ink-200 hover:border-teal-400/60 hover:bg-teal-50/40'
                     )}
                   >
-                    <UploadCloud className="h-6 w-6" />
-                  </span>
-                  <p className="text-sm font-medium text-ink-700">
-                    {isDragging ? 'Drop it here' : 'Click to choose a file, or drag one in'}
-                  </p>
-                  <p className="text-xs text-ink-300">
-                    .csv, .xlsx, or .xls · max recommended size: ~10,000 rows per file
-                  </p>
-                  <input
-                    ref={inputRef}
-                    id="file-upload"
-                    type="file"
-                    accept={ACCEPTED_EXTENSIONS.join(',')}
-                    onChange={handleFile}
-                    className="hidden"
-                  />
-                </label>
+                    <span
+                      className={cn(
+                        'flex h-12 w-12 items-center justify-center rounded-full transition',
+                        isDragging ? 'scale-105 bg-teal-100 text-teal-700' : 'bg-ink-50 text-ink-300'
+                      )}
+                    >
+                      <UploadCloud className="h-6 w-6" />
+                    </span>
+                    <p className="text-sm font-medium text-ink-700">
+                      {isDragging ? 'Drop it here' : 'Click to choose a file, or drag one in'}
+                    </p>
+                    <p className="text-xs text-ink-300">
+                      .csv, .xlsx, or .xls · max recommended size: ~10,000 rows per file
+                    </p>
+                    <input
+                      ref={inputRef}
+                      id="file-upload"
+                      type="file"
+                      accept={ACCEPTED_EXTENSIONS.join(',')}
+                      onChange={handleFile}
+                      className="hidden"
+                    />
+                  </label>
+
+                  <div className="mt-3 flex items-center justify-center">
+                    <button
+                      type="button"
+                      onClick={downloadTemplate}
+                      className="flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium text-teal-700 transition hover:bg-teal-50 hover:text-teal-800"
+                    >
+                      <Download className="h-3.5 w-3.5" />
+                      Download a template CSV
+                    </button>
+                  </div>
+                </>
               ) : (
                 <div className="flex items-center justify-between gap-3 rounded-lg border border-ink-100 bg-ink-50/50 px-4 py-3">
                   <div className="flex min-w-0 items-center gap-3">
-                    <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-ledger-stamp/10 text-ledger-stampDark">
+                    <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-teal-100 text-teal-700">
                       <FileSpreadsheet className="h-4 w-4" />
                     </span>
                     <div className="min-w-0">
@@ -340,10 +386,13 @@ export default function AdminUpload() {
               )}
 
               {parseError && (
-                <p className="mt-3 flex items-center gap-1.5 text-xs text-red-600">
-                  <AlertCircle className="h-3.5 w-3.5 shrink-0" />
-                  {parseError}
-                </p>
+                <div className="mt-3 flex items-start gap-2 rounded-md border border-red-200 bg-red-50 px-3.5 py-3 text-xs text-red-700">
+                  <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  <div>
+                    <p className="font-medium">Couldn't read this file</p>
+                    <p className="mt-0.5 text-red-600/90">{parseError}</p>
+                  </div>
+                </div>
               )}
 
               {hasFile && (
@@ -357,7 +406,7 @@ export default function AdminUpload() {
                         <label className="mb-1 flex items-center gap-1.5 text-xs font-medium text-ink-500">
                           {label}
                           {autoDetected[key] && mapping[key] && (
-                            <span className="flex items-center gap-0.5 rounded-full bg-ledger-stamp/10 px-1.5 py-0.5 text-[10px] font-medium text-ledger-stampDark">
+                            <span className="flex items-center gap-0.5 rounded-full bg-teal-100 px-1.5 py-0.5 text-[10px] font-medium text-teal-700">
                               <Sparkles className="h-2.5 w-2.5" />
                               auto
                             </span>
@@ -370,7 +419,7 @@ export default function AdminUpload() {
                             setMapping((m) => ({ ...m, [key]: value }))
                             setAutoDetected((d) => ({ ...d, [key]: false }))
                           }}
-                          className={cn(!mapping[key] && 'ring-1 ring-ledger-amber/40')}
+                          className={cn(!mapping[key] && 'ring-1 ring-orange-400/60')}
                         >
                           <option value="">— Select column —</option>
                           {headers.map((h) => (
@@ -384,14 +433,14 @@ export default function AdminUpload() {
                   </div>
 
                   {!mappingComplete && (
-                    <p className="mt-3 flex items-center gap-1.5 text-xs text-ledger-amber">
+                    <p className="mt-3 flex items-center gap-1.5 text-xs font-medium text-orange-600">
                       <AlertTriangle className="h-3.5 w-3.5" /> Map all five fields to continue.
                     </p>
                   )}
 
                   {mappingComplete && dataQuality && totalIssues > 0 && (
-                    <div className="mt-4 rounded-md border border-ledger-amber/30 bg-ledger-amber/5 px-3.5 py-3 text-xs text-ink-600">
-                      <p className="flex items-center gap-1.5 font-medium text-ledger-amber">
+                    <div className="mt-4 rounded-md border border-orange-200 bg-orange-50 px-3.5 py-3 text-xs text-ink-600">
+                      <p className="flex items-center gap-1.5 font-medium text-orange-600">
                         <AlertTriangle className="h-3.5 w-3.5" />
                         Some rows may need a second look
                       </p>
@@ -411,15 +460,15 @@ export default function AdminUpload() {
                         )}
                       </ul>
                       <p className="mt-1.5 text-ink-400">
-                        These rows will still be imported — double-check the column mapping above if
-                        this looks wrong.
+                        These rows will still be imported — flagged cells are marked orange below so
+                        you can double-check the source file or your column mapping.
                       </p>
                     </div>
                   )}
 
                   <div className="mt-5 overflow-x-auto rounded-md border border-ink-100">
                     <table className="w-full text-left text-xs">
-                      <thead className="bg-ink-50 text-ink-400">
+                      <thead className="bg-teal-50 text-teal-700">
                         <tr>
                           <th className="px-3 py-2 font-medium">Row</th>
                           {REQUIRED_FIELDS.map(({ key, label }) => (
@@ -430,23 +479,69 @@ export default function AdminUpload() {
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-dashed divide-ink-100">
-                        {rawRows.slice(0, 5).map((row, i) => (
-                          <tr key={i}>
-                            <td className="px-3 py-2 font-mono text-ink-300">{i + 2}</td>
-                            {REQUIRED_FIELDS.map(({ key }) => (
-                              <td key={key} className="px-3 py-2 text-ink-700">
-                                {mapping[key] ? String(row[headers.indexOf(mapping[key])]) : '—'}
-                              </td>
-                            ))}
-                          </tr>
-                        ))}
+                        {previewRows.map((row, i) => {
+                          const flags = rowFlags[i] || {}
+                          return (
+                            <tr key={i} className="transition hover:bg-teal-50/50">
+                              <td className="px-3 py-2 font-mono text-ink-300">{i + 2}</td>
+                              {REQUIRED_FIELDS.map(({ key }) => {
+                                const value = mapping[key]
+                                  ? String(row[headers.indexOf(mapping[key])] ?? '')
+                                  : ''
+                                const flagged = flags[key]
+                                return (
+                                  <td
+                                    key={key}
+                                    className={cn(
+                                      'px-3 py-2',
+                                      flagged ? 'font-medium text-orange-600' : 'text-ink-700'
+                                    )}
+                                  >
+                                    {!mapping[key] ? (
+                                      '—'
+                                    ) : flagged ? (
+                                      <span className="inline-flex items-center gap-1">
+                                        <AlertTriangle className="h-3 w-3 shrink-0" />
+                                        {value.trim() ? value : 'Missing'}
+                                      </span>
+                                    ) : (
+                                      value || '—'
+                                    )}
+                                  </td>
+                                )
+                              })}
+                            </tr>
+                          )
+                        })}
                       </tbody>
                     </table>
                   </div>
-                  <p className="mt-2 flex items-center gap-1.5 text-xs text-ink-300">
-                    <FileSpreadsheet className="h-3.5 w-3.5" />
-                    Showing 5 of {rawRows.length} rows detected.
-                  </p>
+
+                  <div className="mt-2 flex items-center justify-between">
+                    <p className="flex items-center gap-1.5 text-xs text-ink-300">
+                      <FileSpreadsheet className="h-3.5 w-3.5 text-teal-400" />
+                      Showing {previewRows.length} of {rawRows.length} rows detected.
+                    </p>
+                    {rawRows.length > PREVIEW_ROW_LIMIT && (
+                      <button
+                        type="button"
+                        onClick={() => setShowAllRows((v) => !v)}
+                        className="flex items-center gap-1 text-xs font-medium text-teal-700 hover:text-teal-800"
+                      >
+                        {showAllRows ? (
+                          <>
+                            <ChevronUp className="h-3.5 w-3.5" />
+                            Show fewer rows
+                          </>
+                        ) : (
+                          <>
+                            <ChevronDown className="h-3.5 w-3.5" />
+                            Show {Math.min(rawRows.length, EXPANDED_PREVIEW_CAP)} rows
+                          </>
+                        )}
+                      </button>
+                    )}
+                  </div>
 
                   {saving && (
                     <div className="mt-5">
@@ -462,14 +557,18 @@ export default function AdminUpload() {
                         aria-valuemax={100}
                       >
                         <div
-                          className="h-full rounded-full bg-ledger-stamp transition-all duration-300"
+                          className="h-full rounded-full bg-teal-500 transition-all duration-300"
                           style={{ width: `${Math.max(importProgress, 4)}%` }}
                         />
                       </div>
                     </div>
                   )}
 
-                  <Button onClick={handleImport} disabled={!mappingComplete || saving} className="mt-5">
+                  <Button
+                    onClick={handleImport}
+                    disabled={!mappingComplete || saving}
+                    className="mt-5 bg-orange-500 text-white hover:bg-orange-600 focus-visible:ring-orange-400 disabled:bg-ink-200 disabled:text-ink-400"
+                  >
                     {saving ? (
                       <Loader2 className="h-3.5 w-3.5 animate-spin" />
                     ) : (
@@ -493,45 +592,55 @@ function StepTracker({ step }) {
     { n: 2, label: 'Map columns' },
     { n: 3, label: 'Imported' },
   ]
+  const percent = ((step - 1) / (steps.length - 1)) * 100
+
   return (
-    <div className="flex items-center gap-1.5">
-      {steps.map((s, i) => {
-        const state = step > s.n ? 'done' : step === s.n ? 'active' : 'upcoming'
-        return (
-          <React.Fragment key={s.n}>
-            <div
-              className={cn(
-                'flex items-center gap-1.5 rounded-full border px-2.5 py-1.5 transition',
-                state === 'done' && 'border-ledger-stamp/30 bg-ledger-stamp/10',
-                state === 'active' && 'border-ledger-stamp/40 bg-ledger-stamp/5',
-                state === 'upcoming' && 'border-ink-100 bg-ink-50/40'
+    <div>
+      <div className="flex flex-wrap items-center gap-y-2">
+        {steps.map((s, i) => {
+          const state = step > s.n ? 'done' : step === s.n ? 'active' : 'upcoming'
+          return (
+            <React.Fragment key={s.n}>
+              <div
+                className={cn(
+                  'flex items-center gap-1.5 rounded-full border px-2.5 py-1.5 transition',
+                  state === 'done' && 'border-teal-300 bg-teal-50',
+                  state === 'active' && 'border-teal-400 bg-teal-50/70',
+                  state === 'upcoming' && 'border-ink-100 bg-ink-50/40'
+                )}
+              >
+                <span
+                  className={cn(
+                    'flex h-4 w-4 items-center justify-center rounded-full font-mono text-[10px] font-semibold',
+                    state === 'done' && 'bg-teal-600 text-white',
+                    state === 'active' && 'bg-teal-700 text-white',
+                    state === 'upcoming' && 'bg-ink-200 text-ink-500'
+                  )}
+                >
+                  {state === 'done' ? <CheckCircle2 className="h-3 w-3" /> : s.n}
+                </span>
+                <span
+                  className={cn(
+                    'font-mono text-[11px] font-medium',
+                    state === 'upcoming' ? 'text-ink-400' : 'text-teal-700'
+                  )}
+                >
+                  {s.label}
+                </span>
+              </div>
+              {i < steps.length - 1 && (
+                <ArrowRight className="mx-0.5 h-3 w-3 shrink-0 text-ink-200" aria-hidden="true" />
               )}
-            >
-              <span
-                className={cn(
-                  'flex h-4 w-4 items-center justify-center rounded-full font-mono text-[10px] font-semibold',
-                  state === 'done' && 'bg-ledger-stamp text-white',
-                  state === 'active' && 'bg-ledger-stampDark text-white',
-                  state === 'upcoming' && 'bg-ink-200 text-ink-500'
-                )}
-              >
-                {state === 'done' ? <CheckCircle2 className="h-3 w-3" /> : s.n}
-              </span>
-              <span
-                className={cn(
-                  'font-mono text-[11px] font-medium',
-                  state === 'upcoming' ? 'text-ink-400' : 'text-ledger-stampDark'
-                )}
-              >
-                {s.label}
-              </span>
-            </div>
-            {i < steps.length - 1 && (
-              <ArrowRight className="h-3 w-3 shrink-0 text-ink-200" aria-hidden="true" />
-            )}
-          </React.Fragment>
-        )
-      })}
+            </React.Fragment>
+          )
+        })}
+      </div>
+      <div className="mt-2 h-1 w-full overflow-hidden rounded-full bg-ink-100">
+        <div
+          className="h-full rounded-full bg-teal-500 transition-all duration-300"
+          style={{ width: `${Math.max(percent, 4)}%` }}
+        />
+      </div>
     </div>
   )
 }
@@ -539,7 +648,7 @@ function StepTracker({ step }) {
 function ImportedState({ count, fileName, onUploadAnother }) {
   return (
     <div className="flex flex-col items-center py-10 text-center">
-      <span className="stamp-pop flex h-16 w-16 rotate-[-8deg] items-center justify-center rounded-full border-2 border-dashed border-ledger-stamp bg-ledger-stamp/10 text-ledger-stampDark">
+      <span className="stamp-pop flex h-16 w-16 rotate-[-8deg] items-center justify-center rounded-full border-2 border-dashed border-teal-500 bg-teal-50 text-orange-500">
         <Stamp className="h-7 w-7" />
       </span>
       <p className="mt-4 font-display text-lg font-semibold text-ink-900">
@@ -551,7 +660,7 @@ function ImportedState({ count, fileName, onUploadAnother }) {
       </p>
       <button
         onClick={onUploadAnother}
-        className="mt-5 flex items-center gap-1.5 rounded-md border border-ink-200 px-4 py-2 text-sm font-medium text-ink-600 hover:bg-ink-50"
+        className="mt-5 flex items-center gap-1.5 rounded-md border border-ink-200 px-4 py-2 text-sm font-medium text-teal-700 hover:border-teal-300 hover:bg-teal-50"
       >
         <UploadCloud className="h-3.5 w-3.5" />
         Upload another file
