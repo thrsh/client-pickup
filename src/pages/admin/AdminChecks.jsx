@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Search,
-  PackageCheck,
   RotateCcw,
   SlidersHorizontal,
   ArrowUp,
@@ -15,14 +14,21 @@ import {
   Check,
   Minimize2,
   Maximize2,
-  Users,
+  Send,
+  Hourglass,
+  CheckSquare,
+  Square,
+  Layers,
+  Wallet,
+  CircleCheckBig,
 } from 'lucide-react'
+import { useProfile } from '../../context/ProfileContext'
 import { supabase } from '../../lib/supabaseClient'
 import { Input } from '../../components/ui/input'
 import { Select } from '../../components/ui/select'
 import { Button } from '../../components/ui/button'
 import { Badge } from '../../components/ui/badge'
-import { Dialog } from '../../components/ui/dialog'
+import { Card, CardContent } from '../../components/ui/card'
 import { useToast } from '../../components/ui/toast'
 import { formatCurrency, formatDate, cn } from '../../lib/utils'
 
@@ -31,6 +37,7 @@ const SORTABLE_COLUMNS = ['payee', 'check_date', 'amount', 'uploaded_at']
 const DEBOUNCE_MS = 300
 
 export default function AdminChecks() {
+  const { name: adminName } = useProfile()
   const [query, setQuery] = useState('')
   const [status, setStatus] = useState('all')
   const [showAdvanced, setShowAdvanced] = useState(false)
@@ -58,19 +65,27 @@ export default function AdminChecks() {
 
   // Lightweight status breakdown for the current filters (head-only counts,
   // so this stays cheap no matter how large the underlying table gets).
-  const [stats, setStats] = useState({ available: null, pickedUp: null })
+  // Also powers the KPI cards at the top of the page.
+  const [stats, setStats] = useState({ available: null, pendingApproval: null, pickedUp: null })
 
-  const [activeRow, setActiveRow] = useState(null)
-  const [collectorName, setCollectorName] = useState('')
-  const [submitting, setSubmitting] = useState(false)
-  const [pickupError, setPickupError] = useState('')
+  // Submit-for-approval modal. `submitTargets` is null when the modal is
+  // closed, or the array of check rows it's acting on (one row for a
+  // single-check submission, several for a bulk one) when it's open. The
+  // modal itself owns the collector-name and per-check field state; this
+  // component only owns the network call and its in-flight/error state so
+  // both the single-row and bulk entry points can share one code path.
+  const [submitTargets, setSubmitTargets] = useState(null)
+  const [submitSubmitting, setSubmitSubmitting] = useState(false)
+  const [submitError, setSubmitError] = useState('')
+
+  // Cancelling a pending submission (back to 'available') and undoing a
+  // finalized pickup (also back to 'available') are both simple, uniform
+  // updates, so a single row id or many share the same in-flight tracking
+  // set and the same bulk-capable function.
+  const [cancelingIds, setCancelingIds] = useState(() => new Set())
   const [undoingIds, setUndoingIds] = useState(() => new Set())
 
   const [selectedIds, setSelectedIds] = useState(() => new Set())
-  const [bulkAction, setBulkAction] = useState(null) // 'pickup' | 'undo' | null
-  const [bulkCollectorName, setBulkCollectorName] = useState('')
-  const [bulkSubmitting, setBulkSubmitting] = useState(false)
-  const [bulkError, setBulkError] = useState('')
 
   const { push } = useToast()
 
@@ -107,11 +122,24 @@ export default function AdminChecks() {
     try {
       const [batchesRes, collectorsRes] = await Promise.all([
         supabase.from('upload_batches').select('id, file_name').order('uploaded_at', { ascending: false }).limit(200),
-        supabase.from('checks').select('picked_up_by').not('picked_up_by', 'is', null).limit(1000),
+        // Collector suggestions pool together everyone who has ever
+        // finished a pickup (picked_up_by) and everyone currently waiting
+        // on approval (submitted_by_name), so the dropdown covers both.
+       supabase
+  .from('checks')
+  .select('picked_up_by, collector_name')
+  .or('picked_up_by.not.is.null,collector_name.not.is.null')
+  .limit(1000),
       ])
       if (!batchesRes.error) setFileOptions(batchesRes.data || [])
       if (!collectorsRes.error) {
-        const distinct = [...new Set((collectorsRes.data || []).map((r) => r.picked_up_by).filter(Boolean))].sort()
+        const distinct = [
+          ...new Set(
+            (collectorsRes.data || [])
+              .flatMap((r) => [r.picked_up_by, r.collector_name])
+              .filter(Boolean),
+          ),
+        ].sort()
         setCollectorOptions(distinct)
       }
     } catch {
@@ -177,7 +205,15 @@ export default function AdminChecks() {
       if (amountMin) r = r.gte('amount', Number(amountMin))
       if (amountMax) r = r.lte('amount', Number(amountMax))
       if (fileFilter) r = r.eq('upload_batch_id', fileFilter)
-      if (collectorFilter) r = r.eq('picked_up_by', collectorFilter)
+      // A collector can show up as either the person who submitted a check
+      // for approval or the person it was ultimately logged as picked up
+      // by, so match either column. This is a second, independent `.or()`
+      // call — supabase-js ANDs separate `.or()` groups together, so this
+      // combines correctly with the search clause above rather than
+      // replacing it.
+   if (collectorFilter) {
+  r = r.or(`picked_up_by.eq.${collectorFilter},collector_name.eq.${collectorFilter}`)
+}
       return r
     },
     [query, dateFrom, dateTo, amountMin, amountMax, fileFilter, collectorFilter],
@@ -192,9 +228,9 @@ export default function AdminChecks() {
       try {
         let req = supabase
           .from('checks')
-          .select(
-            'id, row_number, payee, payor, check_no, check_date, amount, status, picked_up_by, picked_up_at, upload_batches(file_name, uploaded_at)',
-            { count: 'exact' },
+         .select(
+  'id, row_number, payee, payor, check_no, check_date, amount, status, picked_up_by, picked_up_at, or_no, ar_collected, remarks, collector_name, submitted_by_name, submitted_at, upload_batches(file_name, uploaded_at)',
+  { count: 'exact' },
           )
           .range(pageIndex * pageSize, pageIndex * pageSize + pageSize - 1)
 
@@ -234,15 +270,20 @@ export default function AdminChecks() {
     [status, sortKey, sortAsc, pageSize, applyCommonFilters],
   )
 
-  // Head-only counts (no rows fetched) so the available/picked-up split
-  // stays cheap regardless of table size, and reflects every filter except
-  // status itself so the split is always meaningful.
+  // Head-only counts (no rows fetched) so the available / pending / picked-up
+  // split stays cheap regardless of table size, and reflects every filter
+  // except status itself so the split is always meaningful. This also
+  // feeds the KPI cards at the top of the page.
   const loadStats = useCallback(async () => {
     try {
-      const [availableRes, pickedUpRes] = await Promise.all([
+      const [availableRes, pendingRes, pickedUpRes] = await Promise.all([
         applyCommonFilters(supabase.from('checks').select('id', { count: 'exact', head: true })).eq(
           'status',
           'available',
+        ),
+        applyCommonFilters(supabase.from('checks').select('id', { count: 'exact', head: true })).eq(
+          'status',
+          'pending_approval',
         ),
         applyCommonFilters(supabase.from('checks').select('id', { count: 'exact', head: true })).eq(
           'status',
@@ -252,10 +293,11 @@ export default function AdminChecks() {
       if (!isMountedRef.current) return
       setStats({
         available: availableRes.error ? null : availableRes.count ?? 0,
+        pendingApproval: pendingRes.error ? null : pendingRes.count ?? 0,
         pickedUp: pickedUpRes.error ? null : pickedUpRes.count ?? 0,
       })
     } catch {
-      if (isMountedRef.current) setStats({ available: null, pickedUp: null })
+      if (isMountedRef.current) setStats({ available: null, pendingApproval: null, pickedUp: null })
     }
   }, [applyCommonFilters])
 
@@ -288,9 +330,11 @@ export default function AdminChecks() {
   const hasAdvancedFilters = !!(dateFrom || dateTo || amountMin || amountMax || fileFilter || collectorFilter)
   const hasAnyFilters = hasAdvancedFilters || !!query.trim() || status !== 'all'
 
+  const statusLabel = (s) => (s === 'available' ? 'Available' : s === 'pending_approval' ? 'Pending approval' : 'Picked up')
+
   const activeChips = useMemo(() => {
     const chips = []
-    if (status !== 'all') chips.push({ key: 'status', label: `Status: ${status === 'available' ? 'Available' : 'Picked up'}`, clear: () => setStatus('all') })
+    if (status !== 'all') chips.push({ key: 'status', label: `Status: ${statusLabel(status)}`, clear: () => setStatus('all') })
     if (dateFrom || dateTo) chips.push({ key: 'dates', label: `Date: ${dateFrom || '…'} → ${dateTo || '…'}`, clear: () => { setDateFrom(''); setDateTo('') } })
     if (amountMin || amountMax) chips.push({ key: 'amount', label: `Amount: ${amountMin || '0'} - ${amountMax || '∞'}`, clear: () => { setAmountMin(''); setAmountMax('') } })
     if (fileFilter) {
@@ -299,73 +343,195 @@ export default function AdminChecks() {
     }
     if (collectorFilter) chips.push({ key: 'collector', label: `Collector: ${collectorFilter}`, clear: () => setCollectorFilter('') })
     return chips
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status, dateFrom, dateTo, amountMin, amountMax, fileFilter, collectorFilter, fileOptions])
 
-  function openPickup(row) {
-    setActiveRow(row)
-    setCollectorName('')
-    setPickupError('')
+  // ---------------------------------------------------------------------
+  // Submit for approval (available -> pending_approval)
+  // ---------------------------------------------------------------------
+
+  function openSubmitModal(targetRows) {
+    if (!targetRows || targetRows.length === 0) return
+    setSubmitError('')
+    setSubmitTargets(targetRows)
   }
 
-  function closePickup() {
-    if (submitting) return
-    setActiveRow(null)
-    setPickupError('')
+  function closeSubmitModal() {
+    if (submitSubmitting) return
+    setSubmitTargets(null)
+    setSubmitError('')
   }
 
-  async function confirmPickup() {
-    if (!collectorName.trim() || !activeRow || submitting) return
-    setSubmitting(true)
-    setPickupError('')
+  // Called by the modal once the admin has entered a collector name and a
+  // complete OR no. / AR-collected / remarks entry for every included
+  // check. Re-validates everything server-side-of-the-UI before writing,
+  // since the modal's own validation only gates its button — it doesn't
+  // guarantee the data reaching this function is still valid.
+async function confirmSubmitForApproval(collectorName, entries) {
+    if (!submitTargets || submitSubmitting) return
+
+    const trimmedName = collectorName.trim()
+    if (!trimmedName) {
+      setSubmitError("Enter the collector's full name.")
+      return
+    }
+
+    const included = submitTargets.filter((r) => entries[r.id]?.include)
+    if (included.length === 0) {
+      setSubmitError('Include at least one check to submit.')
+      return
+    }
+
+    const seenOrNos = new Map()
+    for (const r of included) {
+      const entry = entries[r.id]
+      const orNo = entry.orNo?.trim() ?? ''
+      if (!orNo || entry.collected === null || entry.collected === undefined) {
+        setSubmitError('Enter an OR number and AR-collected status for every check being submitted.')
+        return
+      }
+      if (entry.collected === false && !entry.remarks?.trim()) {
+        setSubmitError('Enter a reason for every check where AR was not collected.')
+        return
+      }
+      const key = orNo.toLowerCase()
+      if (seenOrNos.has(key)) {
+        setSubmitError("Each check needs its own unique OR number — duplicates were found.")
+        return
+      }
+      seenOrNos.set(key, r.id)
+    }
+
+    const trimmedAdminName = (adminName || '').trim()
+    if (!trimmedAdminName) {
+      setSubmitError('Could not identify the signed-in admin. Please refresh and try again.')
+      return
+    }
+
+    setSubmitSubmitting(true)
+    setSubmitError('')
 
     try {
-      const { error } = await supabase
-        .from('checks')
-        .update({
-          status: 'picked_up',
-          picked_up_by: collectorName.trim(),
-          picked_up_at: new Date().toISOString(),
-        })
-        .eq('id', activeRow.id)
+      // Creating the pickup_reservations row and stamping checks with its
+      // id has to happen through a SECURITY DEFINER RPC — the admin's own
+      // role doesn't have RLS permission to INSERT into
+      // pickup_reservations directly (that's what caused the 403). This
+      // mirrors admin_submit_for_approval / approver_decide, which are
+      // RPCs for the same reason.
+      //
+      // Pass a plain array/object, not JSON.stringify() — supabase-js
+      // already serializes this for the jsonb param, and double-encoding
+      // it makes Postgres receive a jsonb *string* instead of a jsonb
+      // *array*.
+      const p_check_outcomes = included.map((r) => {
+        const entry = entries[r.id]
+        return {
+          check_id: r.id,
+          or_no: entry.orNo.trim(),
+          ar_collected: entry.collected,
+          remarks: entry.collected === false ? entry.remarks.trim() : null,
+        }
+      })
 
-      if (error) {
-        setPickupError(error.message || 'Something went wrong. Please try again.')
-        push({ variant: 'error', title: 'Update failed', description: error.message })
+      const { data: reservationId, error } = await supabase.rpc(
+        'admin_submit_available_checks_for_approval',
+        {
+          p_collector_name: trimmedName,
+          p_admin_name: trimmedAdminName,
+          p_check_outcomes,
+        },
+      )
+
+      if (!isMountedRef.current) return
+
+      if (error || !reservationId) {
+        setSubmitError(error?.message || 'Could not submit the selected checks. Please try again.')
         return
       }
 
+      setSubmitTargets(null)
+      setSelectedIds(new Set())
       push({
         variant: 'success',
-        title: 'Marked as picked up',
-        description: `${activeRow.payee} — ${collectorName.trim()}`,
+        title: 'Submitted for approval',
+        description: `${included.length} check${included.length === 1 ? '' : 's'} — ${trimmedName}`,
       })
-      setActiveRow(null)
       load(page)
       loadStats()
     } catch (err) {
-      const message = err?.message || 'Something went wrong. Please try again.'
-      setPickupError(message)
-      push({ variant: 'error', title: 'Update failed', description: message })
+      if (!isMountedRef.current) return
+      setSubmitError(err?.message || 'Something went wrong. Please try again.')
     } finally {
-      setSubmitting(false)
+      if (isMountedRef.current) setSubmitSubmitting(false)
     }
   }
 
-  async function undoPickup(row) {
-    if (undoingIds.has(row.id)) return
-    setUndoingIds((prev) => new Set(prev).add(row.id))
+  // ---------------------------------------------------------------------
+  // Cancel a pending submission (pending_approval -> available), and undo a
+  // finalized pickup (picked_up -> available). Both are uniform updates
+  // across however many ids are involved, so a single `.in('id', ids)`
+  // call covers the single-row and bulk cases alike.
+  // ---------------------------------------------------------------------
 
+  async function cancelSubmissions(ids, label) {
+    if (ids.length === 0) return
+    setCancelingIds((prev) => {
+      const next = new Set(prev)
+      ids.forEach((id) => next.add(id))
+      return next
+    })
+    try {
+      const { error } = await supabase
+        .from('checks')
+       .update({ status: 'available', or_no: null, ar_collected: null, remarks: null, collector_name: null, submitted_by_name: null, submitted_at: null })
+        .in('id', ids)
+
+      if (error) {
+        push({ variant: 'error', title: 'Could not cancel submission', description: error.message })
+        return
+      }
+      push({
+        variant: 'info',
+        title: 'Submission cancelled',
+        description: label || `${ids.length} check${ids.length === 1 ? '' : 's'}`,
+      })
+      setSelectedIds(new Set())
+      load(page)
+      loadStats()
+    } catch (err) {
+      push({ variant: 'error', title: 'Could not cancel submission', description: err?.message || 'Please try again.' })
+    } finally {
+      setCancelingIds((prev) => {
+        const next = new Set(prev)
+        ids.forEach((id) => next.delete(id))
+        return next
+      })
+    }
+  }
+
+  async function undoPickups(ids, label) {
+    if (ids.length === 0) return
+    setUndoingIds((prev) => {
+      const next = new Set(prev)
+      ids.forEach((id) => next.add(id))
+      return next
+    })
     try {
       const { error } = await supabase
         .from('checks')
         .update({ status: 'available', picked_up_by: null, picked_up_at: null })
-        .eq('id', row.id)
+        .in('id', ids)
 
       if (error) {
         push({ variant: 'error', title: 'Could not undo', description: error.message })
         return
       }
-      push({ variant: 'info', title: 'Reverted to available', description: row.payee })
+      push({
+        variant: 'info',
+        title: 'Reverted to available',
+        description: label || `${ids.length} check${ids.length === 1 ? '' : 's'}`,
+      })
+      setSelectedIds(new Set())
       load(page)
       loadStats()
     } catch (err) {
@@ -373,7 +539,7 @@ export default function AdminChecks() {
     } finally {
       setUndoingIds((prev) => {
         const next = new Set(prev)
-        next.delete(row.id)
+        ids.forEach((id) => next.delete(id))
         return next
       })
     }
@@ -401,90 +567,10 @@ export default function AdminChecks() {
   }
 
   const selectedAvailable = rows.filter((r) => selectedIds.has(r.id) && r.status === 'available')
+  const selectedPendingApproval = rows.filter((r) => selectedIds.has(r.id) && r.status === 'pending_approval')
   const selectedPickedUp = rows.filter((r) => selectedIds.has(r.id) && r.status === 'picked_up')
-
-  function openBulkPickup() {
-    setBulkAction('pickup')
-    setBulkCollectorName('')
-    setBulkError('')
-  }
-
-  function openBulkUndo() {
-    setBulkAction('undo')
-    setBulkError('')
-  }
-
-  function closeBulkDialog() {
-    if (bulkSubmitting) return
-    setBulkAction(null)
-    setBulkError('')
-  }
-
-  async function confirmBulkPickup() {
-    if (!bulkCollectorName.trim() || selectedAvailable.length === 0 || bulkSubmitting) return
-    setBulkSubmitting(true)
-    setBulkError('')
-    try {
-      const ids = selectedAvailable.map((r) => r.id)
-      const { error } = await supabase
-        .from('checks')
-        .update({ status: 'picked_up', picked_up_by: bulkCollectorName.trim(), picked_up_at: new Date().toISOString() })
-        .in('id', ids)
-
-      if (error) {
-        setBulkError(error.message || 'Something went wrong. Please try again.')
-        push({ variant: 'error', title: 'Bulk update failed', description: error.message })
-        return
-      }
-
-      push({
-        variant: 'success',
-        title: 'Marked as picked up',
-        description: `${ids.length} check${ids.length === 1 ? '' : 's'} — ${bulkCollectorName.trim()}`,
-      })
-      setBulkAction(null)
-      setSelectedIds(new Set())
-      load(page)
-      loadStats()
-    } catch (err) {
-      const message = err?.message || 'Something went wrong. Please try again.'
-      setBulkError(message)
-      push({ variant: 'error', title: 'Bulk update failed', description: message })
-    } finally {
-      setBulkSubmitting(false)
-    }
-  }
-
-  async function confirmBulkUndo() {
-    if (selectedPickedUp.length === 0 || bulkSubmitting) return
-    setBulkSubmitting(true)
-    setBulkError('')
-    try {
-      const ids = selectedPickedUp.map((r) => r.id)
-      const { error } = await supabase
-        .from('checks')
-        .update({ status: 'available', picked_up_by: null, picked_up_at: null })
-        .in('id', ids)
-
-      if (error) {
-        setBulkError(error.message || 'Something went wrong. Please try again.')
-        push({ variant: 'error', title: 'Bulk undo failed', description: error.message })
-        return
-      }
-
-      push({ variant: 'info', title: 'Reverted to available', description: `${ids.length} check${ids.length === 1 ? '' : 's'}` })
-      setBulkAction(null)
-      setSelectedIds(new Set())
-      load(page)
-      loadStats()
-    } catch (err) {
-      const message = err?.message || 'Something went wrong. Please try again.'
-      setBulkError(message)
-      push({ variant: 'error', title: 'Bulk undo failed', description: message })
-    } finally {
-      setBulkSubmitting(false)
-    }
-  }
+  const cancelingSelected = selectedPendingApproval.some((r) => cancelingIds.has(r.id))
+  const undoingSelected = selectedPickedUp.some((r) => undoingIds.has(r.id))
 
   const totalPages = Math.max(1, Math.ceil(count / pageSize))
   const rangeStart = count === 0 ? 0 : page * pageSize + 1
@@ -497,7 +583,7 @@ export default function AdminChecks() {
         <div>
           <h1 className="font-display text-2xl font-semibold text-ink-900">Checks register</h1>
           <p className="mt-1 text-sm text-ink-400">
-            Search every uploaded check, sort any column, mark pickups, and undo mistakes.
+            Search every uploaded check, sort any column, submit pickups for approval, and undo mistakes.
           </p>
         </div>
         <div className="flex items-center gap-3 text-right">
@@ -509,11 +595,49 @@ export default function AdminChecks() {
               <p className="mt-0.5 flex items-center gap-2 font-mono">
                 <span className="text-ledger-stamp">{stats.available ?? '—'} available</span>
                 <span className="text-ink-300">·</span>
+                <span className="text-amber-600">{stats.pendingApproval ?? '—'} pending</span>
+                <span className="text-ink-300">·</span>
                 <span>{stats.pickedUp ?? '—'} picked up</span>
               </p>
             </div>
           )}
         </div>
+      </div>
+
+      {/* KPI summary row — mirrors the dashboard's KpiCard pattern so both
+          pages feel consistent. Fed entirely by `stats` and `count`, which
+          are already fetched by loadStats()/load() above, so this adds no
+          extra network calls. Numbers update live as filters change since
+          `stats` respects every active filter except status itself. */}
+      <div className="mb-5 grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <KpiCard
+          icon={Layers}
+          label="Matching filters"
+          value={loading ? null : count}
+          secondary={loading ? null : count === 0 ? 'No results' : `${rangeStart}–${rangeEnd} shown`}
+          accent="lightTeal"
+        />
+        <KpiCard
+          icon={Wallet}
+          label="Available"
+          value={loading ? null : stats.available}
+          secondary="Ready for pickup"
+          accent="teal"
+        />
+        <KpiCard
+          icon={Hourglass}
+          label="Pending approval"
+          value={loading ? null : stats.pendingApproval}
+          secondary="Awaiting approver review"
+          accent="orange"
+        />
+        <KpiCard
+          icon={CircleCheckBig}
+          label="Picked up"
+          value={loading ? null : stats.pickedUp}
+          secondary="Completed pickups"
+          accent="teal"
+        />
       </div>
 
       <div className="mb-3 flex flex-col gap-3 sm:flex-row">
@@ -539,6 +663,7 @@ export default function AdminChecks() {
         <Select value={status} onChange={(e) => setStatus(e.target.value)} className="sm:w-48">
           <option value="all">All statuses</option>
           <option value="available">Available</option>
+          <option value="pending_approval">Pending approval</option>
           <option value="picked_up">Picked up</option>
         </Select>
         <Button
@@ -612,7 +737,7 @@ export default function AdminChecks() {
             </Select>
           </div>
           <div>
-            <label className="mb-1 block text-xs font-medium text-ink-500">Collected by</label>
+            <label className="mb-1 block text-xs font-medium text-ink-500">Collector (submitted or picked up)</label>
             <Select value={collectorFilter} onChange={(e) => setCollectorFilter(e.target.value)}>
               <option value="">Anyone</option>
               {collectorOptions.map((c) => (
@@ -634,11 +759,41 @@ export default function AdminChecks() {
           {selectedIds.size > 0 ? (
             <div className="flex flex-wrap items-center gap-2 rounded-md border border-ledger-stamp/30 bg-ledger-stamp/5 px-3 py-1.5 text-xs">
               <span className="font-medium text-ink-700">{selectedIds.size} selected</span>
-              <Button size="sm" variant="stamp" onClick={openBulkPickup} disabled={selectedAvailable.length === 0}>
-                <PackageCheck className="h-3.5 w-3.5" /> Mark picked up ({selectedAvailable.length})
+              <Button
+                size="sm"
+                variant="stamp"
+                onClick={() => openSubmitModal(selectedAvailable)}
+                disabled={selectedAvailable.length === 0}
+              >
+                <Send className="h-3.5 w-3.5" /> Submit for approval ({selectedAvailable.length})
               </Button>
-              <Button size="sm" variant="ghost" onClick={openBulkUndo} disabled={selectedPickedUp.length === 0}>
-                <RotateCcw className="h-3.5 w-3.5" /> Undo ({selectedPickedUp.length})
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() =>
+                  cancelSubmissions(
+                    selectedPendingApproval.map((r) => r.id),
+                    `${selectedPendingApproval.length} check${selectedPendingApproval.length === 1 ? '' : 's'}`,
+                  )
+                }
+                disabled={selectedPendingApproval.length === 0 || cancelingSelected}
+              >
+                {cancelingSelected ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RotateCcw className="h-3.5 w-3.5" />}
+                Cancel submission ({selectedPendingApproval.length})
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() =>
+                  undoPickups(
+                    selectedPickedUp.map((r) => r.id),
+                    `${selectedPickedUp.length} check${selectedPickedUp.length === 1 ? '' : 's'}`,
+                  )
+                }
+                disabled={selectedPickedUp.length === 0 || undoingSelected}
+              >
+                {undoingSelected ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RotateCcw className="h-3.5 w-3.5" />}
+                Undo pickup ({selectedPickedUp.length})
               </Button>
               <button
                 onClick={() => setSelectedIds(new Set())}
@@ -778,20 +933,36 @@ export default function AdminChecks() {
                   <td className={cellPad}>
                     {row.status === 'available' ? (
                       <Badge variant="available">Available</Badge>
+                    ) : row.status === 'pending_approval' ? (
+                      <PendingApprovalBadge row={row} />
                     ) : (
                       <Badge variant="pickedup">Picked up by {row.picked_up_by || 'unknown'}</Badge>
                     )}
                   </td>
                   <td className={cn(cellPad, 'text-right')}>
                     {row.status === 'available' ? (
-                      <Button size="sm" variant="stamp" onClick={() => openPickup(row)}>
-                        <PackageCheck className="h-3.5 w-3.5" /> Mark picked up
+                      <Button size="sm" variant="stamp" onClick={() => openSubmitModal([row])}>
+                        <Send className="h-3.5 w-3.5" /> Submit for approval
+                      </Button>
+                    ) : row.status === 'pending_approval' ? (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => cancelSubmissions([row.id], row.payee)}
+                        disabled={cancelingIds.has(row.id)}
+                      >
+                        {cancelingIds.has(row.id) ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <RotateCcw className="h-3.5 w-3.5" />
+                        )}
+                        {cancelingIds.has(row.id) ? 'Cancelling…' : 'Cancel submission'}
                       </Button>
                     ) : (
                       <Button
                         size="sm"
                         variant="ghost"
-                        onClick={() => undoPickup(row)}
+                        onClick={() => undoPickups([row.id], row.payee)}
                         disabled={undoingIds.has(row.id)}
                       >
                         {undoingIds.has(row.id) ? (
@@ -846,105 +1017,65 @@ export default function AdminChecks() {
         </div>
       )}
 
-      <Dialog
-        open={!!activeRow}
-        onClose={closePickup}
-        title="Mark check as picked up"
-        description={activeRow ? `${activeRow.payee} · Check #${activeRow.check_no}` : ''}
-      >
-        <label className="mb-1 block text-xs font-medium text-ink-500">Collector name</label>
-        <Input
-          value={collectorName}
-          onChange={(e) => setCollectorName(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') {
-              e.preventDefault()
-              confirmPickup()
-            }
-          }}
-          placeholder="Full name of the person picking up"
-          autoFocus
+      {submitTargets && (
+        <SubmitApprovalModal
+          rows={submitTargets}
+          onCancel={closeSubmitModal}
+          onConfirm={confirmSubmitForApproval}
+          submitting={submitSubmitting}
+          error={submitError}
         />
-        {pickupError && (
-          <p className="mt-2 flex items-center gap-1.5 text-xs text-red-600">
-            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-            {pickupError}
-          </p>
-        )}
-        <div className="mt-4 flex justify-end gap-2">
-          <Button variant="outline" onClick={closePickup} disabled={submitting}>
-            Cancel
-          </Button>
-          <Button variant="stamp" disabled={!collectorName.trim() || submitting} onClick={confirmPickup}>
-            {submitting && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-            {submitting ? 'Saving…' : 'Confirm pickup'}
-          </Button>
-        </div>
-      </Dialog>
-
-      <Dialog
-        open={bulkAction === 'pickup'}
-        onClose={closeBulkDialog}
-        title="Mark selected checks as picked up"
-        description={`${selectedAvailable.length} available check${selectedAvailable.length === 1 ? '' : 's'} selected`}
-      >
-        <label className="mb-1 block text-xs font-medium text-ink-500">Collector name</label>
-        <Input
-          value={bulkCollectorName}
-          onChange={(e) => setBulkCollectorName(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') {
-              e.preventDefault()
-              confirmBulkPickup()
-            }
-          }}
-          placeholder="Full name of the person picking up"
-          autoFocus
-        />
-        {bulkError && (
-          <p className="mt-2 flex items-center gap-1.5 text-xs text-red-600">
-            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-            {bulkError}
-          </p>
-        )}
-        <div className="mt-4 flex justify-end gap-2">
-          <Button variant="outline" onClick={closeBulkDialog} disabled={bulkSubmitting}>
-            Cancel
-          </Button>
-          <Button
-            variant="stamp"
-            disabled={!bulkCollectorName.trim() || selectedAvailable.length === 0 || bulkSubmitting}
-            onClick={confirmBulkPickup}
-          >
-            {bulkSubmitting && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-            {bulkSubmitting ? 'Saving…' : `Confirm for ${selectedAvailable.length}`}
-          </Button>
-        </div>
-      </Dialog>
-
-      <Dialog
-        open={bulkAction === 'undo'}
-        onClose={closeBulkDialog}
-        title="Undo pickup for selected checks"
-        description={`${selectedPickedUp.length} picked-up check${selectedPickedUp.length === 1 ? '' : 's'} selected — this reverts them to Available.`}
-      >
-        {bulkError && (
-          <p className="mb-2 flex items-center gap-1.5 text-xs text-red-600">
-            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-            {bulkError}
-          </p>
-        )}
-        <div className="mt-2 flex justify-end gap-2">
-          <Button variant="outline" onClick={closeBulkDialog} disabled={bulkSubmitting}>
-            Cancel
-          </Button>
-          <Button variant="stamp" disabled={selectedPickedUp.length === 0 || bulkSubmitting} onClick={confirmBulkUndo}>
-            {bulkSubmitting && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-            {bulkSubmitting ? 'Reverting…' : `Undo ${selectedPickedUp.length}`}
-          </Button>
-        </div>
-      </Dialog>
+      )}
     </div>
+  )
+}
+
+// Compact stat card reused from the admin dashboard's KPI pattern, so the
+// register and the dashboard feel like one product. Color usage follows
+// the brand palette: teal (`ledger-stamp`) for healthy/actionable states,
+// light teal for the neutral aggregate total, and orange (`ledger-amber`)
+// for anything sitting in a review queue — matching the semantics already
+// used by <Badge> and <PendingApprovalBadge> elsewhere on this page.
+function KpiCard({ icon: Icon, label, value, secondary, accent = 'teal', loading }) {
+  const accents = {
+    teal: { badge: 'bg-ledger-stamp/10 text-ledger-stampDark', ring: 'border-ledger-stamp/30' },
+    lightTeal: { badge: 'bg-teal-50 text-teal-600', ring: 'border-teal-200' },
+    orange: { badge: 'bg-ledger-amber/10 text-ledger-amber', ring: 'border-ledger-amber/30' },
+    ink: { badge: 'bg-ink-50 text-ink-700', ring: 'border-ink-100' },
+  }
+  const style = accents[accent] || accents.teal
+  const isLoading = loading || value === null || value === undefined
+
+  return (
+    <Card>
+      <CardContent className="relative overflow-hidden p-4">
+        <div
+          className={cn(
+            'pointer-events-none absolute -right-4 -top-4 h-16 w-16 rounded-full border-2 border-dashed',
+            style.ring,
+          )}
+          aria-hidden="true"
+        />
+        <div className="relative flex items-start gap-3">
+          <div className={cn('flex h-9 w-9 shrink-0 items-center justify-center rounded-full', style.badge)}>
+            <Icon className="h-4 w-4" />
+          </div>
+          <div className="min-w-0 flex-1">
+            {isLoading ? (
+              <div className="h-6 w-14 animate-pulse rounded bg-ink-100" />
+            ) : (
+              <p className="truncate font-display text-lg font-semibold text-ink-900">
+                {typeof value === 'number' ? value.toLocaleString() : value}
+              </p>
+            )}
+            <p className="truncate text-xs text-ink-400">{label}</p>
+            {!isLoading && secondary && (
+              <p className="mt-0.5 truncate font-mono text-xs text-ink-500">{secondary}</p>
+            )}
+          </div>
+        </div>
+      </CardContent>
+    </Card>
   )
 }
 
@@ -989,6 +1120,424 @@ function CopyableCheckNo({ value }) {
         <Copy className="h-3 w-3 opacity-0 group-hover:opacity-100" />
       )}
     </button>
+  )
+}
+
+// Compact badge for a check awaiting approver review. The full OR no. / AR
+// collected / remarks trail is available on hover via the title attribute
+// rather than as extra table columns, so the register stays scannable.
+function PendingApprovalBadge({ row }) {
+  const details = [
+    row.or_no ? `OR #${row.or_no}` : null,
+    row.ar_collected === null || row.ar_collected === undefined
+      ? null
+      : row.ar_collected
+      ? 'AR collected'
+      : `AR not collected${row.remarks ? ` — ${row.remarks}` : ''}`,
+  ]
+    .filter(Boolean)
+    .join(' · ')
+
+ const title = [
+  row.collector_name ? `Collector: ${row.collector_name}` : null,
+  row.submitted_by_name ? `Submitted by ${row.submitted_by_name}` : null,
+  details || null,
+  'Awaiting approver review',
+].filter(Boolean).join(' — ')
+
+  return (
+    <span className="inline-flex flex-col items-start gap-0.5" title={title}>
+      <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-700">
+        <Hourglass className="h-3 w-3" />
+        Pending approval
+      </span>
+     {row.collector_name && <span className="text-[11px] text-ink-400">for {row.collector_name}</span>}
+    </span>
+  )
+}
+
+// Every check starts "included" (assumed being submitted) with an empty OR
+// number and no AR-collected answer, so the admin's default action is to
+// fill in details for everything selected — they only need to exclude rows
+// they change their mind about.
+function buildInitialSubmitEntries(rowsList) {
+  const initial = {}
+  rowsList.forEach((r) => {
+    initial[r.id] = { include: true, orNo: '', collected: null, remarks: '' }
+  })
+  return initial
+}
+
+function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
+  const [collectorName, setCollectorName] = useState('')
+  const [entries, setEntries] = useState(() => buildInitialSubmitEntries(rows))
+  const dialogRef = useRef(null)
+  const cancelButtonRef = useRef(null)
+  const nameInputRef = useRef(null)
+
+  // Focuses the collector-name field on open (it's always the first thing
+  // to fill in) and restores focus to whatever was focused before the
+  // modal opened once it closes. Deliberately an empty dependency array —
+  // this must run once on mount only.
+  useEffect(() => {
+    const previouslyFocused = document.activeElement
+    nameInputRef.current?.focus()
+    const prevOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    return () => {
+      document.body.style.overflow = prevOverflow
+      if (previouslyFocused instanceof HTMLElement) previouslyFocused.focus()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Escape-to-close and a light focus trap so keyboard users aren't
+  // dropped out of the modal into the page behind it.
+  useEffect(() => {
+    function handleKeyDown(e) {
+      if (e.key === 'Escape' && !submitting) {
+        onCancel()
+        return
+      }
+      if (e.key === 'Tab' && dialogRef.current) {
+        const focusable = dialogRef.current.querySelectorAll(
+          'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+        )
+        if (focusable.length === 0) return
+        const first = focusable[0]
+        const last = focusable[focusable.length - 1]
+        if (e.shiftKey && document.activeElement === first) {
+          e.preventDefault()
+          last.focus()
+        } else if (!e.shiftKey && document.activeElement === last) {
+          e.preventDefault()
+          first.focus()
+        }
+      }
+    }
+    document.addEventListener('keydown', handleKeyDown)
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [submitting, onCancel])
+
+  const updateInclude = useCallback((id, value) => {
+    setEntries((prev) => ({
+      ...prev,
+      [id]: {
+        include: value,
+        orNo: value ? prev[id]?.orNo || '' : '',
+        collected: value ? prev[id]?.collected ?? null : null,
+        remarks: value ? prev[id]?.remarks || '' : '',
+      },
+    }))
+  }, [])
+
+  const updateOrNo = useCallback((id, value) => {
+    setEntries((prev) => ({ ...prev, [id]: { ...prev[id], orNo: value } }))
+  }, [])
+
+  const updateCollected = useCallback((id, value) => {
+    setEntries((prev) => ({
+      ...prev,
+      [id]: { ...prev[id], collected: value, remarks: value === true ? '' : prev[id]?.remarks || '' },
+    }))
+  }, [])
+
+  const updateRemarks = useCallback((id, value) => {
+    setEntries((prev) => ({ ...prev, [id]: { ...prev[id], remarks: value } }))
+  }, [])
+
+  const trimmedName = collectorName.trim()
+  const nameEntered = trimmedName.length > 0
+
+  // How many included checks currently have a complete outcome, and
+  // whether any entered OR numbers collide.
+  const { completedCount, duplicateOrNos, includeCount } = useMemo(() => {
+    const seenCounts = {}
+    let completed = 0
+    let included = 0
+    rows.forEach((r) => {
+      const entry = entries[r.id]
+      if (!entry?.include) return
+      included += 1
+      const orNo = entry.orNo?.trim() ?? ''
+      const reasonOk = entry.collected !== false || !!entry.remarks?.trim()
+      if (orNo && entry.collected !== null && entry.collected !== undefined && reasonOk) completed += 1
+      if (orNo) {
+        const key = orNo.toLowerCase()
+        seenCounts[key] = (seenCounts[key] || 0) + 1
+      }
+    })
+    const duplicates = new Set(
+      Object.entries(seenCounts)
+        .filter(([, c]) => c > 1)
+        .map(([k]) => k),
+    )
+    return { completedCount: completed, duplicateOrNos: duplicates, includeCount: included }
+  }, [entries, rows])
+
+  const hasDuplicates = duplicateOrNos.size > 0
+  const allComplete = includeCount > 0 && completedCount === includeCount && !hasDuplicates
+  const canSubmit = nameEntered && allComplete && !submitting
+
+  function handleConfirm() {
+    if (!canSubmit) return
+    onConfirm(collectorName, entries)
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-40 flex items-center justify-center bg-ink-900/40 p-4"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget && !submitting) onCancel()
+      }}
+    >
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="submit-approval-title"
+        className="relative w-full max-w-2xl overflow-hidden rounded-xl bg-white shadow-xl"
+      >
+        <div className="flex items-center justify-between border-b border-ink-100 px-5 py-4">
+          <h2 id="submit-approval-title" className="text-lg font-semibold text-ink-900">
+            Submit for approval
+          </h2>
+          <button
+            onClick={onCancel}
+            disabled={submitting}
+            className="text-ink-300 hover:text-ink-600 disabled:opacity-40"
+            aria-label="Close"
+          >
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        <div className="max-h-[75vh] overflow-y-auto px-5 py-4">
+          <p className="text-sm text-ink-600">
+            {rows.length === 1 ? (
+              <>
+                Enter who is collecting <span className="font-medium text-ink-900">{rows[0].payee}</span>'s check,
+                then confirm the OR number and AR status. It goes to an approver for verification before it's marked
+                picked up.
+              </>
+            ) : (
+              <>
+                Enter who is collecting these {rows.length} checks, then confirm the OR number and AR status for
+                each. They go to an approver for verification before they're marked picked up.
+              </>
+            )}
+          </p>
+
+          <div className="mt-3">
+            <label className="mb-1 block text-xs font-medium text-ink-500">Collector name</label>
+            <Input
+              ref={nameInputRef}
+              value={collectorName}
+              onChange={(e) => setCollectorName(e.target.value)}
+              placeholder="Full name of the person picking up"
+            />
+          </div>
+
+          {nameEntered && (
+            <div className="mt-4">
+              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                <p className="text-xs font-medium text-ink-500">Per-check details</p>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="rounded-full bg-ledger-stamp/10 px-2 py-0.5 text-[11px] font-medium text-ledger-stamp">
+                    {includeCount} to submit
+                  </span>
+                  <span
+                    className={cn(
+                      'rounded-full px-2 py-0.5 text-[11px] font-medium',
+                      allComplete ? 'bg-ledger-stamp/10 text-ledger-stamp' : 'bg-orange-100 text-orange-700',
+                    )}
+                  >
+                    {completedCount} of {includeCount} entered
+                  </span>
+                </div>
+              </div>
+
+              <div className="max-h-[22rem] overflow-y-auto rounded-md border border-ink-100">
+                <table className="w-full text-xs">
+                  <thead className="sticky top-0 bg-ink-50">
+                    <tr className="text-left uppercase tracking-wide text-ink-400">
+                      <th className="px-3 py-1.5 font-medium">Include</th>
+                      <th className="px-3 py-1.5 font-medium">Check no.</th>
+                      <th className="px-3 py-1.5 font-medium">Payee</th>
+                      <th className="px-3 py-1.5 text-right font-medium">Amount</th>
+                      <th className="px-3 py-1.5 font-medium">OR no.</th>
+                      <th className="px-3 py-1.5 font-medium">AR collected</th>
+                      <th className="px-3 py-1.5 font-medium">Remarks</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-ink-50">
+                    {rows.map((r, idx) => {
+                      const entry = entries[r.id] || { include: true, orNo: '', collected: null, remarks: '' }
+                      const trimmedOrNo = entry.orNo?.trim() ?? ''
+                      const isDuplicate = entry.include && trimmedOrNo && duplicateOrNos.has(trimmedOrNo.toLowerCase())
+                      const needsReason = entry.include && entry.collected === false
+                      const missingReason = needsReason && !entry.remarks?.trim()
+                      const rowIncomplete =
+                        entry.include &&
+                        (!trimmedOrNo || entry.collected === null || entry.collected === undefined || missingReason)
+
+                      return (
+                        <tr
+                          key={r.id}
+                          className={cn(
+                            !entry.include && 'bg-slate-50/70',
+                            entry.include && isDuplicate && 'bg-red-50/70',
+                            entry.include && !isDuplicate && rowIncomplete && 'bg-amber-50/50',
+                          )}
+                        >
+                          <td className="px-3 py-2">
+                            <button
+                              type="button"
+                              onClick={() => updateInclude(r.id, !entry.include)}
+                              aria-pressed={entry.include}
+                              aria-label={
+                                entry.include
+                                  ? `Exclude check ${r.check_no || idx + 1}`
+                                  : `Include check ${r.check_no || idx + 1}`
+                              }
+                              className={entry.include ? 'text-ledger-stamp' : 'text-ink-300 hover:text-ink-500'}
+                            >
+                              {entry.include ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
+                            </button>
+                          </td>
+                          <td className="px-3 py-2 font-mono text-ink-700">{r.check_no || '—'}</td>
+                          <td className="max-w-[110px] truncate px-3 py-2 text-ink-900">{r.payee || '—'}</td>
+                          <td className="px-3 py-2 text-right font-mono text-ink-700">{formatCurrency(r.amount)}</td>
+                          <td className="px-2 py-1.5">
+                            {entry.include ? (
+                              <>
+                                <input
+                                  type="text"
+                                  inputMode="numeric"
+                                  value={entry.orNo}
+                                  onChange={(e) => updateOrNo(r.id, e.target.value)}
+                                  onBlur={(e) => updateOrNo(r.id, e.target.value.trim())}
+                                  placeholder="OR no."
+                                  maxLength={40}
+                                  aria-label={`OR number for check ${r.check_no || idx + 1}`}
+                                  className={cn(
+                                    'w-24 rounded border px-2 py-1 text-xs text-ink-800 focus:outline-none focus:ring-1 focus:ring-ledger-stamp',
+                                    isDuplicate ? 'border-red-400' : 'border-ink-200',
+                                  )}
+                                />
+                                {isDuplicate && (
+                                  <p className="mt-0.5 text-[10px] leading-tight text-red-600">Duplicate</p>
+                                )}
+                              </>
+                            ) : (
+                              <span className="text-ink-300">—</span>
+                            )}
+                          </td>
+                          <td className="px-2 py-1.5">
+                            {entry.include ? (
+                              <div
+                                className="flex gap-1"
+                                role="group"
+                                aria-label={`AR collected for check ${r.check_no || idx + 1}`}
+                              >
+                                <button
+                                  type="button"
+                                  onClick={() => updateCollected(r.id, true)}
+                                  aria-pressed={entry.collected === true}
+                                  className={cn(
+                                    'rounded border px-2 py-1 text-[11px] font-medium transition',
+                                    entry.collected === true
+                                      ? 'border-ledger-stamp bg-ledger-stamp text-white'
+                                      : 'border-ink-200 text-ink-500 hover:bg-ink-50',
+                                  )}
+                                >
+                                  Yes
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => updateCollected(r.id, false)}
+                                  aria-pressed={entry.collected === false}
+                                  className={cn(
+                                    'rounded border px-2 py-1 text-[11px] font-medium transition',
+                                    entry.collected === false
+                                      ? 'border-ink-700 bg-ink-700 text-white'
+                                      : 'border-ink-200 text-ink-500 hover:bg-ink-50',
+                                  )}
+                                >
+                                  No
+                                </button>
+                              </div>
+                            ) : (
+                              <span className="text-ink-300">—</span>
+                            )}
+                          </td>
+                          <td className="px-2 py-1.5">
+                            {needsReason ? (
+                              <input
+                                type="text"
+                                value={entry.remarks}
+                                onChange={(e) => updateRemarks(r.id, e.target.value)}
+                                placeholder="Why wasn't AR collected?"
+                                maxLength={200}
+                                aria-label={`Remarks for check ${r.check_no || idx + 1}`}
+                                className={cn(
+                                  'w-40 rounded border px-2 py-1 text-xs text-ink-800 focus:outline-none focus:ring-1 focus:ring-ledger-stamp',
+                                  missingReason ? 'border-orange-400' : 'border-ink-200',
+                                )}
+                              />
+                            ) : (
+                              <span className="text-ink-300">—</span>
+                            )}
+                          </td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+
+              {!allComplete && (
+                <p className="mt-2 flex items-center gap-1.5 text-xs text-orange-600">
+                  <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                  {includeCount === 0
+                    ? 'Include at least one check to submit.'
+                    : hasDuplicates
+                    ? 'Each check needs its own unique OR number.'
+                    : "Every included check needs an OR number and AR-collected status (plus a reason if AR wasn't collected)."}
+                </p>
+              )}
+            </div>
+          )}
+
+          {error && (
+            <p className="mt-3 flex items-center gap-1.5 text-sm text-red-600">
+              <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+              {error}
+            </p>
+          )}
+        </div>
+
+        <div className="flex items-center justify-end gap-2 border-t border-ink-100 px-5 py-4">
+          <button
+            ref={cancelButtonRef}
+            onClick={onCancel}
+            disabled={submitting}
+            className="rounded-md border border-ink-200 px-4 py-2 text-sm font-medium text-ink-600 hover:bg-ink-50 disabled:opacity-40"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={handleConfirm}
+            disabled={!canSubmit}
+            title={!canSubmit && nameEntered ? 'Every included check needs complete details before submitting' : undefined}
+            className="flex items-center gap-2 rounded-md bg-ledger-stamp px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {submitting && <Loader2 className="h-4 w-4 animate-spin" />}
+            {submitting ? 'Submitting…' : includeCount > 1 ? `Submit ${includeCount} for approval` : 'Submit for approval'}
+          </button>
+        </div>
+      </div>
+    </div>
   )
 }
 

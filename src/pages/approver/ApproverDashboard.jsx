@@ -3,7 +3,8 @@
 // Overview page for the approver area — mirrors the structure and "ledger"
 // visual identity of AdminDashboard.jsx, but the KPIs are about the
 // approval queue itself: what's waiting on you, how fast you're clearing
-// it, and how it's trending, instead of pickup/collection activity.
+// it, how it's trending, and (new) who's driving the numbers — instead of
+// pickup/collection activity.
 //
 // Decision history (approved/rejected) does NOT live on `checks` — that
 // table only tracks the current state (approved_by/approved_at reflect the
@@ -11,6 +12,17 @@
 // constraint). The actual per-decision record, including rejections, is
 // `check_activity_log` (action = 'approved' | 'rejected'), joined back to
 // `checks` for payee/check_no/amount. See flattenDecisionRow() below.
+//
+// Layout:
+//   1. Key figures        — primary KPI row (queue size, approved, rejected, avg time)
+//   2. Insights           — secondary KPI row (approval rate, SLA, top approver, largest pending)
+//   3. Wait breakdown + decision trend
+//   4. Top submitters + approver leaderboard
+//   5. Rejection reasons + recent decisions
+//
+// The KpiCard component below is the shared template for any future
+// approver/admin page — icon badge, accent ring, optional delta pill,
+// optional link-through. Reuse it rather than hand-rolling new stat cards.
 //
 // Access: gated at the route level by <RequireRole roles={['approver','admin']}>
 // (see App.jsx), plus an in-component check here as defense-in-depth.
@@ -28,7 +40,6 @@ import {
   ShieldAlert,
   ShieldX,
   Timer,
-  Layers,
   Users,
   BarChart3,
   TrendingUp,
@@ -36,6 +47,11 @@ import {
   ChevronRight,
   CheckCircle2,
   XCircle,
+  Percent,
+  Target,
+  Award,
+  Banknote,
+  MessageSquareWarning,
 } from 'lucide-react'
 import { supabase } from '../../lib/supabaseClient'
 import { Card, CardContent } from '../../components/ui/card'
@@ -46,6 +62,7 @@ const DAY_MS = 86400000
 const HOUR_MS = 3600000
 const URGENT_WAIT_HOURS = 24
 const TREND_DAYS = 14
+const SLA_TARGET_HOURS = 24
 const ALLOWED_ROLES = ['approver', 'admin']
 
 const PERIOD_OPTIONS = [
@@ -73,7 +90,8 @@ export default function ApproverDashboard() {
   const [period, setPeriod] = useState('7d')
   const [pendingChecks, setPendingChecks] = useState([])
   const [decidedPeriod, setDecidedPeriod] = useState([])
-  const [prevPeriodCount, setPrevPeriodCount] = useState(0)
+  const [prevPeriodApproved, setPrevPeriodApproved] = useState(0)
+  const [prevPeriodRejected, setPrevPeriodRejected] = useState(0)
   const [decidedTrend, setDecidedTrend] = useState([])
   const [recentDecisions, setRecentDecisions] = useState([])
   const [loading, setLoading] = useState(true)
@@ -117,16 +135,18 @@ export default function ApproverDashboard() {
       try {
         const queries = [
           // Everything currently waiting on a decision — powers the
-          // wait-time breakdown and the top KPI cards.
+          // wait-time breakdown, the top KPI cards, top submitters, and
+          // the "largest pending check" insight.
           supabase
             .from('checks')
             .select('id, payee, check_no, amount, submitted_at, submitted_by_name')
             .eq('status', 'pending_approval'),
 
           // Decided within the selected period, for the KPI cards, the
-          // avg-time-to-decision stat, and the rejection rate. Joins back
-          // to `checks` for payee/check_no/amount/submitted_at — the log
-          // row itself only has the check_id and what happened.
+          // avg-time-to-decision stat, rejection rate, approval rate, SLA
+          // compliance, the approver leaderboard, and rejection reasons.
+          // Joins back to `checks` for payee/check_no/amount/submitted_at —
+          // the log row itself only has the check_id and what happened.
           (() => {
             let q = supabase
               .from('check_activity_log')
@@ -136,15 +156,17 @@ export default function ApproverDashboard() {
             return q
           })(),
 
-          // Decided during the equivalent prior window, for the delta badge.
+          // Decided during the equivalent prior window, broken out by
+          // action so we can show both a raw-volume delta and an
+          // approval-rate delta, not just a total-count delta.
           activeOption.days != null
             ? supabase
                 .from('check_activity_log')
-                .select('id', { count: 'exact', head: true })
+                .select('action')
                 .in('action', ['approved', 'rejected'])
                 .gte('performed_at', prevStartIso)
                 .lt('performed_at', periodStartIso)
-            : Promise.resolve({ count: 0, error: null }),
+            : Promise.resolve({ data: [], error: null }),
 
           // Fixed 14-day window for the approved/rejected trend chart,
           // independent of the period selector so the shape stays
@@ -180,9 +202,12 @@ export default function ApproverDashboard() {
           return
         }
 
+        const prevRows = Array.isArray(prevRes.data) ? prevRes.data : []
+
         setPendingChecks(Array.isArray(pendingRes.data) ? pendingRes.data : [])
         setDecidedPeriod((decidedRes.data || []).map(flattenDecisionRow))
-        setPrevPeriodCount(prevRes.count || 0)
+        setPrevPeriodApproved(prevRows.filter((r) => r.action === 'approved').length)
+        setPrevPeriodRejected(prevRows.filter((r) => r.action === 'rejected').length)
         setDecidedTrend(Array.isArray(trendRes.data) ? trendRes.data : [])
         setRecentDecisions((recentRes.data || []).map(flattenDecisionRow))
         setLastUpdated(new Date())
@@ -209,7 +234,11 @@ export default function ApproverDashboard() {
   const rejectedAmount = useMemo(() => sumAmount(rejectedPeriod), [rejectedPeriod])
 
   const decidedCount = decidedPeriod.length
-  const decidedDelta = useMemo(() => computeDelta(decidedCount, prevPeriodCount), [decidedCount, prevPeriodCount])
+  const prevDecidedCount = prevPeriodApproved + prevPeriodRejected
+  const decidedDelta = useMemo(
+    () => computeDelta(decidedCount, prevDecidedCount),
+    [decidedCount, prevDecidedCount]
+  )
 
   const rejectionRate = decidedCount > 0 ? Math.round((rejectedPeriod.length / decidedCount) * 100) : null
 
@@ -223,11 +252,41 @@ export default function ApproverDashboard() {
     return totalMs / withBoth.length / HOUR_MS
   }, [decidedPeriod])
 
+  // Approval rate — share of decisions in the period that were approvals,
+  // plus a point-delta against the prior equivalent window.
+  const approvalRate = useMemo(() => computeApprovalRate(approvedPeriod.length, decidedCount), [
+    approvedPeriod.length,
+    decidedCount,
+  ])
+  const prevApprovalRate = useMemo(
+    () => computeApprovalRate(prevPeriodApproved, prevDecidedCount),
+    [prevPeriodApproved, prevDecidedCount]
+  )
+  const approvalRateDelta = useMemo(() => {
+    if (approvalRate === null || prevApprovalRate === null) return null
+    const diff = approvalRate - prevApprovalRate
+    return { pct: diff, direction: diff >= 0 ? 'up' : 'down', isNew: false }
+  }, [approvalRate, prevApprovalRate])
+
+  // SLA compliance — share of decisions made within the target turnaround.
+  const slaCompliance = useMemo(() => computeSlaCompliance(decidedPeriod, SLA_TARGET_HOURS), [decidedPeriod])
+
+  // Approver leaderboard — who's clearing the queue, and how their
+  // approve/reject split looks, for this period.
+  const approverLeaderboard = useMemo(() => buildApproverLeaderboard(decidedPeriod, 5), [decidedPeriod])
+  const topApprover = approverLeaderboard[0] || null
+
+  // Most common rejection remarks, so patterns in why checks bounce are
+  // visible at a glance instead of buried in the activity log.
+  const rejectionReasons = useMemo(() => buildRejectionReasons(rejectedPeriod, 5), [rejectedPeriod])
+
+  const largestPending = useMemo(() => findLargestPending(pendingChecks), [pendingChecks])
+
   const waitBreakdown = useMemo(() => computeWaitBreakdown(pendingChecks, now), [pendingChecks, now])
 
   const trend = useMemo(() => buildDecisionTrend(decidedTrend, TREND_DAYS), [decidedTrend])
 
-  const topSubmitters = useMemo(() => buildTopSubmitters(pendingChecks, 5), [pendingChecks])
+  const topSubmitters = useMemo(() => buildTopSubmitters(pendingChecks, now, 5), [pendingChecks, now])
 
   const activePeriodOption = PERIOD_OPTIONS.find((o) => o.value === period) || PERIOD_OPTIONS[1]
 
@@ -352,6 +411,78 @@ export default function ApproverDashboard() {
         />
       </div>
 
+      <div className="mb-2 mt-6 flex items-center justify-between gap-2">
+        <p className="font-mono text-[11px] uppercase tracking-[0.15em] text-ink-300">Insights</p>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <KpiCard
+          icon={Percent}
+          label="Approval rate"
+          value={loading ? null : approvalRate === null ? '—' : `${approvalRate}%`}
+          secondary={loading ? null : `${approvedPeriod.length} of ${decidedCount} decision${decidedCount === 1 ? '' : 's'}`}
+          accent={
+            !loading && approvalRate !== null
+              ? approvalRate < 70
+                ? 'critical'
+                : approvalRate < 90
+                ? 'amber'
+                : 'stamp'
+              : 'ink'
+          }
+          delta={period === 'all' ? null : approvalRateDelta}
+          deltaUnit="pts"
+        />
+        <KpiCard
+          icon={Target}
+          label={`SLA compliance · ${SLA_TARGET_HOURS}h`}
+          value={loading ? null : slaCompliance === null ? '—' : `${slaCompliance.pct}%`}
+          secondary={
+            loading
+              ? null
+              : slaCompliance
+              ? `${slaCompliance.within} of ${slaCompliance.total} within target`
+              : 'No data yet'
+          }
+          accent={
+            !loading && slaCompliance !== null
+              ? slaCompliance.pct < 70
+                ? 'critical'
+                : slaCompliance.pct < 90
+                ? 'amber'
+                : 'ink'
+              : 'ink'
+          }
+        />
+        <KpiCard
+          icon={Award}
+          label={`Top approver · ${activePeriodOption.label}`}
+          value={loading ? null : topApprover ? topApprover.name : '—'}
+          secondary={
+            loading
+              ? null
+              : topApprover
+              ? `${topApprover.total} decision${topApprover.total === 1 ? '' : 's'} · ${topApprover.approved} approved / ${topApprover.rejected} rejected`
+              : 'No decisions yet'
+          }
+          accent="ink"
+        />
+        <KpiCard
+          icon={Banknote}
+          label="Largest pending check"
+          value={loading ? null : largestPending ? formatCurrency(Number(largestPending.amount || 0)) : '—'}
+          secondary={
+            loading
+              ? null
+              : largestPending
+              ? `${largestPending.payee || 'Unknown payee'}${largestPending.check_no ? ` · #${largestPending.check_no}` : ''}`
+              : 'Nothing pending'
+          }
+          accent="stamp"
+          to="/approver/pending"
+        />
+      </div>
+
       <div className="mt-5 grid grid-cols-1 gap-5 xl:grid-cols-2">
         <WaitBreakdownCard loading={loading} breakdown={waitBreakdown} />
         <TrendCard loading={loading} trend={trend} />
@@ -359,6 +490,11 @@ export default function ApproverDashboard() {
 
       <div className="mt-5 grid grid-cols-1 gap-5 xl:grid-cols-2">
         <TopSubmittersCard loading={loading} submitters={topSubmitters} />
+        <ApproverLeaderboardCard loading={loading} leaderboard={approverLeaderboard} />
+      </div>
+
+      <div className="mt-5 grid grid-cols-1 gap-5 xl:grid-cols-2">
+        <RejectionReasonsCard loading={loading} reasons={rejectionReasons} totalRejected={rejectedPeriod.length} />
         <SectionCard
           icon={Stamp}
           title="Recent decisions"
@@ -475,16 +611,82 @@ function buildDecisionTrend(decided, days) {
   return out
 }
 
-function buildTopSubmitters(pendingChecks, limit) {
+function buildTopSubmitters(pendingChecks, now, limit) {
   const map = new Map()
   pendingChecks.forEach((c) => {
     const submittedName = c.submitted_by_name || 'Unknown submitter'
-    const entry = map.get(submittedName) || { name: submittedName, count: 0, amount: 0 }
+    const entry = map.get(submittedName) || { name: submittedName, count: 0, amount: 0, totalHours: 0, hoursCount: 0 }
     entry.count += 1
     entry.amount += Number(c.amount || 0)
+    const hours = waitHours(c, now)
+    if (hours !== null) {
+      entry.totalHours += hours
+      entry.hoursCount += 1
+    }
     map.set(submittedName, entry)
   })
+  return [...map.values()]
+    .map((e) => ({ ...e, avgHours: e.hoursCount > 0 ? e.totalHours / e.hoursCount : null }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, limit)
+}
+
+// Who's clearing the queue this period, and how their approve/reject split
+// looks — surfaces workload imbalance and unusually high rejection rates
+// per approver at a glance.
+function buildApproverLeaderboard(decided, limit) {
+  const map = new Map()
+  decided.forEach((d) => {
+    const nameKey = d.decided_by_name || 'Unknown approver'
+    const entry = map.get(nameKey) || { name: nameKey, approved: 0, rejected: 0, amount: 0 }
+    if (d.decision === 'rejected') entry.rejected += 1
+    else entry.approved += 1
+    entry.amount += Number(d.amount || 0)
+    map.set(nameKey, entry)
+  })
+  return [...map.values()]
+    .map((e) => ({ ...e, total: e.approved + e.rejected }))
+    .sort((a, b) => b.total - a.total)
+    .slice(0, limit)
+}
+
+// Groups rejected checks by their (trimmed, case-insensitive) remark text
+// so recurring reasons surface even though remarks are free text.
+function buildRejectionReasons(rejected, limit) {
+  const map = new Map()
+  rejected.forEach((r) => {
+    const label = (r.rejection_remarks || '').trim()
+    if (!label) return
+    const key = label.toLowerCase()
+    const entry = map.get(key) || { label, count: 0 }
+    entry.count += 1
+    map.set(key, entry)
+  })
   return [...map.values()].sort((a, b) => b.count - a.count).slice(0, limit)
+}
+
+function computeApprovalRate(approvedCount, decidedCount) {
+  if (!decidedCount) return null
+  return Math.round((approvedCount / decidedCount) * 100)
+}
+
+// Share of decisions made within the SLA target, measured from submission
+// to decision. Only counts rows where both timestamps are present.
+function computeSlaCompliance(decided, slaHours) {
+  const withBoth = decided.filter((c) => c.submitted_at && c.decided_at)
+  if (withBoth.length === 0) return null
+  const within = withBoth.filter(
+    (c) => (new Date(c.decided_at).getTime() - new Date(c.submitted_at).getTime()) / HOUR_MS <= slaHours
+  ).length
+  return { pct: Math.round((within / withBoth.length) * 100), within, total: withBoth.length }
+}
+
+function findLargestPending(pendingChecks) {
+  if (!pendingChecks.length) return null
+  return pendingChecks.reduce(
+    (max, c) => (Number(c.amount || 0) > Number(max.amount || 0) ? c : max),
+    pendingChecks[0]
+  )
 }
 
 function computeDelta(curr, prev) {
@@ -570,7 +772,13 @@ function SectionCard({ icon: Icon, title, subtitle, right, children, className }
   )
 }
 
-function KpiCard({ icon: Icon, label, value, secondary, loading, accent, delta, to }) {
+// Shared KPI card template — icon badge, accent ring, value + secondary
+// line, optional delta pill (growth % by default, or `deltaUnit="pts"` for
+// point-based deltas like approval-rate swings), optional link-through.
+// Reuse this component for any new stat card on approver/admin pages
+// rather than hand-rolling new markup, so the visual language stays
+// consistent across the app.
+function KpiCard({ icon: Icon, label, value, secondary, loading, accent, delta, deltaUnit = '%', to }) {
   const accents = {
     stamp: { badge: 'bg-ledger-stamp/10 text-ledger-stampDark', ring: 'border-ledger-stamp/30' },
     amber: { badge: 'bg-ledger-amber/10 text-ledger-amber', ring: 'border-ledger-amber/30' },
@@ -603,7 +811,7 @@ function KpiCard({ icon: Icon, label, value, secondary, loading, accent, delta, 
               {delta && !delta.isNew && delta.pct !== null && (
                 <span
                   className={cn(
-                    'flex items-center gap-0.5 text-[11px] font-medium',
+                    'flex shrink-0 items-center gap-0.5 text-[11px] font-medium',
                     delta.direction === 'up' ? 'text-ledger-stampDark' : 'text-ink-400'
                   )}
                 >
@@ -612,11 +820,12 @@ function KpiCard({ icon: Icon, label, value, secondary, loading, accent, delta, 
                   ) : (
                     <TrendingDown className="h-3 w-3" />
                   )}
-                  {Math.abs(delta.pct)}%
+                  {Math.abs(delta.pct)}
+                  {deltaUnit}
                 </span>
               )}
               {delta && delta.isNew && (
-                <span className="text-[11px] font-medium text-ledger-stampDark">new</span>
+                <span className="shrink-0 text-[11px] font-medium text-ledger-stampDark">new</span>
               )}
             </div>
           )}
@@ -778,10 +987,90 @@ function TopSubmittersCard({ loading, submitters }) {
                 <p className="truncate font-medium text-ink-800">{s.name}</p>
                 <p className="font-mono text-xs text-ink-300">
                   {s.count} check{s.count === 1 ? '' : 's'} pending
+                  {s.avgHours !== null ? ` · avg wait ${formatHours(s.avgHours)}` : ''}
                 </p>
               </div>
               <span className="shrink-0 font-mono text-sm font-medium text-ink-800">
                 {formatCurrency(s.amount)}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </SectionCard>
+  )
+}
+
+function ApproverLeaderboardCard({ loading, leaderboard }) {
+  const maxTotal = Math.max(1, ...leaderboard.map((a) => a.total))
+  return (
+    <SectionCard icon={Award} title="Approver activity" subtitle="Who's clearing the queue this period.">
+      {loading ? (
+        <RecentSkeleton />
+      ) : leaderboard.length === 0 ? (
+        <p className="py-6 text-center text-sm text-ink-400">No decisions recorded in this period.</p>
+      ) : (
+        <div className="space-y-3.5">
+          {leaderboard.map((a, idx) => (
+            <div key={a.name} className="flex items-center gap-3 text-sm">
+              <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-dashed border-ink-200 font-mono text-[11px] text-ink-400">
+                {idx + 1}
+              </span>
+              <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-ink-50 font-mono text-[10px] font-semibold text-ink-600">
+                {initials(a.name)}
+              </span>
+              <div className="min-w-0 flex-1">
+                <p className="truncate font-medium text-ink-800">{a.name}</p>
+                <div className="mt-1.5 flex h-1.5 w-full overflow-hidden rounded-full bg-ink-50">
+                  <div className="h-full bg-ledger-stamp/60" style={{ width: `${(a.approved / maxTotal) * 100}%` }} />
+                  <div className="h-full bg-red-300" style={{ width: `${(a.rejected / maxTotal) * 100}%` }} />
+                </div>
+              </div>
+              <div className="shrink-0 text-right">
+                <p className="font-mono text-sm font-medium text-ink-800">{a.total}</p>
+                <p className="font-mono text-[11px] text-ink-300">
+                  {a.approved}/{a.rejected}
+                </p>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </SectionCard>
+  )
+}
+
+function RejectionReasonsCard({ loading, reasons, totalRejected }) {
+  const maxCount = Math.max(1, ...reasons.map((r) => r.count))
+  return (
+    <SectionCard
+      icon={MessageSquareWarning}
+      title="Top rejection reasons"
+      subtitle="Most common remarks left on rejected checks this period."
+    >
+      {loading ? (
+        <div className="space-y-2.5">
+          {Array.from({ length: 3 }).map((_, i) => (
+            <div key={i} className="h-6 animate-pulse rounded bg-ink-50" />
+          ))}
+        </div>
+      ) : reasons.length === 0 ? (
+        <p className="py-6 text-center text-sm text-ink-400">
+          {totalRejected === 0 ? 'No rejections in this period.' : 'No remarks were recorded for rejections.'}
+        </p>
+      ) : (
+        <div className="space-y-2.5">
+          {reasons.map((r) => (
+            <div key={r.label} className="flex items-center gap-3">
+              <div className="h-2 flex-1 overflow-hidden rounded-full bg-ink-50">
+                <div
+                  className="h-full rounded-full bg-red-300"
+                  style={{ width: `${Math.max(4, (r.count / maxCount) * 100)}%` }}
+                />
+              </div>
+              <span className="w-8 shrink-0 text-right font-mono text-xs text-ink-600">{r.count}</span>
+              <span className="max-w-[45%] shrink-0 truncate text-xs text-ink-500" title={r.label}>
+                {r.label}
               </span>
             </div>
           ))}

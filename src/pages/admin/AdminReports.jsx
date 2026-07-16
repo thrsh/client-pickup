@@ -60,6 +60,13 @@ const BRAND_TEAL_RGB = [13, 148, 136]
 /* `buildRow` is the single source of truth for row content — it's    */
 /* used to build the .xlsx workbook, the PDF, AND to render the       */
 /* in-app preview table, so none of the three can drift out of sync.  */
+/*                                                                    */
+/* `released_audit` is a SEPARATE config entry from `released` — it   */
+/* is only ever used when the admin explicitly checks "Include full   */
+/* audit trail" on the Released report. See effectiveReportKey()      */
+/* below, which is the single place that decides which of the two    */
+/* configs actually gets used. The plain `released` config is never   */
+/* modified by that toggle.                                           */
 /* ------------------------------------------------------------------ */
 
 const MANUAL_FILL_COLOR = 'FFFFFBEA' // faint amber — flags cells meant for manual entry
@@ -167,6 +174,7 @@ const REPORT_CONFIG = {
     statusFilter: 'picked_up',
     showReleasedDate: true,
     amountColIndex: 5,
+    legendText: 'Highlighted cells are blank in the file — fill them in manually after export.',
     columns: [
       { header: 'NO', width: 6 },
       { header: 'Check Date', width: 14 },
@@ -197,12 +205,108 @@ const REPORT_CONFIG = {
     ],
   },
 
+  // Same underlying data (status = 'picked_up') as `released`, but with
+  // the full chain of custody: who uploaded it, who reserved it for
+  // pickup, who submitted it for approval, and who approved it — plus
+  // when each of those happened. Only ever selected via
+  // effectiveReportKey() when the admin checks "Include full audit
+  // trail" on the Released report.
+  released_audit: {
+    fileTag: 'released-check-report-audit-trail',
+    title: 'RELEASED CHECK REPORT — FULL AUDIT TRAIL',
+    statusFilter: 'picked_up',
+    showReleasedDate: true,
+    amountColIndex: 7,
+    legendText:
+      'Highlighted cells indicate missing audit data — the step may not have happened yet, or the record predates this tracking.',
+    columns: [
+      { header: 'NO', width: 6 },
+      { header: 'Check Date', width: 14 },
+      { header: 'Date Uploaded', width: 14 },
+      { header: 'Uploaded By', width: 18 },
+      { header: 'Payee', width: 24 },
+      { header: 'Payor', width: 22 },
+      { header: 'Check Amount', width: 16 },
+      { header: 'Client Name', width: 24 },
+      { header: 'Status', width: 14 },
+      { header: 'Selected For Pickup By', width: 20 },
+      { header: 'Date Selected', width: 14 },
+      { header: 'Submitted By', width: 20 },
+      { header: 'Date Submitted', width: 14 },
+      { header: 'Approved By', width: 20 },
+      { header: 'Date Approved', width: 14 },
+      { header: 'Date Released', width: 14 },
+      { header: 'Aging (Days)', width: 12 },
+      { header: 'OR No.', width: 14 },
+      { header: 'AR Collected (Y/N)', width: 16 },
+      { header: 'Remarks', width: 22 },
+    ],
+    buildRow: (r, no) => [
+      { value: no, align: 'center' },
+      { value: r.check_date ? new Date(r.check_date) : null, numFmt: 'mm/dd/yyyy', align: 'center' },
+      { value: r.created_at ? new Date(r.created_at) : null, numFmt: 'mm/dd/yyyy', align: 'center' },
+      {
+        value: r.upload_batches?.uploaded_by || '',
+        align: 'center',
+        fill: r.upload_batches?.uploaded_by ? undefined : MANUAL_FILL_COLOR,
+      },
+      { value: r.payee || '' },
+      { value: r.payor || '' },
+      { value: Number(r.amount || 0), numFmt: '#,##0.00', align: 'right' },
+      { value: getClientName(r) },
+      { value: releasedStatusLabel(r.status), align: 'center' },
+      {
+        value: r.collector_name || '',
+        align: 'center',
+        fill: r.collector_name ? undefined : MANUAL_FILL_COLOR,
+      },
+      {
+        value: r.pickup_reservations?.reserved_at ? new Date(r.pickup_reservations.reserved_at) : null,
+        numFmt: 'mm/dd/yyyy',
+        align: 'center',
+        fill: r.pickup_reservations?.reserved_at ? undefined : MANUAL_FILL_COLOR,
+      },
+      {
+        value: r.submitted_by_name || '',
+        align: 'center',
+        fill: r.submitted_by_name ? undefined : MANUAL_FILL_COLOR,
+      },
+      {
+        value: r.submitted_at ? new Date(r.submitted_at) : null,
+        numFmt: 'mm/dd/yyyy',
+        align: 'center',
+        fill: r.submitted_at ? undefined : MANUAL_FILL_COLOR,
+      },
+      {
+        value: r.approved_by_name || '',
+        align: 'center',
+        fill: r.approved_by_name ? undefined : MANUAL_FILL_COLOR,
+      },
+      {
+        value: r.approved_at ? new Date(r.approved_at) : null,
+        numFmt: 'mm/dd/yyyy',
+        align: 'center',
+        fill: r.approved_at ? undefined : MANUAL_FILL_COLOR,
+      },
+      { value: r.picked_up_at ? new Date(r.picked_up_at) : null, numFmt: 'mm/dd/yyyy', align: 'center' },
+      { value: daysBetween(r.created_at, r.picked_up_at) ?? '', align: 'center' },
+      { value: r.or_no || '', align: 'center', fill: r.or_no ? undefined : MANUAL_FILL_COLOR },
+      {
+        value: arCollectedLabel(r.ar_collected),
+        align: 'center',
+        fill: r.ar_collected == null ? MANUAL_FILL_COLOR : undefined,
+      },
+      { value: remarksLabel(r.status) },
+    ],
+  },
+
   unreleased: {
     fileTag: 'unreleased-check-report',
     title: 'UNRELEASED CHECK REPORT',
     statusFilter: 'available',
     showReleasedDate: false,
     amountColIndex: 5,
+    legendText: 'Highlighted cells are blank in the file — fill them in manually after export.',
     columns: [
       { header: 'No', width: 6 },
       { header: 'Payee Name', width: 26 },
@@ -231,6 +335,7 @@ const REPORT_CONFIG = {
     statusFilter: 'picked_up',
     showReleasedDate: true,
     amountColIndex: 9,
+    legendText: 'Highlighted cells are blank in the file — fill them in manually after export.',
     columns: [
       { header: 'No', width: 6 },
       { header: 'Releasing Unit Name', width: 22 },
@@ -275,6 +380,15 @@ const REPORT_TYPE_LABELS = {
 }
 
 const PAGE_SIZE_OPTIONS = [25, 50, 100]
+
+// The ONLY place that decides which REPORT_CONFIG entry is actually used.
+// `reportType` is what the Select control shows/stores — it never changes
+// to 'released_audit' itself. The toggle just switches which config key
+// this function resolves to when reportType === 'released'. Every other
+// report type ignores includeAuditTrail entirely.
+function effectiveReportKey(reportType, includeAuditTrail) {
+  return reportType === 'released' && includeAuditTrail ? 'released_audit' : reportType
+}
 
 /* ------------------------------------------------------------------ */
 /* NameCombobox                                                       */
@@ -555,6 +669,10 @@ export default function AdminReports() {
 
   // Filter form state
   const [reportType, setReportType] = useState('released')
+  // Only meaningful when reportType === 'released'. Reset to false any
+  // time reportType changes away from 'released' (see the Select's
+  // onChange below) so it can never silently apply to another report.
+  const [includeAuditTrail, setIncludeAuditTrail] = useState(false)
   const [reportPayees, setReportPayees] = useState([])
   const [reportPayeeAll, setReportPayeeAll] = useState(false)
   const [reportPayor, setReportPayor] = useState('')
@@ -568,7 +686,13 @@ export default function AdminReports() {
   // Data behind the current preview (fetched once, reused for download —
   // no refetch needed unless the user explicitly refreshes)
   const [rawRows, setRawRows] = useState([])
-  const [previewMeta, setPreviewMeta] = useState(null) // { reportType, payees, payeeAll, payor, releasedDate, dateFrom, dateTo }
+  // previewMeta.configKey is the resolved REPORT_CONFIG key actually used
+  // for this preview (e.g. 'released_audit'), captured at the moment the
+  // admin clicked "Preview report" — every download/refresh/PDF action
+  // below reads previewMeta.configKey, never reportType or
+  // includeAuditTrail directly, so editing the form afterward can't
+  // retroactively change what an already-generated preview shows.
+  const [previewMeta, setPreviewMeta] = useState(null)
   const [fetching, setFetching] = useState(false)
   const [fetchError, setFetchError] = useState('')
   const [downloading, setDownloading] = useState(false)
@@ -612,6 +736,12 @@ export default function AdminReports() {
 
   // Fetches every matching row in pages of 1000 (Supabase's per-request cap)
   // so large payee/payor/date combinations don't get silently truncated.
+  // Audit-trail columns (collector_name, submitted_by_name, submitted_at,
+  // approved_by_name, approved_at, and the embedded reservation/batch
+  // fields) are always selected — they're harmless no-ops for report
+  // types whose buildRow doesn't reference them, and it means toggling
+  // "Include full audit trail" before clicking Preview needs no separate
+  // fetch path.
   async function fetchAllChecks({ payees, payeeAll, payor, statusFilter, dateFrom, dateTo }) {
     const PAGE = 1000
     let from = 0
@@ -621,7 +751,7 @@ export default function AdminReports() {
       let req = supabase
         .from('checks')
         .select(
-          'id, check_no, check_date, payee, payor, amount, status, picked_up_by, picked_up_at, created_at, or_no, ar_collected'
+          'id, check_no, check_date, payee, payor, amount, status, picked_up_by, picked_up_at, created_at, or_no, ar_collected, collector_name, submitted_by_name, submitted_at, approved_by_name, approved_at, reservation_id, pickup_reservations(reserved_at), upload_batches(uploaded_by)'
         )
         .order('check_date', { ascending: true })
         .range(from, from + PAGE - 1)
@@ -650,7 +780,7 @@ export default function AdminReports() {
     if (!reportPayeeAll && reportPayees.length === 0) {
       return `Please select at least one payee, or choose "${ALL_PAYEES_LABEL}".`
     }
-    if (REPORT_CONFIG[reportType].showReleasedDate && !releasedDate) {
+    if (REPORT_CONFIG[effectiveReportKey(reportType, includeAuditTrail)].showReleasedDate && !releasedDate) {
       return 'Please select a released date.'
     }
     if (reportDateFrom && reportDateTo && reportDateFrom > reportDateTo) {
@@ -669,7 +799,8 @@ export default function AdminReports() {
     setFetchError('')
     setFetching(true)
     try {
-      const config = REPORT_CONFIG[reportType]
+      const configKey = effectiveReportKey(reportType, includeAuditTrail)
+      const config = REPORT_CONFIG[configKey]
       const rows = await fetchAllChecks({
         payees: reportPayees,
         payeeAll: reportPayeeAll,
@@ -687,6 +818,8 @@ export default function AdminReports() {
       setRawRows(rows)
       setPreviewMeta({
         reportType,
+        configKey,
+        includeAuditTrail: configKey === 'released_audit',
         payees: reportPayeeAll ? [] : reportPayees,
         payeeAll: reportPayeeAll,
         payor: reportPayor.trim(),
@@ -710,7 +843,7 @@ export default function AdminReports() {
     setFetchError('')
     setFetching(true)
     try {
-      const config = REPORT_CONFIG[previewMeta.reportType]
+      const config = REPORT_CONFIG[previewMeta.configKey]
       const rows = await fetchAllChecks({
         payees: previewMeta.payees,
         payeeAll: previewMeta.payeeAll,
@@ -751,8 +884,8 @@ export default function AdminReports() {
   // Shared header text lines for the report's info block — used to build
   // both the Excel workbook header rows and the PDF header, so the two
   // outputs can't drift apart.
-  function buildHeaderLines(type, { payeeDisplay, payor, releasedDateValue, dateFrom, dateTo }) {
-    const config = REPORT_CONFIG[type]
+  function buildHeaderLines(configKey, { payeeDisplay, payor, releasedDateValue, dateFrom, dateTo }) {
+    const config = REPORT_CONFIG[configKey]
     const lines = [{ text: `Client Name: ${payeeDisplay || '—'}`, size: 11, bold: true }]
     lines.push({ text: `Report Date: ${formatExcelDateLabel(new Date())}`, size: 10 })
     if (dateFrom || dateTo) {
@@ -767,8 +900,8 @@ export default function AdminReports() {
     return lines
   }
 
-  async function buildWorkbook(type, rows, { payeeDisplay, payor, releasedDateValue, dateFrom, dateTo }) {
-    const config = REPORT_CONFIG[type]
+  async function buildWorkbook(configKey, rows, { payeeDisplay, payor, releasedDateValue, dateFrom, dateTo }) {
+    const config = REPORT_CONFIG[configKey]
     const colCount = config.columns.length
 
     const workbook = new ExcelJS.Workbook()
@@ -793,7 +926,7 @@ export default function AdminReports() {
     r++
 
     // Remaining header lines (Client Name, Report Date, Date Range, Released Date)
-    for (const line of buildHeaderLines(type, { payeeDisplay, payor, releasedDateValue, dateFrom, dateTo })) {
+    for (const line of buildHeaderLines(configKey, { payeeDisplay, payor, releasedDateValue, dateFrom, dateTo })) {
       addHeaderRow(sheet, r, colCount, line.text, { bold: line.bold, size: line.size })
       r++
     }
@@ -862,8 +995,8 @@ export default function AdminReports() {
   // header lines and row data as the Excel workbook (via buildHeaderLines
   // and config.buildRow), so all three surfaces — preview table, Excel,
   // PDF — always show identical numbers.
-  function buildPdfDocument(type, rows, { payeeDisplay, payor, releasedDateValue, dateFrom, dateTo }) {
-    const config = REPORT_CONFIG[type]
+  function buildPdfDocument(configKey, rows, { payeeDisplay, payor, releasedDateValue, dateFrom, dateTo }) {
+    const config = REPORT_CONFIG[configKey]
     const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' })
     const margin = 32
 
@@ -880,7 +1013,7 @@ export default function AdminReports() {
     doc.setFont('helvetica', 'normal')
     doc.setFontSize(10)
     doc.setTextColor(60, 60, 60)
-    for (const line of buildHeaderLines(type, { payeeDisplay, payor, releasedDateValue, dateFrom, dateTo })) {
+    for (const line of buildHeaderLines(configKey, { payeeDisplay, payor, releasedDateValue, dateFrom, dateTo })) {
       if (line.bold) doc.setFont('helvetica', 'bold')
       doc.text(line.text, margin, y)
       if (line.bold) doc.setFont('helvetica', 'normal')
@@ -940,9 +1073,9 @@ export default function AdminReports() {
     if (!previewMeta || rawRows.length === 0) return
     setDownloading(true)
     try {
-      const config = REPORT_CONFIG[previewMeta.reportType]
+      const config = REPORT_CONFIG[previewMeta.configKey]
       const payeeDisplay = formatPayeeDisplay(previewMeta.payeeAll, previewMeta.payees)
-      const workbook = await buildWorkbook(previewMeta.reportType, rawRows, {
+      const workbook = await buildWorkbook(previewMeta.configKey, rawRows, {
         payeeDisplay,
         payor: previewMeta.payor,
         releasedDateValue: previewMeta.releasedDate,
@@ -967,7 +1100,7 @@ export default function AdminReports() {
       push?.({
         variant: 'success',
         title: 'Report downloaded',
-        description: `${rawRows.length} check${rawRows.length === 1 ? '' : 's'} included in the ${REPORT_TYPE_LABELS[previewMeta.reportType].toLowerCase()}.`,
+        description: `${rawRows.length} check${rawRows.length === 1 ? '' : 's'} included in the ${config.title.toLowerCase()}.`,
       })
     } catch (err) {
       const message = err?.message || 'Failed to generate the report. Please try again.'
@@ -988,7 +1121,7 @@ export default function AdminReports() {
   }
 
   function pdfFilename() {
-    const config = REPORT_CONFIG[previewMeta.reportType]
+    const config = REPORT_CONFIG[previewMeta.configKey]
     const stamp = new Date().toISOString().slice(0, 10)
     const safePayor = previewMeta.payor.replace(/[^a-z0-9]+/gi, '_')
     const payeeTag = payeeFileTag(previewMeta.payeeAll, previewMeta.payees)
@@ -999,7 +1132,7 @@ export default function AdminReports() {
     if (!previewMeta || rawRows.length === 0) return
     setPdfState((s) => ({ ...s, generating: true }))
     try {
-      const doc = buildPdfDocument(previewMeta.reportType, rawRows, pdfMetaArgs())
+      const doc = buildPdfDocument(previewMeta.configKey, rawRows, pdfMetaArgs())
       const blobUrl = doc.output('bloburl')
       setPdfState((s) => {
         if (s.url) URL.revokeObjectURL(s.url)
@@ -1022,7 +1155,7 @@ export default function AdminReports() {
     if (!previewMeta || rawRows.length === 0) return
     setDownloadingPdf(true)
     try {
-      const doc = buildPdfDocument(previewMeta.reportType, rawRows, pdfMetaArgs())
+      const doc = buildPdfDocument(previewMeta.configKey, rawRows, pdfMetaArgs())
       doc.save(pdfFilename())
     } catch (err) {
       push?.({ variant: 'error', title: 'PDF download failed', description: err?.message || 'Please try again.' })
@@ -1031,7 +1164,7 @@ export default function AdminReports() {
     }
   }
 
-  const activeConfig = previewMeta ? REPORT_CONFIG[previewMeta.reportType] : null
+  const activeConfig = previewMeta ? REPORT_CONFIG[previewMeta.configKey] : null
 
   // Row numbering reflects position in the full, unfiltered result set so
   // "No" stays stable regardless of what the user types into the quick search.
@@ -1088,20 +1221,51 @@ export default function AdminReports() {
             <div className="grid gap-4 sm:grid-cols-2">
               <div>
                 <label className="mb-1 block text-xs font-medium text-gray-500">Report type</label>
-                <Select value={reportType} onChange={(e) => setReportType(e.target.value)}>
+                <Select
+                  value={reportType}
+                  onChange={(e) => {
+                    setReportType(e.target.value)
+                    // The toggle only ever applies to the Released report —
+                    // reset it whenever the report type changes away from
+                    // 'released' so it can't silently carry over and apply
+                    // to a different report type later.
+                    if (e.target.value !== 'released') setIncludeAuditTrail(false)
+                  }}
+                >
                   {Object.entries(REPORT_TYPE_LABELS).map(([value, label]) => (
                     <option key={value} value={value}>{label}</option>
                   ))}
                 </Select>
               </div>
 
-              {REPORT_CONFIG[reportType].showReleasedDate && (
+              {REPORT_CONFIG[effectiveReportKey(reportType, includeAuditTrail)].showReleasedDate && (
                 <div>
                   <label className="mb-1 block text-xs font-medium text-gray-500">Released date</label>
                   <Input type="date" value={releasedDate} onChange={(e) => setReleasedDate(e.target.value)} />
                 </div>
               )}
             </div>
+
+            {/* Audit-trail toggle — only ever shown for the Released report.
+                Unchecked (the default) is the exact original `released`
+                config with no behavior change from before this feature. */}
+            {reportType === 'released' && (
+              <label className="flex cursor-pointer items-start gap-2 rounded-md border border-gray-200 bg-gray-50/60 px-3 py-2.5 text-sm text-gray-700">
+                <input
+                  type="checkbox"
+                  checked={includeAuditTrail}
+                  onChange={(e) => setIncludeAuditTrail(e.target.checked)}
+                  className="mt-0.5 h-4 w-4 accent-teal-600"
+                />
+                <span>
+                  <span className="font-medium">Include full audit trail</span>
+                  <span className="block text-xs text-gray-500">
+                    Adds who uploaded each check and when, who selected it for pickup and when, who
+                    submitted it for approval and when, and who approved it and when.
+                  </span>
+                </span>
+              </label>
+            )}
 
             <div className="grid gap-4 sm:grid-cols-2">
               <div>
@@ -1164,7 +1328,14 @@ export default function AdminReports() {
           <CardHeader className="space-y-4">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
-                <CardTitle className="text-lg">{activeConfig.title}</CardTitle>
+                <CardTitle className="flex items-center gap-2 text-lg">
+                  {activeConfig.title}
+                  {previewMeta.includeAuditTrail && (
+                    <span className="rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-700">
+                      Full audit trail
+                    </span>
+                  )}
+                </CardTitle>
                 <CardDescription>
                   Payor: <span className="font-medium text-gray-700">{previewMeta.payor}</span>
                   {' · '}Payee(s):{' '}
@@ -1282,7 +1453,7 @@ export default function AdminReports() {
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="flex items-center gap-1.5 text-xs text-gray-500">
                 <span className="inline-block h-3 w-3 rounded-sm border border-amber-200" style={{ backgroundColor: '#fffbea' }} />
-                Highlighted cells are blank in the file — fill them in manually after export.
+                {activeConfig.legendText || 'Highlighted cells are blank in the file — fill them in manually after export.'}
               </div>
               <div className="flex items-center gap-2 text-sm text-gray-600">
                 <span>

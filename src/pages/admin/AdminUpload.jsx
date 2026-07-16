@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import * as XLSX from 'xlsx'
 import {
   UploadCloud,
@@ -14,13 +14,20 @@ import {
   Download,
   ChevronDown,
   ChevronUp,
+  Search,
+  Filter,
+  CheckSquare,
+  Square,
+  Wallet,
+  Layers,
+  X,
 } from 'lucide-react'
 import { supabase } from '../../lib/supabaseClient'
 import { Button } from '../../components/ui/button'
 import { Card, CardContent } from '../../components/ui/card'
 import { Select } from '../../components/ui/select'
 import { useToast } from '../../components/ui/toast'
-import { normalizeDate, cn } from '../../lib/utils'
+import { normalizeDate, formatCurrency, cn } from '../../lib/utils'
 
 const REQUIRED_FIELDS = [
   { key: 'payee', label: 'Payee' },
@@ -31,8 +38,43 @@ const REQUIRED_FIELDS = [
 ]
 
 const ACCEPTED_EXTENSIONS = ['.csv', '.xlsx', '.xls']
+// Browsers report CSV/Excel MIME types inconsistently (many omit it
+// entirely), so this is a best-effort secondary check layered on top of
+// the extension check — it only rejects files that are clearly something
+// else (e.g. a renamed PDF or image), not ambiguous/empty types.
+const ACCEPTED_MIME_TYPES = new Set([
+  '',
+  'text/csv',
+  'application/csv',
+  'text/plain',
+  'text/x-csv',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/octet-stream', // some OSes report this for .xlsx
+])
+
+const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024 // 5 MB
+const MAX_ROWS = 1000
 const PREVIEW_ROW_LIMIT = 5
-const EXPANDED_PREVIEW_CAP = 200
+const EXPANDED_PREVIEW_CAP = MAX_ROWS
+const DUPLICATE_CHECK_DEBOUNCE_MS = 400
+const DUPLICATE_CHECK_CHUNK_SIZE = 300
+const IMPORT_CHUNK_SIZE = 500
+
+// Human-readable labels for every validation flag a row can carry — reused
+// by the breakdown panel, the per-cell tooltips, and the flagged-rows CSV
+// export so the wording never drifts between the three.
+const FLAG_LABELS = {
+  missingPayee: 'Missing payee',
+  missingPayor: 'Missing payor',
+  missingCheckNo: 'Missing check no.',
+  invalidAmount: 'Invalid or zero amount',
+  negativeAmount: 'Negative amount',
+  missingDate: 'Missing or unreadable date',
+  futureDate: 'Check dated in the future',
+  duplicateCheckNo: 'Duplicate check no. in this file',
+  existsInSystem: 'Check no. already in the system',
+}
 
 // best-effort auto-detection of column headers
 function guessColumn(headers, field) {
@@ -54,6 +96,54 @@ function formatFileSize(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
+// Validates a File object before it's ever read — extension, best-effort
+// MIME type, emptiness, and the 5 MB size cap. Row-count validation
+// happens later, once the file is actually parsed.
+function validateFile(file) {
+  const ext = file.name.slice(file.name.lastIndexOf('.')).toLowerCase()
+  if (!ACCEPTED_EXTENSIONS.includes(ext)) {
+    return `Unsupported file type "${ext || 'unknown'}". Please upload a ${ACCEPTED_EXTENSIONS.join(', ')} file.`
+  }
+  if (file.type && !ACCEPTED_MIME_TYPES.has(file.type)) {
+    return `This doesn't look like a spreadsheet file (detected type: ${file.type}). Please export it as CSV or Excel and try again.`
+  }
+  if (file.size === 0) {
+    return 'This file is empty.'
+  }
+  if (file.size > MAX_FILE_SIZE_BYTES) {
+    return `This file is ${formatFileSize(file.size)}, which exceeds the ${formatFileSize(
+      MAX_FILE_SIZE_BYTES,
+    )} limit. Please split it into smaller files.`
+  }
+  return null
+}
+
+// ---- Data normalization helpers -------------------------------------------
+
+function normalizeText(raw) {
+  return String(raw ?? '').trim().replace(/\s+/g, ' ')
+}
+
+function normalizeCheckNo(raw) {
+  return String(raw ?? '').trim()
+}
+
+// Strips currency symbols, thousands separators, and stray characters;
+// treats parenthesized values as negative (common in accounting exports),
+// and rounds to cents so downstream sums/display are exact.
+function normalizeAmountValue(raw) {
+  if (raw === null || raw === undefined) return NaN
+  const str = String(raw).trim()
+  if (!str) return NaN
+  const isParenNegative = /^\(.*\)$/.test(str)
+  const cleaned = str.replace(/[^0-9.\-]/g, '')
+  if (!cleaned || cleaned === '-' || cleaned === '.') return NaN
+  let value = Number(cleaned)
+  if (Number.isNaN(value)) return NaN
+  if (isParenNegative) value = -Math.abs(value)
+  return Math.round(value * 100) / 100
+}
+
 function downloadTemplate() {
   const csvContent = [
     'Payee,Payor,Check No,Check Date,Amount',
@@ -65,6 +155,34 @@ function downloadTemplate() {
   const link = document.createElement('a')
   link.href = url
   link.download = 'check-import-template.csv'
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  URL.revokeObjectURL(url)
+}
+
+// Exports the currently-flagged rows (with a plain-English reason column)
+// so an admin can hand the list to whoever owns the source file instead of
+// hunting through the on-screen preview row by row.
+function downloadFlaggedRows(rows, fileNameBase) {
+  if (rows.length === 0) return
+  const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`
+  const header = 'Row,Payee,Payor,Check No,Check Date,Amount,Issues'
+  const lines = rows.map((r) => {
+    const issues = Object.entries(FLAG_LABELS)
+      .filter(([key]) => r.flags[key])
+      .map(([, label]) => label)
+      .join('; ')
+    return [r.rowNumber, esc(r.payee), esc(r.payor), esc(r.check_no), esc(r.check_date || ''), r.amount, esc(issues)].join(
+      ',',
+    )
+  })
+  const csv = [header, ...lines].join('\n')
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = `${fileNameBase.replace(/\.[^.]+$/, '') || 'import'}-flagged-rows.csv`
   document.body.appendChild(link)
   link.click()
   document.body.removeChild(link)
@@ -84,49 +202,188 @@ export default function AdminUpload() {
   const [isDragging, setIsDragging] = useState(false)
   const [importedCount, setImportedCount] = useState(null) // set once import succeeds
   const [showAllRows, setShowAllRows] = useState(false)
+
+  // Advanced preview controls
+  const [excludedRows, setExcludedRows] = useState(() => new Set()) // indices (into rawRows) excluded from import
+  const [previewSearch, setPreviewSearch] = useState('')
+  const [showFlaggedOnly, setShowFlaggedOnly] = useState(false)
+
+  // Cross-checks the mapped check numbers against what's already in the
+  // database, so re-uploading the same batch (or an overlapping one) gets
+  // caught before it creates duplicate register entries.
+  const [existingCheckNos, setExistingCheckNos] = useState(() => new Set())
+  const [checkingDuplicates, setCheckingDuplicates] = useState(false)
+
   const inputRef = useRef(null)
   const { push } = useToast()
 
   const hasFile = headers.length > 0
   const mappingComplete = REQUIRED_FIELDS.every(({ key }) => mapping[key])
 
-  // Per-row quality flags so the preview table can point at the exact
-  // cells that look wrong, not just show an aggregate count.
-  const rowFlags = useMemo(() => {
+  // ---- Normalization + validation pipeline --------------------------------
+  // Every row is normalized once here (trimmed text, parsed currency,
+  // standardized dates) and tagged with every applicable validation flag.
+  // Everything downstream — the KPI cards, the preview table, the CSV
+  // export, and the actual import — reads from this single source of truth
+  // so normalization can never drift between what's shown and what's saved.
+  const normalizedRows = useMemo(() => {
     if (!mappingComplete || rawRows.length === 0) return []
 
     const payeeIdx = headers.indexOf(mapping.payee)
-    const amountIdx = headers.indexOf(mapping.amount)
+    const payorIdx = headers.indexOf(mapping.payor)
+    const checkNoIdx = headers.indexOf(mapping.check_no)
     const dateIdx = headers.indexOf(mapping.check_date)
+    const amountIdx = headers.indexOf(mapping.amount)
 
-    return rawRows.map((row) => {
-      const parsedAmount =
-        Number(String(row[amountIdx] ?? '0').replace(/[^0-9.-]/g, '')) || 0
+    const draft = rawRows.map((row, i) => {
+      const rawAmount = normalizeAmountValue(row[amountIdx])
       return {
-        payee: !String(row[payeeIdx] ?? '').trim(),
-        amount: parsedAmount === 0,
-        check_date: !normalizeDate(row[dateIdx]),
+        index: i,
+        rowNumber: i + 2, // +2 accounts for the header row occupying row 1
+        payee: normalizeText(row[payeeIdx]),
+        payor: normalizeText(row[payorIdx]),
+        check_no: normalizeCheckNo(row[checkNoIdx]),
+        check_date: normalizeDate(row[dateIdx]),
+        amount: Number.isNaN(rawAmount) ? 0 : rawAmount,
+        amountInvalid: Number.isNaN(rawAmount),
       }
+    })
+
+    const checkNoCounts = new Map()
+    draft.forEach((r) => {
+      if (!r.check_no) return
+      const key = r.check_no.toLowerCase()
+      checkNoCounts.set(key, (checkNoCounts.get(key) || 0) + 1)
+    })
+
+    const todayEnd = new Date()
+    todayEnd.setHours(23, 59, 59, 999)
+
+    return draft.map((r) => {
+      const flags = {
+        missingPayee: !r.payee,
+        missingPayor: !r.payor,
+        missingCheckNo: !r.check_no,
+        invalidAmount: r.amountInvalid || r.amount === 0,
+        negativeAmount: !r.amountInvalid && r.amount < 0,
+        missingDate: !r.check_date,
+        futureDate: !!r.check_date && new Date(r.check_date) > todayEnd,
+        duplicateCheckNo: !!r.check_no && checkNoCounts.get(r.check_no.toLowerCase()) > 1,
+      }
+      const hasIssue = Object.values(flags).some(Boolean)
+      return { ...r, flags, hasIssue }
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mappingComplete, rawRows, headers, mapping])
 
-  const dataQuality = useMemo(() => {
-    if (rowFlags.length === 0) return null
-    return {
-      missingPayee: rowFlags.filter((f) => f.payee).length,
-      missingAmount: rowFlags.filter((f) => f.amount).length,
-      missingDate: rowFlags.filter((f) => f.check_date).length,
+  // Looks up mapped check numbers against the database. Debounced and
+  // best-effort: if it fails or is still running, the import flow is never
+  // blocked — this is an extra safety net, not a hard gate.
+  useEffect(() => {
+    if (normalizedRows.length === 0) {
+      setExistingCheckNos(new Set())
+      return
     }
-  }, [rowFlags])
+    const uniqueNos = [...new Set(normalizedRows.map((r) => r.check_no).filter(Boolean))]
+    if (uniqueNos.length === 0) {
+      setExistingCheckNos(new Set())
+      return
+    }
 
-  const totalIssues = dataQuality
-    ? dataQuality.missingPayee + dataQuality.missingAmount + dataQuality.missingDate
-    : 0
+    let cancelled = false
+    setCheckingDuplicates(true)
+    const t = setTimeout(async () => {
+      try {
+        const found = new Set()
+        for (let i = 0; i < uniqueNos.length; i += DUPLICATE_CHECK_CHUNK_SIZE) {
+          const chunk = uniqueNos.slice(i, i + DUPLICATE_CHECK_CHUNK_SIZE)
+          const { data, error } = await supabase.from('checks').select('check_no').in('check_no', chunk)
+          if (!error && data) {
+            data.forEach((d) => d.check_no && found.add(String(d.check_no).toLowerCase()))
+          }
+        }
+        if (!cancelled) setExistingCheckNos(found)
+      } catch {
+        // Best-effort only — a failed lookup just means this particular
+        // safety net doesn't fire; it never blocks the import itself.
+      } finally {
+        if (!cancelled) setCheckingDuplicates(false)
+      }
+    }, DUPLICATE_CHECK_DEBOUNCE_MS)
 
-  const previewRows = showAllRows
-    ? rawRows.slice(0, EXPANDED_PREVIEW_CAP)
-    : rawRows.slice(0, PREVIEW_ROW_LIMIT)
+    return () => {
+      cancelled = true
+      clearTimeout(t)
+    }
+  }, [normalizedRows])
+
+  // Merges the synchronous validation flags with the async system-duplicate
+  // check into the rows the rest of the UI actually renders from.
+  const enrichedRows = useMemo(() => {
+    if (normalizedRows.length === 0) return []
+    return normalizedRows.map((r) => {
+      const existsInSystem = !!r.check_no && existingCheckNos.has(r.check_no.toLowerCase())
+      const flags = { ...r.flags, existsInSystem }
+      return { ...r, flags, hasIssue: r.hasIssue || existsInSystem }
+    })
+  }, [normalizedRows, existingCheckNos])
+
+  const existsInSystemCount = useMemo(
+    () => enrichedRows.filter((r) => r.flags.existsInSystem).length,
+    [enrichedRows],
+  )
+
+  const issueBreakdown = useMemo(() => {
+    const counts = {}
+    Object.keys(FLAG_LABELS).forEach((k) => {
+      counts[k] = 0
+    })
+    enrichedRows.forEach((r) => {
+      Object.keys(counts).forEach((k) => {
+        if (r.flags[k]) counts[k] += 1
+      })
+    })
+    return counts
+  }, [enrichedRows])
+
+  // KPI summary — total rows, how many are actually going to be imported
+  // once exclusions are applied, how many still need review, and the
+  // dollar total of what's about to be saved.
+  const stats = useMemo(() => {
+    if (enrichedRows.length === 0) return null
+    const included = enrichedRows.filter((r) => !excludedRows.has(r.index))
+    const flaggedIncluded = included.filter((r) => r.hasIssue)
+    const validIncluded = included.filter((r) => !r.hasIssue)
+    const totalAmount = included.reduce((s, r) => s + (Number.isFinite(r.amount) ? r.amount : 0), 0)
+    return {
+      total: enrichedRows.length,
+      included: included.length,
+      excluded: excludedRows.size,
+      valid: validIncluded.length,
+      flagged: flaggedIncluded.length,
+      totalAmount,
+      duplicateCount: issueBreakdown.duplicateCheckNo,
+    }
+  }, [enrichedRows, excludedRows, issueBreakdown])
+
+  // Search + "flagged only" filter applied on top of the enriched rows,
+  // independent from pagination (showAllRows) so all three compose cleanly.
+  const searchedRows = useMemo(() => {
+    let list = enrichedRows
+    if (showFlaggedOnly) list = list.filter((r) => r.hasIssue)
+    const q = previewSearch.trim().toLowerCase()
+    if (q) {
+      list = list.filter(
+        (r) =>
+          r.payee.toLowerCase().includes(q) ||
+          r.payor.toLowerCase().includes(q) ||
+          r.check_no.toLowerCase().includes(q),
+      )
+    }
+    return list
+  }, [enrichedRows, showFlaggedOnly, previewSearch])
+
+  const previewRows = showAllRows ? searchedRows.slice(0, EXPANDED_PREVIEW_CAP) : searchedRows.slice(0, PREVIEW_ROW_LIMIT)
 
   function resetFileState() {
     setFileName('')
@@ -139,25 +396,28 @@ export default function AdminUpload() {
     setImportProgress(0)
     setImportedCount(null)
     setShowAllRows(false)
+    setExcludedRows(new Set())
+    setPreviewSearch('')
+    setShowFlaggedOnly(false)
+    setExistingCheckNos(new Set())
     if (inputRef.current) inputRef.current.value = ''
   }
 
   function processFile(file) {
     if (!file) return
 
-    const ext = file.name.slice(file.name.lastIndexOf('.')).toLowerCase()
-    if (!ACCEPTED_EXTENSIONS.includes(ext)) {
-      push({
-        variant: 'error',
-        title: 'Unsupported file type',
-        description: `Please choose a ${ACCEPTED_EXTENSIONS.join(', ')} file.`,
-      })
+    const validationError = validateFile(file)
+    if (validationError) {
+      push({ variant: 'error', title: 'File not accepted', description: validationError })
       return
     }
 
     setParseError('')
     setImportedCount(null)
     setShowAllRows(false)
+    setExcludedRows(new Set())
+    setPreviewSearch('')
+    setShowFlaggedOnly(false)
     setFileName(file.name)
     setFileSize(file.size)
 
@@ -192,6 +452,16 @@ export default function AdminUpload() {
           return
         }
 
+        if (bodyRows.length > MAX_ROWS) {
+          push({
+            variant: 'error',
+            title: 'Too many rows',
+            description: `This file has ${bodyRows.length.toLocaleString()} rows, which exceeds the ${MAX_ROWS.toLocaleString()}-row limit per file. Please split it into multiple files and upload them separately.`,
+          })
+          resetFileState()
+          return
+        }
+
         setHeaders(cleanHeaders)
         setRawRows(bodyRows)
 
@@ -220,23 +490,64 @@ export default function AdminUpload() {
   function handleDrop(e) {
     e.preventDefault()
     setIsDragging(false)
+    if (e.dataTransfer.files?.length > 1) {
+      push({
+        variant: 'error',
+        title: 'One file at a time',
+        description: 'Drop a single CSV or Excel file — only the first one was used.',
+      })
+    }
     processFile(e.dataTransfer.files?.[0])
+  }
+
+  function toggleRowExcluded(index) {
+    setExcludedRows((prev) => {
+      const next = new Set(prev)
+      if (next.has(index)) next.delete(index)
+      else next.add(index)
+      return next
+    })
+  }
+
+  function excludeAllFlagged() {
+    setExcludedRows((prev) => {
+      const next = new Set(prev)
+      enrichedRows.forEach((r) => {
+        if (r.hasIssue) next.add(r.index)
+      })
+      return next
+    })
+  }
+
+  function includeAllRows() {
+    setExcludedRows(new Set())
   }
 
   async function handleImport() {
     if (!mappingComplete || saving) return
+
+    const includedRows = enrichedRows.filter((r) => !excludedRows.has(r.index))
+    if (includedRows.length === 0) {
+      push({
+        variant: 'error',
+        title: 'Nothing to import',
+        description: 'Every row is excluded. Include at least one row before importing.',
+      })
+      return
+    }
+
     setSaving(true)
     setImportProgress(0)
 
-    const colIndex = (field) => headers.indexOf(mapping[field])
-
-    const preparedRows = rawRows.map((row, i) => ({
-      row_number: i + 2, // +2 accounts for the header row occupying row 1
-      payee: String(row[colIndex('payee')] ?? '').trim(),
-      payor: String(row[colIndex('payor')] ?? '').trim(),
-      check_no: String(row[colIndex('check_no')] ?? '').trim(),
-      check_date: normalizeDate(row[colIndex('check_date')]),
-      amount: Number(String(row[colIndex('amount')] ?? '0').replace(/[^0-9.-]/g, '')) || 0,
+    // Rows already carry their normalized values from the pipeline above,
+    // so the saved data always matches exactly what the preview showed.
+    const preparedRows = includedRows.map((r) => ({
+      row_number: r.rowNumber,
+      payee: r.payee,
+      payor: r.payor,
+      check_no: r.check_no,
+      check_date: r.check_date,
+      amount: r.amount,
     }))
 
     try {
@@ -258,9 +569,8 @@ export default function AdminUpload() {
       const toInsert = preparedRows.map((r) => ({ ...r, batch_id: batch.id, status: 'available' }))
 
       // insert in chunks to stay under request size limits
-      const chunkSize = 500
-      for (let i = 0; i < toInsert.length; i += chunkSize) {
-        const chunk = toInsert.slice(i, i + chunkSize)
+      for (let i = 0; i < toInsert.length; i += IMPORT_CHUNK_SIZE) {
+        const chunk = toInsert.slice(i, i + IMPORT_CHUNK_SIZE)
         const { error } = await supabase.from('checks').insert(chunk)
         if (error) {
           push({ variant: 'error', title: 'Import failed partway', description: error.message })
@@ -272,7 +582,10 @@ export default function AdminUpload() {
       push({
         variant: 'success',
         title: 'Import complete',
-        description: `${toInsert.length} checks added from ${fileName}.`,
+        description:
+          excludedRows.size > 0
+            ? `${toInsert.length} checks added from ${fileName} (${excludedRows.size} excluded).`
+            : `${toInsert.length} checks added from ${fileName}.`,
       })
       setImportedCount(toInsert.length)
     } catch (err) {
@@ -291,8 +604,9 @@ export default function AdminUpload() {
       <div className="mb-6">
         <h1 className="font-display text-2xl font-semibold text-ink-900">Upload a file</h1>
         <p className="mt-1 text-sm text-ink-400">
-          Import a CSV or Excel file with Payee, Payor, Check No, Check Date, and Amount columns.
-          Each row's position in the file is stored automatically for cross-reference.
+          Import a CSV or Excel file (up to {formatFileSize(MAX_FILE_SIZE_BYTES)}, {MAX_ROWS.toLocaleString()} rows
+          max) with Payee, Payor, Check No, Check Date, and Amount columns. Each row's position in the file is
+          stored automatically for cross-reference.
         </p>
       </div>
 
@@ -337,7 +651,8 @@ export default function AdminUpload() {
                       {isDragging ? 'Drop it here' : 'Click to choose a file, or drag one in'}
                     </p>
                     <p className="text-xs text-ink-300">
-                      .csv, .xlsx, or .xls · max recommended size: ~10,000 rows per file
+                      .csv, .xlsx, or .xls · up to {formatFileSize(MAX_FILE_SIZE_BYTES)} · max{' '}
+                      {MAX_ROWS.toLocaleString()} rows per file
                     </p>
                     <input
                       ref={inputRef}
@@ -369,8 +684,8 @@ export default function AdminUpload() {
                     <div className="min-w-0">
                       <p className="truncate text-sm font-medium text-ink-800">{fileName}</p>
                       <p className="font-mono text-xs text-ink-400">
-                        {formatFileSize(fileSize)} · {rawRows.length} row{rawRows.length === 1 ? '' : 's'}{' '}
-                        detected
+                        {formatFileSize(fileSize)} / {formatFileSize(MAX_FILE_SIZE_BYTES)} ·{' '}
+                        {rawRows.length.toLocaleString()} / {MAX_ROWS.toLocaleString()} rows
                       </p>
                     </div>
                   </div>
@@ -438,38 +753,149 @@ export default function AdminUpload() {
                     </p>
                   )}
 
-                  {mappingComplete && dataQuality && totalIssues > 0 && (
+                  {/* KPI summary row — same visual language as the checks
+                      register and dashboard, so every admin page reads the
+                      same way. Fed entirely by the normalization pipeline
+                      above; no extra network calls beyond the debounced
+                      duplicate-number lookup already running. */}
+                  {mappingComplete && stats && (
+                    <div className="mt-5 grid grid-cols-2 gap-3 lg:grid-cols-4">
+                      <KpiCard
+                        icon={Layers}
+                        label="Total rows"
+                        value={stats.total}
+                        secondary={stats.excluded > 0 ? `${stats.excluded} excluded` : 'None excluded'}
+                        accent="lightTeal"
+                      />
+                      <KpiCard
+                        icon={CheckCircle2}
+                        label="Ready to import"
+                        value={stats.included}
+                        secondary={`${stats.valid} with no issues`}
+                        accent="teal"
+                      />
+                      <KpiCard
+                        icon={AlertTriangle}
+                        label="Needs review"
+                        value={stats.flagged}
+                        secondary={checkingDuplicates ? 'Checking for duplicates…' : `${stats.duplicateCount} duplicate check no.`}
+                        accent="orange"
+                      />
+                      <KpiCard
+                        icon={Wallet}
+                        label="Total amount"
+                        value={formatCurrency(stats.totalAmount)}
+                        secondary={`${stats.included} check${stats.included === 1 ? '' : 's'} included`}
+                        accent="teal"
+                      />
+                    </div>
+                  )}
+
+                  {mappingComplete && existsInSystemCount > 0 && (
+                    <div className="mt-4 flex items-start gap-2 rounded-md border border-red-200 bg-red-50 px-3.5 py-3 text-xs text-red-700">
+                      <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                      <div>
+                        <p className="font-medium">
+                          {existsInSystemCount} check number{existsInSystemCount === 1 ? '' : 's'} already{' '}
+                          {existsInSystemCount === 1 ? 'exists' : 'exist'} in the system
+                        </p>
+                        <p className="mt-0.5 text-red-600/90">
+                          This may be a duplicate upload. Matching rows are highlighted red in the preview —
+                          review them or use the checkbox to exclude them before importing.
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  {mappingComplete && stats && stats.flagged > 0 && (
                     <div className="mt-4 rounded-md border border-orange-200 bg-orange-50 px-3.5 py-3 text-xs text-ink-600">
                       <p className="flex items-center gap-1.5 font-medium text-orange-600">
                         <AlertTriangle className="h-3.5 w-3.5" />
                         Some rows may need a second look
                       </p>
                       <ul className="mt-1.5 space-y-0.5 pl-5 text-ink-500">
-                        {dataQuality.missingPayee > 0 && (
-                          <li className="list-disc">{dataQuality.missingPayee} row(s) missing a payee</li>
-                        )}
-                        {dataQuality.missingAmount > 0 && (
-                          <li className="list-disc">
-                            {dataQuality.missingAmount} row(s) with a zero or unreadable amount
-                          </li>
-                        )}
-                        {dataQuality.missingDate > 0 && (
-                          <li className="list-disc">
-                            {dataQuality.missingDate} row(s) with a missing or unreadable check date
-                          </li>
-                        )}
+                        {Object.entries(issueBreakdown)
+                          .filter(([, count]) => count > 0)
+                          .map(([key, count]) => (
+                            <li key={key} className="list-disc">
+                              {count} row{count === 1 ? '' : 's'} — {FLAG_LABELS[key].toLowerCase()}
+                            </li>
+                          ))}
                       </ul>
                       <p className="mt-1.5 text-ink-400">
-                        These rows will still be imported — flagged cells are marked orange below so
-                        you can double-check the source file or your column mapping.
+                        Flagged rows are still included by default and will be imported unless you exclude them
+                        below.
                       </p>
                     </div>
                   )}
 
-                  <div className="mt-5 overflow-x-auto rounded-md border border-ink-100">
+                  {/* Preview toolbar — search, flagged-only filter, bulk
+                      include/exclude actions, and a flagged-rows export. */}
+                  <div className="mt-5 flex flex-wrap items-center gap-2">
+                    <div className="relative min-w-[200px] flex-1">
+                      <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-ink-300" />
+                      <input
+                        type="text"
+                        value={previewSearch}
+                        onChange={(e) => setPreviewSearch(e.target.value)}
+                        placeholder="Search payee, payor, or check no..."
+                        className="w-full rounded-md border border-ink-200 py-1.5 pl-8 pr-7 text-xs text-ink-800 focus:outline-none focus:ring-1 focus:ring-teal-400"
+                      />
+                      {previewSearch && (
+                        <button
+                          onClick={() => setPreviewSearch('')}
+                          className="absolute right-2 top-1/2 -translate-y-1/2 text-ink-300 hover:text-ink-600"
+                          aria-label="Clear search"
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setShowFlaggedOnly((v) => !v)}
+                      className={cn(
+                        'flex shrink-0 items-center gap-1 rounded-md border px-2.5 py-1.5 text-xs font-medium transition',
+                        showFlaggedOnly
+                          ? 'border-orange-300 bg-orange-50 text-orange-700'
+                          : 'border-ink-200 text-ink-500 hover:bg-ink-50',
+                      )}
+                    >
+                      <Filter className="h-3.5 w-3.5" />
+                      Flagged only
+                    </button>
+                    <button
+                      type="button"
+                      onClick={excludeAllFlagged}
+                      disabled={!stats || stats.flagged === 0}
+                      className="flex shrink-0 items-center gap-1 rounded-md border border-ink-200 px-2.5 py-1.5 text-xs font-medium text-ink-500 hover:bg-ink-50 disabled:opacity-40"
+                    >
+                      Exclude all flagged
+                    </button>
+                    <button
+                      type="button"
+                      onClick={includeAllRows}
+                      disabled={excludedRows.size === 0}
+                      className="flex shrink-0 items-center gap-1 rounded-md border border-ink-200 px-2.5 py-1.5 text-xs font-medium text-ink-500 hover:bg-ink-50 disabled:opacity-40"
+                    >
+                      Include all
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => downloadFlaggedRows(enrichedRows.filter((r) => r.hasIssue), fileName)}
+                      disabled={!stats || stats.flagged === 0}
+                      className="flex shrink-0 items-center gap-1.5 rounded-md border border-ink-200 px-2.5 py-1.5 text-xs font-medium text-teal-700 hover:bg-teal-50 disabled:opacity-40 disabled:text-ink-400 disabled:hover:bg-transparent"
+                    >
+                      <Download className="h-3.5 w-3.5" />
+                      Download flagged rows
+                    </button>
+                  </div>
+
+                  <div className="mt-3 overflow-x-auto rounded-md border border-ink-100">
                     <table className="w-full text-left text-xs">
                       <thead className="bg-teal-50 text-teal-700">
                         <tr>
+                          <th className="px-3 py-2 font-medium">Include</th>
                           <th className="px-3 py-2 font-medium">Row</th>
                           {REQUIRED_FIELDS.map(({ key, label }) => (
                             <th key={key} className="px-3 py-2 font-medium">
@@ -479,50 +905,165 @@ export default function AdminUpload() {
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-dashed divide-ink-100">
-                        {previewRows.map((row, i) => {
-                          const flags = rowFlags[i] || {}
+                        {previewRows.map((r) => {
+                          const isExcluded = excludedRows.has(r.index)
+                          const isCritical = r.flags.duplicateCheckNo || r.flags.existsInSystem
                           return (
-                            <tr key={i} className="transition hover:bg-teal-50/50">
-                              <td className="px-3 py-2 font-mono text-ink-300">{i + 2}</td>
-                              {REQUIRED_FIELDS.map(({ key }) => {
-                                const value = mapping[key]
-                                  ? String(row[headers.indexOf(mapping[key])] ?? '')
-                                  : ''
-                                const flagged = flags[key]
-                                return (
-                                  <td
-                                    key={key}
-                                    className={cn(
-                                      'px-3 py-2',
-                                      flagged ? 'font-medium text-orange-600' : 'text-ink-700'
-                                    )}
+                            <tr
+                              key={r.index}
+                              className={cn(
+                                'transition',
+                                isExcluded && 'bg-slate-50/70 opacity-60',
+                                !isExcluded && isCritical && 'bg-red-50/70',
+                                !isExcluded && !isCritical && r.hasIssue && 'bg-amber-50/50',
+                                !isExcluded && !r.hasIssue && 'hover:bg-teal-50/50',
+                              )}
+                            >
+                              <td className="px-3 py-2">
+                                <button
+                                  type="button"
+                                  onClick={() => toggleRowExcluded(r.index)}
+                                  aria-pressed={!isExcluded}
+                                  aria-label={isExcluded ? `Include row ${r.rowNumber}` : `Exclude row ${r.rowNumber}`}
+                                  className={isExcluded ? 'text-ink-300 hover:text-ink-500' : 'text-teal-600'}
+                                >
+                                  {isExcluded ? <Square className="h-4 w-4" /> : <CheckSquare className="h-4 w-4" />}
+                                </button>
+                              </td>
+                              <td className="px-3 py-2 font-mono text-ink-300">{r.rowNumber}</td>
+                              <td
+                                className={cn(
+                                  'px-3 py-2',
+                                  r.flags.missingPayee ? 'font-medium text-orange-600' : 'text-ink-700',
+                                )}
+                              >
+                                {r.flags.missingPayee ? (
+                                  <span className="inline-flex items-center gap-1">
+                                    <AlertTriangle className="h-3 w-3 shrink-0" />
+                                    Missing
+                                  </span>
+                                ) : (
+                                  r.payee || '—'
+                                )}
+                              </td>
+                              <td
+                                className={cn(
+                                  'px-3 py-2',
+                                  r.flags.missingPayor ? 'font-medium text-orange-600' : 'text-ink-700',
+                                )}
+                              >
+                                {r.flags.missingPayor ? (
+                                  <span className="inline-flex items-center gap-1">
+                                    <AlertTriangle className="h-3 w-3 shrink-0" />
+                                    Missing
+                                  </span>
+                                ) : (
+                                  r.payor || '—'
+                                )}
+                              </td>
+                              <td
+                                className={cn(
+                                  'px-3 py-2 font-mono',
+                                  isCritical
+                                    ? 'font-medium text-red-600'
+                                    : r.flags.missingCheckNo
+                                    ? 'font-medium text-orange-600'
+                                    : 'text-ink-700',
+                                )}
+                                title={
+                                  r.flags.duplicateCheckNo && r.flags.existsInSystem
+                                    ? 'Duplicate within this file, and already exists in the system'
+                                    : r.flags.duplicateCheckNo
+                                    ? 'Duplicate check number within this file'
+                                    : r.flags.existsInSystem
+                                    ? 'This check number already exists in the system'
+                                    : undefined
+                                }
+                              >
+                                {r.flags.missingCheckNo ? (
+                                  <span className="inline-flex items-center gap-1">
+                                    <AlertTriangle className="h-3 w-3 shrink-0" />
+                                    Missing
+                                  </span>
+                                ) : (
+                                  <span className="inline-flex items-center gap-1">
+                                    {isCritical && <AlertCircle className="h-3 w-3 shrink-0" />}
+                                    {r.check_no}
+                                  </span>
+                                )}
+                              </td>
+                              <td
+                                className={cn(
+                                  'px-3 py-2',
+                                  r.flags.missingDate || r.flags.futureDate
+                                    ? 'font-medium text-orange-600'
+                                    : 'text-ink-700',
+                                )}
+                              >
+                                {r.flags.missingDate ? (
+                                  <span className="inline-flex items-center gap-1">
+                                    <AlertTriangle className="h-3 w-3 shrink-0" />
+                                    Missing
+                                  </span>
+                                ) : r.flags.futureDate ? (
+                                  <span
+                                    className="inline-flex items-center gap-1"
+                                    title="This check is dated in the future"
                                   >
-                                    {!mapping[key] ? (
-                                      '—'
-                                    ) : flagged ? (
-                                      <span className="inline-flex items-center gap-1">
-                                        <AlertTriangle className="h-3 w-3 shrink-0" />
-                                        {value.trim() ? value : 'Missing'}
-                                      </span>
-                                    ) : (
-                                      value || '—'
-                                    )}
-                                  </td>
-                                )
-                              })}
+                                    <AlertTriangle className="h-3 w-3 shrink-0" />
+                                    {r.check_date}
+                                  </span>
+                                ) : (
+                                  r.check_date || '—'
+                                )}
+                              </td>
+                              <td
+                                className={cn(
+                                  'px-3 py-2 font-mono',
+                                  r.flags.invalidAmount || r.flags.negativeAmount
+                                    ? 'font-medium text-orange-600'
+                                    : 'text-ink-700',
+                                )}
+                              >
+                                {r.flags.invalidAmount ? (
+                                  <span className="inline-flex items-center gap-1">
+                                    <AlertTriangle className="h-3 w-3 shrink-0" />
+                                    Invalid
+                                  </span>
+                                ) : (
+                                  <span
+                                    className="inline-flex items-center gap-1"
+                                    title={r.flags.negativeAmount ? 'Negative amount' : undefined}
+                                  >
+                                    {r.flags.negativeAmount && <AlertTriangle className="h-3 w-3 shrink-0" />}
+                                    {formatCurrency(r.amount)}
+                                  </span>
+                                )}
+                              </td>
                             </tr>
                           )
                         })}
+                        {previewRows.length === 0 && (
+                          <tr>
+                            <td colSpan={7} className="px-3 py-8 text-center text-ink-300">
+                              No rows match your search or filter.
+                            </td>
+                          </tr>
+                        )}
                       </tbody>
                     </table>
                   </div>
 
-                  <div className="mt-2 flex items-center justify-between">
+                  <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
                     <p className="flex items-center gap-1.5 text-xs text-ink-300">
                       <FileSpreadsheet className="h-3.5 w-3.5 text-teal-400" />
-                      Showing {previewRows.length} of {rawRows.length} rows detected.
+                      Showing {previewRows.length} of {searchedRows.length} row{searchedRows.length === 1 ? '' : 's'}
+                      {showFlaggedOnly || previewSearch.trim() ? ' matching your filters' : ' detected'}
+                      {(showFlaggedOnly || previewSearch.trim()) &&
+                        enrichedRows.length !== searchedRows.length &&
+                        ` (${enrichedRows.length} total)`}
                     </p>
-                    {rawRows.length > PREVIEW_ROW_LIMIT && (
+                    {searchedRows.length > PREVIEW_ROW_LIMIT && (
                       <button
                         type="button"
                         onClick={() => setShowAllRows((v) => !v)}
@@ -536,7 +1077,7 @@ export default function AdminUpload() {
                         ) : (
                           <>
                             <ChevronDown className="h-3.5 w-3.5" />
-                            Show {Math.min(rawRows.length, EXPANDED_PREVIEW_CAP)} rows
+                            Show all {Math.min(searchedRows.length, EXPANDED_PREVIEW_CAP)} rows
                           </>
                         )}
                       </button>
@@ -566,7 +1107,7 @@ export default function AdminUpload() {
 
                   <Button
                     onClick={handleImport}
-                    disabled={!mappingComplete || saving}
+                    disabled={!mappingComplete || saving || (stats && stats.included === 0)}
                     className="mt-5 bg-orange-500 text-white hover:bg-orange-600 focus-visible:ring-orange-400 disabled:bg-ink-200 disabled:text-ink-400"
                   >
                     {saving ? (
@@ -574,7 +1115,13 @@ export default function AdminUpload() {
                     ) : (
                       <CheckCircle2 className="h-3.5 w-3.5" />
                     )}
-                    {saving ? 'Importing…' : `Import ${rawRows.length} checks`}
+                    {saving
+                      ? 'Importing…'
+                      : stats
+                      ? `Import ${stats.included} check${stats.included === 1 ? '' : 's'}${
+                          stats.excluded > 0 ? ` (${stats.excluded} excluded)` : ''
+                        }`
+                      : `Import ${rawRows.length} checks`}
                   </Button>
                 </div>
               )}
@@ -583,6 +1130,52 @@ export default function AdminUpload() {
         </CardContent>
       </Card>
     </div>
+  )
+}
+
+// Compact stat card — same pattern used on the dashboard and checks
+// register, so every admin page reads the same way. Color usage follows
+// the brand palette: teal for healthy/actionable states, light teal for
+// the neutral aggregate total, and orange for anything needing review.
+function KpiCard({ icon: Icon, label, value, secondary, accent = 'teal' }) {
+  const accents = {
+    teal: { badge: 'bg-teal-100 text-teal-700', ring: 'border-teal-300' },
+    lightTeal: { badge: 'bg-teal-50 text-teal-600', ring: 'border-teal-200' },
+    orange: { badge: 'bg-orange-100 text-orange-600', ring: 'border-orange-300' },
+  }
+  const style = accents[accent] || accents.teal
+  const isLoading = value === null || value === undefined
+
+  return (
+    <Card>
+      <CardContent className="relative overflow-hidden p-4">
+        <div
+          className={cn(
+            'pointer-events-none absolute -right-4 -top-4 h-16 w-16 rounded-full border-2 border-dashed',
+            style.ring,
+          )}
+          aria-hidden="true"
+        />
+        <div className="relative flex items-start gap-3">
+          <div className={cn('flex h-9 w-9 shrink-0 items-center justify-center rounded-full', style.badge)}>
+            <Icon className="h-4 w-4" />
+          </div>
+          <div className="min-w-0 flex-1">
+            {isLoading ? (
+              <div className="h-6 w-14 animate-pulse rounded bg-ink-100" />
+            ) : (
+              <p className="truncate font-display text-lg font-semibold text-ink-900">
+                {typeof value === 'number' ? value.toLocaleString() : value}
+              </p>
+            )}
+            <p className="truncate text-xs text-ink-400">{label}</p>
+            {!isLoading && secondary && (
+              <p className="mt-0.5 truncate font-mono text-xs text-ink-500">{secondary}</p>
+            )}
+          </div>
+        </div>
+      </CardContent>
+    </Card>
   )
 }
 

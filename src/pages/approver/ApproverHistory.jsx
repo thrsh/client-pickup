@@ -7,6 +7,12 @@
 // it and when, what they decided, and the OR no. / AR collected / remarks
 // attached at that moment.
 //
+// DESIGN: uses the same "ledger" visual identity and shared components
+// (KpiCard, SectionCard) as ApproverDashboard.jsx, so this page and the
+// overview read as one consistent system rather than two different UIs.
+// If a future page needs the same stat-card or section-card treatment,
+// copy these two components rather than re-inventing the styling.
+//
 // DATA NOTE: check_activity_log doesn't have a "submitted_at" column on
 // the decision row itself — only `performed_at` (when the decision
 // happened). But every submission ALSO writes its own
@@ -19,7 +25,9 @@
 // (approval-workflow migration + the approver_decide fix that logs
 // action = 'approved' | 'rejected' | 'returned').
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
 import {
+  Stamp,
   RefreshCw,
   Search,
   X,
@@ -37,6 +45,7 @@ import {
   Download,
   ArrowUpDown,
   ShieldCheck,
+  ShieldAlert,
   Filter,
   SlidersHorizontal,
   ClipboardList,
@@ -44,7 +53,7 @@ import {
 } from 'lucide-react'
 import { supabase } from '../../lib/supabaseClient'
 import { Input } from '../../components/ui/input'
-import { Card } from '../../components/ui/card'
+import { Card, CardContent } from '../../components/ui/card'
 import { formatCurrency, formatDate, cn } from '../../lib/utils'
 import { useProfile, hasRole } from '../../context/ProfileContext'
 
@@ -53,24 +62,26 @@ const FETCH_LIMIT = 2000
 const PAGE_SIZE_OPTIONS = [25, 50, 100]
 const DECISION_ACTIONS = ['approved', 'rejected', 'returned']
 
+// Recolored onto the ledger palette (ledger-stamp / ledger-amber / red)
+// used across the approver area, instead of a one-off teal/red/amber set.
 const DECISION_META = {
   approved: {
     label: 'Approved',
     icon: Check,
-    badge: 'bg-teal-100 text-teal-700',
-    accent: 'border-l-teal-400',
+    badge: 'bg-ledger-stamp/10 text-ledger-stampDark',
+    accent: 'border-l-ledger-stamp/60',
   },
   rejected: {
     label: 'Rejected',
     icon: XCircle,
-    badge: 'bg-red-100 text-red-700',
+    badge: 'bg-red-50 text-red-600',
     accent: 'border-l-red-400',
   },
   returned: {
     label: 'Returned',
     icon: RotateCcw,
-    badge: 'bg-amber-100 text-amber-700',
-    accent: 'border-l-amber-400',
+    badge: 'bg-ledger-amber/10 text-ledger-amber',
+    accent: 'border-l-ledger-amber/60',
   },
 }
 
@@ -192,46 +203,6 @@ function toDateInputValue(d) {
   return d.toISOString().slice(0, 10)
 }
 
-// Matches the KPI card treatment used on ApproverHome: a small tinted
-// icon chip, a muted mono label, and a large display value.
-function HistoryStatCard({ icon: Icon, label, value, tone = 'ink', active, onClick }) {
-  const TONE = {
-    ink: { chip: 'bg-ink-100 text-ink-500', value: 'text-ink-900' },
-    teal: { chip: 'bg-teal-100 text-teal-600', value: 'text-teal-700' },
-    red: { chip: 'bg-red-100 text-red-600', value: 'text-red-700' },
-    amber: { chip: 'bg-amber-100 text-amber-600', value: 'text-amber-700' },
-  }
-  const t = TONE[tone] || TONE.ink
-  const content = (
-    <Card
-      className={cn(
-        'border-ink-100 p-4 shadow-sm transition',
-        onClick && 'hover:border-ink-200 hover:shadow-md',
-        active && 'ring-2 ring-offset-1',
-        active && tone === 'teal' && 'ring-teal-400',
-        active && tone === 'red' && 'ring-red-400',
-        active && tone === 'amber' && 'ring-amber-400',
-        active && tone === 'ink' && 'ring-ink-300'
-      )}
-    >
-      <div className="flex items-center gap-2">
-        <span className={cn('flex h-7 w-7 shrink-0 items-center justify-center rounded-full', t.chip)}>
-          <Icon className="h-3.5 w-3.5" />
-        </span>
-        <p className="truncate font-mono text-[10px] uppercase tracking-wide text-ink-400">{label}</p>
-      </div>
-      <p className={cn('mt-1.5 font-display text-2xl font-semibold', t.value)}>{value}</p>
-    </Card>
-  )
-
-  if (!onClick) return content
-  return (
-    <button onClick={onClick} className="text-left">
-      {content}
-    </button>
-  )
-}
-
 export default function ApproverHistory() {
   const { role, loading: profileLoading, error: profileError } = useProfile()
   const authorized = hasRole(role, ALLOWED_ROLES)
@@ -336,8 +307,8 @@ export default function ApproverHistory() {
   }
 
   // Clicking a KPI card isolates that decision type; clicking it again
-  // restores the full set. Mirrors the "quick filter" affordance on
-  // ApproverHome's stat cards.
+  // restores the full set. Mirrors the "quick filter" affordance the
+  // dashboard's linked KPI cards use for navigation.
   function isolateDecision(action) {
     setDecisionFilter((prev) => {
       if (prev.size === 1 && prev.has(action)) return new Set(DECISION_ACTIONS)
@@ -484,38 +455,39 @@ export default function ApproverHistory() {
   }
 
   const activeSortLabel = SORT_OPTIONS.find((o) => o.value === sortBy)?.label || 'Sort'
+  const pctOfTotal = (n) => (summary.total > 0 ? Math.round((n / summary.total) * 100) : null)
 
   if (profileLoading) {
     return <div className="flex min-h-[40vh] items-center justify-center text-sm text-ink-300">Loading…</div>
   }
   if (profileError) {
-    return <ErrorState message={profileError} />
+    return <ProfileLoadError error={profileError} />
   }
   if (!authorized) {
-    return (
-      <div className="flex flex-col items-center rounded-lg border border-dashed border-red-200 bg-red-50/40 px-4 py-16 text-center">
-        <ShieldCheck className="h-8 w-8 text-red-300" />
-        <p className="mt-3 text-lg font-semibold text-ink-700">You don't have access to this page</p>
-        <p className="mt-1 max-w-sm text-sm text-ink-400">
-          Viewing approval history requires the approver or admin role.
-        </p>
-      </div>
-    )
+    return <AccessDenied />
   }
 
   return (
     <div className="pb-20 sm:pb-0">
       <div className="mb-6 flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h1 className="text-2xl font-semibold text-ink-900">Approval history</h1>
-          <p className="mt-1 max-w-2xl text-sm text-ink-500">
-            Full audit trail for every check that's gone through approval — who submitted it, who
-            verified it, what they decided, and when each step happened.
-          </p>
+        <div className="flex items-start gap-3">
+          <span className="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-dashed border-ledger-stamp/40 bg-ledger-stamp/10 text-ledger-stampDark">
+            <Stamp className="h-4.5 w-4.5" />
+          </span>
+          <div>
+            <p className="font-mono text-[11px] uppercase tracking-[0.2em] text-ledger-stampDark/80">
+              Approval audit trail
+            </p>
+            <h1 className="font-display text-2xl font-semibold text-ink-900">Approval history</h1>
+            <p className="mt-1 max-w-2xl text-sm text-ink-400">
+              Every check that's gone through approval — who submitted it, who verified it, what they
+              decided, and when each step happened.
+            </p>
+          </div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-3">
           {lastUpdated && (
-            <span className="hidden text-xs text-ink-400 sm:inline">
+            <span className="hidden font-mono text-[11px] text-ink-300 sm:inline">
               Updated {Math.round((Date.now() - lastUpdated) / 1000)}s ago
             </span>
           )}
@@ -525,78 +497,114 @@ export default function ApproverHistory() {
             className="flex items-center gap-1.5 rounded-md border border-ink-200 px-3 py-2 text-sm font-medium text-ink-600 hover:bg-ink-50 disabled:opacity-50"
           >
             <RefreshCw className={cn('h-3.5 w-3.5', refreshing && 'animate-spin')} />
-            <span className="hidden sm:inline">Refresh</span>
+            Refresh
           </button>
         </div>
       </div>
 
-      {/* Date range — the only filter that re-queries the DB; everything
-          else below filters in-memory over this window. */}
-      <div className="mb-5 flex flex-wrap items-end gap-3 rounded-xl border border-ink-100 bg-ink-50/40 p-3">
-        <div>
-          <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-ink-400">From</label>
-          <input
-            type="date"
-            value={dateFrom}
-            max={dateTo}
-            onChange={(e) => setDateFrom(e.target.value)}
-            className="rounded-md border border-ink-200 bg-white px-2.5 py-1.5 text-sm text-ink-700 focus:outline-none focus:ring-1 focus:ring-teal-500"
-          />
-        </div>
-        <div>
-          <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-ink-400">To</label>
-          <input
-            type="date"
-            value={dateTo}
-            min={dateFrom}
-            max={toDateInputValue(new Date())}
-            onChange={(e) => setDateTo(e.target.value)}
-            className="rounded-md border border-ink-200 bg-white px-2.5 py-1.5 text-sm text-ink-700 focus:outline-none focus:ring-1 focus:ring-teal-500"
-          />
-        </div>
-        <button
-          onClick={() => load(true)}
-          className="rounded-md bg-ink-900 px-3.5 py-2 text-sm font-medium text-white hover:bg-ink-800"
-        >
-          Apply range
-        </button>
-      </div>
+    {/* Date range — the only filter that re-queries the DB; everything
+    else below filters in-memory over this window. */}
+{(() => {
+  const today = toDateInputValue(new Date());
 
-      {/* KPI cards — same treatment as the approver home dashboard: a
-          tinted icon chip, a muted mono label, and a large value. Each
-          decision card doubles as a quick filter. */}
+  const handleFromChange = (value) => {
+    if (!value) return setDateFrom(value);
+    const clamped = value > today ? today : value;
+    setDateFrom(clamped > dateTo ? dateTo : clamped);
+  };
+
+  const handleToChange = (value) => {
+    if (!value) return setDateTo(value);
+    const clamped = value > today ? today : value;
+    setDateTo(clamped < dateFrom ? dateFrom : clamped);
+  };
+
+  return (
+    <div className="mb-5 flex flex-wrap items-end gap-3 rounded-lg border border-ink-100 bg-ink-50/50 p-3.5">
+      <div>
+        <label className="mb-1 block font-mono text-[11px] uppercase tracking-wide text-ink-400">From</label>
+        <input
+          type="date"
+          value={dateFrom}
+          max={today}
+          onChange={(e) => handleFromChange(e.target.value)}
+          className="rounded-md border border-ink-200 bg-white px-2.5 py-1.5 text-sm text-ink-700 focus:outline-none focus:ring-1 focus:ring-ledger-stamp"
+        />
+      </div>
+      <div>
+        <label className="mb-1 block font-mono text-[11px] uppercase tracking-wide text-ink-400">To</label>
+        <input
+          type="date"
+          value={dateTo}
+          min={dateFrom}
+          max={today}
+          onChange={(e) => handleToChange(e.target.value)}
+          className="rounded-md border border-ink-200 bg-white px-2.5 py-1.5 text-sm text-ink-700 focus:outline-none focus:ring-1 focus:ring-ledger-stamp"
+        />
+      </div>
+      <button
+        onClick={() => load(true)}
+        className="rounded-md bg-ink-900 px-3.5 py-2 text-sm font-medium text-white hover:bg-ink-800"
+      >
+        Apply range
+      </button>
+    </div>
+  );
+})()}
+
+      {/* KPI cards — the same KpiCard template used on ApproverDashboard
+          (icon badge, accent ring, value + secondary line). Each decision
+          card also acts as a quick filter via the onClick affordance. */}
       {!loading && (
-        <div className="mb-5 grid grid-cols-2 gap-3 sm:max-w-3xl sm:grid-cols-5">
-          <HistoryStatCard icon={ClipboardList} label="Decisions" value={summary.total} tone="ink" />
-          <HistoryStatCard
-            icon={Check}
-            label="Approved"
-            value={summary.approved}
-            tone="teal"
-            active={decisionFilter.size === 1 && decisionFilter.has('approved')}
-            onClick={() => isolateDecision('approved')}
-          />
-          <HistoryStatCard
-            icon={XCircle}
-            label="Rejected"
-            value={summary.rejected}
-            tone="red"
-            active={decisionFilter.size === 1 && decisionFilter.has('rejected')}
-            onClick={() => isolateDecision('rejected')}
-          />
-          <HistoryStatCard
-            icon={RotateCcw}
-            label="Returned"
-            value={summary.returned}
-            tone="amber"
-            active={decisionFilter.size === 1 && decisionFilter.has('returned')}
-            onClick={() => isolateDecision('returned')}
-          />
-          <HistoryStatCard icon={Wallet} label="Approved value" value={formatCurrency(summary.approvedValue)} tone="ink" />
-        </div>
+        <>
+          <p className="mb-2 font-mono text-[11px] uppercase tracking-[0.15em] text-ink-300">Decision summary</p>
+          <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
+            <KpiCard
+              icon={ClipboardList}
+              label="Decisions"
+              value={summary.total}
+              secondary={`${formatDate(dateFrom)} – ${formatDate(dateTo)}`}
+              accent="ink"
+            />
+            <KpiCard
+              icon={Check}
+              label="Approved"
+              value={summary.approved}
+              secondary={pctOfTotal(summary.approved) !== null ? `${pctOfTotal(summary.approved)}% of decisions` : null}
+              accent="stamp"
+              active={decisionFilter.size === 1 && decisionFilter.has('approved')}
+              onClick={() => isolateDecision('approved')}
+            />
+            <KpiCard
+              icon={XCircle}
+              label="Rejected"
+              value={summary.rejected}
+              secondary={pctOfTotal(summary.rejected) !== null ? `${pctOfTotal(summary.rejected)}% of decisions` : null}
+              accent="critical"
+              active={decisionFilter.size === 1 && decisionFilter.has('rejected')}
+              onClick={() => isolateDecision('rejected')}
+            />
+            <KpiCard
+              icon={RotateCcw}
+              label="Returned"
+              value={summary.returned}
+              secondary={pctOfTotal(summary.returned) !== null ? `${pctOfTotal(summary.returned)}% of decisions` : null}
+              accent="amber"
+              active={decisionFilter.size === 1 && decisionFilter.has('returned')}
+              onClick={() => isolateDecision('returned')}
+            />
+            <KpiCard
+              icon={Wallet}
+              label="Approved value"
+              value={formatCurrency(summary.approvedValue)}
+              secondary={`${summary.approved} approved check${summary.approved === 1 ? '' : 's'}`}
+              accent="stamp"
+            />
+          </div>
+        </>
       )}
 
-      <div className="mb-3 flex flex-wrap items-center gap-2">
+      <div className="mb-3 mt-5 flex flex-wrap items-center gap-2">
         <div className="relative min-w-[220px] flex-1">
           <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-ink-300" />
           <Input
@@ -607,7 +615,7 @@ export default function ApproverHistory() {
               setPage(1)
             }}
             placeholder="Search collector, check #, payee, payor, OR no., remarks, names..."
-            className="border-ink-200 pl-9 pr-8 text-sm focus-visible:ring-teal-500"
+            className="border-ink-200 pl-9 pr-8 text-sm focus-visible:ring-ledger-stamp"
           />
           {search && (
             <button
@@ -624,12 +632,16 @@ export default function ApproverHistory() {
           onClick={() => setFiltersOpen((v) => !v)}
           className={cn(
             'flex items-center gap-1.5 rounded-md border px-3 py-2 text-sm font-medium hover:bg-ink-50',
-            hasActiveFilters ? 'border-teal-400 text-teal-700' : 'border-ink-200 text-ink-600'
+            hasActiveFilters ? 'border-ledger-stamp/50 text-ledger-stampDark' : 'border-ink-200 text-ink-600'
           )}
         >
           <SlidersHorizontal className="h-3.5 w-3.5" />
           Filters
-          {hasActiveFilters && <span className="rounded-full bg-teal-600 px-1.5 py-0.5 text-[10px] font-semibold text-white">on</span>}
+          {hasActiveFilters && (
+            <span className="rounded-full bg-ledger-stampDark px-1.5 py-0.5 text-[10px] font-semibold text-white">
+              on
+            </span>
+          )}
         </button>
 
         <div className="relative shrink-0">
@@ -654,7 +666,7 @@ export default function ApproverHistory() {
                     }}
                     className={cn(
                       'flex w-full items-center justify-between px-3 py-1.5 text-left text-sm hover:bg-ink-50',
-                      sortBy === o.value ? 'text-teal-700' : 'text-ink-600'
+                      sortBy === o.value ? 'text-ledger-stampDark' : 'text-ink-600'
                     )}
                   >
                     {o.label}
@@ -680,7 +692,7 @@ export default function ApproverHistory() {
         <Card className="mb-4 border-ink-100 p-4 shadow-sm">
           <div className="flex flex-wrap items-start gap-6">
             <div>
-              <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-ink-400">Decision</p>
+              <p className="mb-1.5 font-mono text-[11px] uppercase tracking-wide text-ink-400">Decision</p>
               <div className="flex gap-1.5">
                 {DECISION_ACTIONS.map((action) => {
                   const meta = DECISION_META[action]
@@ -704,14 +716,14 @@ export default function ApproverHistory() {
             </div>
 
             <div>
-              <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-ink-400">Collector</p>
+              <p className="mb-1.5 font-mono text-[11px] uppercase tracking-wide text-ink-400">Collector</p>
               <select
                 value={collectorFilter}
                 onChange={(e) => {
                   setCollectorFilter(e.target.value)
                   setPage(1)
                 }}
-                className="rounded-md border border-ink-200 px-2.5 py-1.5 text-sm text-ink-700 focus:outline-none focus:ring-1 focus:ring-teal-500"
+                className="rounded-md border border-ink-200 px-2.5 py-1.5 text-sm text-ink-700 focus:outline-none focus:ring-1 focus:ring-ledger-stamp"
               >
                 <option value="">All collectors</option>
                 {collectorOptions.map((name) => (
@@ -723,14 +735,14 @@ export default function ApproverHistory() {
             </div>
 
             <div>
-              <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-ink-400">Verified by</p>
+              <p className="mb-1.5 font-mono text-[11px] uppercase tracking-wide text-ink-400">Verified by</p>
               <select
                 value={verifierFilter}
                 onChange={(e) => {
                   setVerifierFilter(e.target.value)
                   setPage(1)
                 }}
-                className="rounded-md border border-ink-200 px-2.5 py-1.5 text-sm text-ink-700 focus:outline-none focus:ring-1 focus:ring-teal-500"
+                className="rounded-md border border-ink-200 px-2.5 py-1.5 text-sm text-ink-700 focus:outline-none focus:ring-1 focus:ring-ledger-stamp"
               >
                 <option value="">All verifiers</option>
                 {verifierOptions.map((name) => (
@@ -742,14 +754,14 @@ export default function ApproverHistory() {
             </div>
 
             <div>
-              <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-ink-400">AR collected</p>
+              <p className="mb-1.5 font-mono text-[11px] uppercase tracking-wide text-ink-400">AR collected</p>
               <select
                 value={arFilter}
                 onChange={(e) => {
                   setArFilter(e.target.value)
                   setPage(1)
                 }}
-                className="rounded-md border border-ink-200 px-2.5 py-1.5 text-sm text-ink-700 focus:outline-none focus:ring-1 focus:ring-teal-500"
+                className="rounded-md border border-ink-200 px-2.5 py-1.5 text-sm text-ink-700 focus:outline-none focus:ring-1 focus:ring-ledger-stamp"
               >
                 <option value="any">Any</option>
                 <option value="yes">Yes</option>
@@ -791,22 +803,45 @@ export default function ApproverHistory() {
         <EmptyState hasFilter={hasActiveFilters || !!search.trim()} />
       ) : (
         <>
-          <div className="overflow-hidden rounded-xl border border-ink-100 shadow-sm">
+          <Card className="overflow-hidden">
+            <div className="flex items-center justify-between gap-3 border-b border-dashed border-ink-100 bg-ink-50/50 px-5 py-3.5">
+              <div>
+                <h2 className="flex items-center gap-2 font-display text-base font-semibold text-ink-900">
+                  <ClipboardList className="h-4 w-4 text-ledger-stampDark" />
+                  Decision records
+                </h2>
+                <p className="mt-0.5 text-xs text-ink-400">
+                  One row per decision — every field below is its own column, so nothing is bundled
+                  together that you might want to sort, scan, or export separately.
+                </p>
+              </div>
+              <span className="hidden shrink-0 font-mono text-[11px] text-ink-400 sm:inline">
+                {filteredRows.length} record{filteredRows.length === 1 ? '' : 's'}
+              </span>
+            </div>
+
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[1000px] border-collapse text-sm">
+              <table className="w-full min-w-[1500px] border-collapse text-sm">
                 <thead>
-                  <tr className="border-b border-ink-100 bg-ink-50/70 text-left text-[11px] uppercase tracking-wide text-ink-400">
+                  <tr className="border-b border-dashed border-ink-100 bg-ink-50/50 text-left font-mono text-[11px] uppercase tracking-wide text-ink-400">
                     <th className="px-4 py-3 font-medium">Decision</th>
-                    <th className="px-4 py-3 font-medium">Collector &amp; check</th>
+                    <th className="px-4 py-3 font-medium">Collector</th>
+                    <th className="px-4 py-3 font-medium">Check no.</th>
+                    <th className="px-4 py-3 font-medium">Check date</th>
                     <th className="px-4 py-3 font-medium">Payee</th>
+                    <th className="px-4 py-3 font-medium">Payor</th>
                     <th className="px-4 py-3 text-right font-medium">Amount</th>
-                    <th className="px-4 py-3 font-medium">OR / AR</th>
-                    <th className="px-4 py-3 font-medium">Sent → Verified</th>
+                    <th className="px-4 py-3 font-medium">OR no.</th>
+                    <th className="px-4 py-3 font-medium">AR collected</th>
+                    <th className="px-4 py-3 font-medium">Sent by</th>
+                    <th className="px-4 py-3 font-medium">Sent at</th>
+                    <th className="px-4 py-3 font-medium">Verified by</th>
+                    <th className="px-4 py-3 font-medium">Decided at</th>
                     <th className="px-4 py-3 font-medium">Turnaround</th>
                     <th className="w-9 px-3 py-3" />
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-ink-50">
+                <tbody className="divide-y divide-dashed divide-ink-100">
                   {pageRows.map((r) => {
                     const meta = DECISION_META[r.decision]
                     const Icon = meta.icon
@@ -821,36 +856,48 @@ export default function ApproverHistory() {
                           onClick={() => setExpandedRowId(isExpanded ? null : r.id)}
                         >
                           <td className="px-4 py-4">
-                            <span className={cn('inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium', meta.badge)}>
+                            <span
+                              className={cn(
+                                'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium',
+                                meta.badge
+                              )}
+                            >
                               <Icon className="h-3 w-3" />
                               {meta.label}
                             </span>
                           </td>
 
                           <td className="px-4 py-4">
-                            <div className="flex items-center gap-2.5">
-                              <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-ink-100 text-[10px] font-semibold text-ink-500">
+                            <div className="flex items-center gap-2">
+                              <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-ink-50 font-mono text-[10px] font-semibold text-ink-600">
                                 {initials(r.collectorName)}
                               </span>
-                              <div className="min-w-0">
-                                <p className="truncate font-medium text-ink-900">{r.collectorName || '—'}</p>
-                                <p className="mt-0.5 flex items-center gap-1 text-xs text-ink-400">
-                                  <Hash className="h-3 w-3" />
-                                  <span className="font-mono">{r.check_no || '—'}</span>
-                                  {r.check_date && (
-                                    <span className="flex items-center gap-1 before:mx-1 before:content-['·']">
-                                      <CalendarDays className="h-3 w-3" />
-                                      {formatDate(r.check_date)}
-                                    </span>
-                                  )}
-                                </p>
-                              </div>
+                              <p className="max-w-[120px] truncate font-medium text-ink-900">
+                                {r.collectorName || '—'}
+                              </p>
                             </div>
                           </td>
 
-                          <td className="max-w-[200px] px-4 py-4">
+                          <td className="px-4 py-4">
+                            <span className="flex items-center gap-1 font-mono text-xs text-ink-700">
+                              <Hash className="h-3 w-3 text-ink-300" />
+                              {r.check_no || '—'}
+                            </span>
+                          </td>
+
+                          <td className="px-4 py-4">
+                            <span className="flex items-center gap-1 text-xs text-ink-500">
+                              <CalendarDays className="h-3 w-3 text-ink-300" />
+                              {r.check_date ? formatDate(r.check_date) : '—'}
+                            </span>
+                          </td>
+
+                          <td className="max-w-[160px] px-4 py-4">
                             <p className="truncate font-medium text-ink-900">{r.payee || '—'}</p>
-                            <p className="truncate text-xs text-ink-400">from {r.payor || '—'}</p>
+                          </td>
+
+                          <td className="max-w-[140px] px-4 py-4">
+                            <p className="truncate text-xs text-ink-500">{r.payor || '—'}</p>
                           </td>
 
                           <td className="px-4 py-4 text-right font-mono font-semibold text-ink-800">
@@ -858,35 +905,46 @@ export default function ApproverHistory() {
                           </td>
 
                           <td className="px-4 py-4">
-                            <p className="font-mono text-xs text-ink-700">{r.or_no || 'No OR no.'}</p>
-                            {r.ar_collected === null || r.ar_collected === undefined ? (
-                              <p className="mt-0.5 text-xs text-ink-300">AR n/a</p>
-                            ) : r.ar_collected ? (
-                              <p className="mt-0.5 text-xs font-medium text-teal-600">AR collected</p>
-                            ) : (
-                              <p className="mt-0.5 text-xs font-medium text-orange-600">AR not collected</p>
-                            )}
+                            <span className="font-mono text-xs text-ink-700">{r.or_no || '—'}</span>
                           </td>
 
                           <td className="px-4 py-4">
-                            <div className="flex items-center gap-2 text-xs">
-                              <div className="min-w-0 max-w-[110px]">
-                                <p className="truncate font-medium text-ink-700">{r.sentByName || '—'}</p>
-                                <p className="truncate text-ink-400">{fmtDateTime(r.sentAt) || 'Unknown'}</p>
-                              </div>
-                              <ChevronRight className="h-3 w-3 shrink-0 text-ink-300" />
-                              <div className="min-w-0 max-w-[110px]">
-                                <p className="flex items-center gap-1 truncate font-medium text-ink-700">
-                                  <UserCheck className="h-3 w-3 shrink-0 text-ink-300" />
-                                  {r.verifiedByName || '—'}
-                                </p>
-                                <p className="truncate text-ink-400">{fmtDateTime(r.decidedAt) || '—'}</p>
-                              </div>
-                            </div>
+                            {r.ar_collected === null || r.ar_collected === undefined ? (
+                              <span className="text-xs text-ink-300">N/A</span>
+                            ) : r.ar_collected ? (
+                              <span className="text-xs font-medium text-ledger-stampDark">Yes</span>
+                            ) : (
+                              <span className="text-xs font-medium text-ledger-amber">No</span>
+                            )}
                           </td>
 
-                          <td className="px-4 py-4 text-xs font-medium text-ink-500">
-                            {durationLabel(r.sentAt, r.decidedAt) || '—'}
+                          <td className="max-w-[130px] px-4 py-4">
+                            <p className="truncate text-xs text-ink-700">{r.sentByName || '—'}</p>
+                          </td>
+
+                          <td className="px-4 py-4">
+                            <p className="whitespace-nowrap font-mono text-xs text-ink-400">
+                              {fmtDateTime(r.sentAt) || '—'}
+                            </p>
+                          </td>
+
+                          <td className="max-w-[130px] px-4 py-4">
+                            <p className="flex items-center gap-1 truncate text-xs text-ink-700">
+                              <UserCheck className="h-3 w-3 shrink-0 text-ink-300" />
+                              {r.verifiedByName || '—'}
+                            </p>
+                          </td>
+
+                          <td className="px-4 py-4">
+                            <p className="whitespace-nowrap font-mono text-xs text-ink-400">
+                              {fmtDateTime(r.decidedAt) || '—'}
+                            </p>
+                          </td>
+
+                          <td className="px-4 py-4">
+                            <span className="font-mono text-xs font-medium text-ink-600">
+                              {durationLabel(r.sentAt, r.decidedAt) || '—'}
+                            </span>
                           </td>
 
                           <td className="px-3 py-4 text-right">
@@ -897,9 +955,9 @@ export default function ApproverHistory() {
                         </tr>
                         {isExpanded && (
                           <tr>
-                            <td colSpan={8} className="bg-ink-50/40 px-4 pb-4 pt-0">
-                              <div className="rounded-lg border border-ink-100 bg-white px-4 py-3">
-                                <p className="mb-1 text-xs font-medium uppercase tracking-wide text-ink-400">
+                            <td colSpan={15} className="bg-ink-50/40 px-4 pb-4 pt-0">
+                              <div className="rounded-lg border border-dashed border-ink-200 bg-white px-4 py-3">
+                                <p className="mb-1 font-mono text-[11px] uppercase tracking-wide text-ink-400">
                                   Remarks at time of {meta.label.toLowerCase()}
                                 </p>
                                 <p className="whitespace-pre-wrap text-sm text-ink-700">
@@ -915,7 +973,7 @@ export default function ApproverHistory() {
                 </tbody>
               </table>
             </div>
-          </div>
+          </Card>
 
           <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2 text-xs text-ink-500">
@@ -929,7 +987,7 @@ export default function ApproverHistory() {
                   setPageSize(Number(e.target.value))
                   setPage(1)
                 }}
-                className="rounded-md border border-ink-200 px-2 py-1 text-xs text-ink-600 focus:outline-none focus:ring-1 focus:ring-teal-500"
+                className="rounded-md border border-ink-200 px-2 py-1 text-xs text-ink-600 focus:outline-none focus:ring-1 focus:ring-ledger-stamp"
               >
                 {PAGE_SIZE_OPTIONS.map((n) => (
                   <option key={n} value={n}>
@@ -966,12 +1024,111 @@ export default function ApproverHistory() {
   )
 }
 
-function ErrorState({ message }) {
+// ---- Shared template pieces -----------------------------------------------
+// These two components (KpiCard, and the state screens below) mirror
+// ApproverDashboard.jsx exactly, so the two pages read as one system.
+// KpiCard additionally supports `active` + `onClick` here, for cards that
+// double as quick filters — a superset of the dashboard's `to`-link usage.
+
+function KpiCard({ icon: Icon, label, value, secondary, loading, accent, delta, deltaUnit = '%', to, active, onClick }) {
+  const accents = {
+    stamp: { badge: 'bg-ledger-stamp/10 text-ledger-stampDark', ring: 'border-ledger-stamp/30', active: 'ring-ledger-stamp/40' },
+    amber: { badge: 'bg-ledger-amber/10 text-ledger-amber', ring: 'border-ledger-amber/30', active: 'ring-ledger-amber/40' },
+    ink: { badge: 'bg-ink-50 text-ink-700', ring: 'border-ink-100', active: 'ring-ink-300' },
+    critical: { badge: 'bg-red-50 text-red-600', ring: 'border-red-200', active: 'ring-red-300' },
+  }
+  const style = accents[accent] || accents.ink
+  const isLoading = value === null || value === undefined
+
+  const content = (
+    <CardContent className="relative overflow-hidden p-4">
+      <div
+        className={cn(
+          'pointer-events-none absolute -right-4 -top-4 h-16 w-16 rounded-full border-2 border-dashed',
+          style.ring
+        )}
+        aria-hidden="true"
+      />
+
+      <div className="relative flex items-start gap-3">
+        <div className={cn('flex h-9 w-9 shrink-0 items-center justify-center rounded-full', style.badge)}>
+          <Icon className="h-4 w-4" />
+        </div>
+        <div className="min-w-0 flex-1">
+          {isLoading ? (
+            <div className="h-6 w-16 animate-pulse rounded bg-ink-100" />
+          ) : (
+            <div className="flex items-center gap-2">
+              <p className="truncate font-display text-lg font-semibold text-ink-900">{value}</p>
+              {delta && !delta.isNew && delta.pct !== null && (
+                <span
+                  className={cn(
+                    'flex shrink-0 items-center gap-0.5 text-[11px] font-medium',
+                    delta.direction === 'up' ? 'text-ledger-stampDark' : 'text-ink-400'
+                  )}
+                >
+                  {Math.abs(delta.pct)}
+                  {deltaUnit}
+                </span>
+              )}
+              {delta && delta.isNew && (
+                <span className="shrink-0 text-[11px] font-medium text-ledger-stampDark">new</span>
+              )}
+            </div>
+          )}
+          <p className="truncate text-xs text-ink-400">{label}</p>
+          {!isLoading && secondary && (
+            <p className="mt-0.5 truncate font-mono text-xs text-ink-500">{secondary}</p>
+          )}
+        </div>
+      </div>
+    </CardContent>
+  )
+
+  const cardClassName = cn(
+    (to || onClick) && 'transition hover:border-ink-200 hover:shadow-sm',
+    active && 'ring-2 ring-offset-1',
+    active && style.active
+  )
+
+  if (to) {
+    return (
+      <Card className={cardClassName}>
+        <Link to={to}>{content}</Link>
+      </Card>
+    )
+  }
+  if (onClick) {
+    return (
+      <Card className={cardClassName}>
+        <button type="button" onClick={onClick} className="w-full text-left">
+          {content}
+        </button>
+      </Card>
+    )
+  }
+  return <Card>{content}</Card>
+}
+
+function ProfileLoadError({ error }) {
   return (
     <div className="flex flex-col items-center rounded-lg border border-dashed border-orange-200 bg-orange-50/40 px-4 py-16 text-center">
       <AlertTriangle className="h-8 w-8 text-orange-300" />
-      <p className="mt-3 text-lg font-semibold text-ink-700">Couldn't load this page</p>
-      <p className="mt-1 max-w-sm text-sm text-ink-400">{message}</p>
+      <p className="mt-3 text-lg font-semibold text-ink-700">Couldn't verify your account permissions</p>
+      <p className="mt-1 max-w-sm text-sm text-ink-400">{error}</p>
+    </div>
+  )
+}
+
+function AccessDenied() {
+  return (
+    <div className="flex flex-col items-center rounded-lg border border-dashed border-red-200 bg-red-50/40 px-4 py-16 text-center">
+      <ShieldAlert className="h-8 w-8 text-red-300" />
+      <p className="mt-3 text-lg font-semibold text-ink-700">You don't have access to this page</p>
+      <p className="mt-1 max-w-sm text-sm text-ink-400">
+        Viewing approval history requires the approver or admin role. If this seems wrong, ask an
+        admin to check your account's role.
+      </p>
     </div>
   )
 }

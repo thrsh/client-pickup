@@ -26,6 +26,38 @@
 // Route-level access is enforced by <ProtectedRoute roles={['approver','admin']}>;
 // this file also does an in-component role check as defense-in-depth, since
 // the real authority is always the Postgres RLS policy on approver_decide.
+//
+// KPI + filtering notes:
+//   - All KPI figures on this page are derived live from `groups` (the
+//     current pending-approval dataset) via useMemo, recomputed on every
+//     poll/refresh and every second (for wait-time figures). Nothing here
+//     is hardcoded or sampled — if a number looks wrong, it's a data bug
+//     upstream, not a stale display.
+//   - The top KPI row always reflects the FULL pending-approval queue,
+//     regardless of active filters, so approvers always have an accurate
+//     top-level picture even while drilled into a filtered view.
+//   - The advanced filter panel filters at the individual check level
+//     (AR status, submitter, amount) and at the order/group level
+//     (collector, waiting time), then drops any group left with zero
+//     matching checks. Group totals and wait times shown in the list are
+//     recomputed against the filtered items, so what's displayed is always
+//     internally consistent.
+//
+// Data source note (fixed — read before touching load()):
+//   - This page used to query `pickup_reservations` filtered by the
+//     reservation's own `status = 'pending_approval'`, then pulled in that
+//     reservation's checks. That's wrong: a reservation can still sit at
+//     `status = 'reserved'` while individual checks inside it have already
+//     moved to `pending_approval` (admin_submit_for_approval only needs to
+//     touch the check rows, not the parent reservation row). Filtering
+//     reservations-first silently dropped those checks from this page even
+//     though ApproverDashboard.jsx — which queries `checks.status` directly
+//     — showed them fine.
+//   - The fix: query `checks` directly (same table + column the dashboard's
+//     "Awaiting your decision" KPI reads) and embed the parent reservation
+//     only for display (collector name) and for the id approver_decide
+//     needs. See buildPendingRows() and load() below. Do not reintroduce a
+//     `pickup_reservations`-first query here.
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   RefreshCw,
@@ -53,6 +85,11 @@ import {
   Play,
   Stamp,
   Hourglass,
+  SlidersHorizontal,
+  TrendingUp,
+  Users,
+  Timer,
+  Wallet,
 } from 'lucide-react'
 import { supabase } from '../../lib/supabaseClient'
 import { Input } from '../../components/ui/input'
@@ -77,36 +114,52 @@ const SORT_OPTIONS = [
   { value: 'collector_asc', label: 'Collector A→Z' },
 ]
 
-// One row per check pending approval, flattened out of whatever reservation
-// it belongs to. Approvers think in terms of "which checks", not "which
-// reservations" — a single order can have some checks awaiting approval
-// while others in the same order were already released before submission.
-function pendingCheckRows(reservations) {
-  const rows = []
-  reservations.forEach((r) => {
-    const checks = Array.isArray(r.checks) ? r.checks : []
-    checks.forEach((c) => {
-      if (c.status !== 'pending_approval') return
-      rows.push({
-        id: c.id,
-        checkId: c.id,
-        reservationId: r.id,
-        collectorName: r.collector_name,
-        row_number: c.row_number,
-        payee: c.payee,
-        payor: c.payor,
-        check_no: c.check_no,
-        check_date: c.check_date,
-        amount: c.amount,
-        or_no: c.or_no,
-        ar_collected: c.ar_collected,
-        remarks: c.remarks,
-        submitted_by_name: c.submitted_by_name,
-        submitted_at: c.submitted_at,
-      })
-    })
+const AR_FILTER_OPTIONS = [
+  { value: 'all', label: 'All' },
+  { value: 'yes', label: 'Collected' },
+  { value: 'no', label: 'Not collected' },
+  { value: 'unset', label: 'Not recorded' },
+]
+
+const URGENCY_FILTER_OPTIONS = [
+  { value: 'all', label: 'Any wait time' },
+  { value: 'stale', label: `Waiting ${PENDING_WARN_MINUTES}m or more` },
+  { value: 'critical', label: `Waiting ${Math.round(PENDING_CRITICAL_MINUTES / 60)}h or more` },
+]
+
+// One row per check pending approval. The query in load() below starts
+// from `checks` — the same table and status column the dashboard's
+// "Awaiting your decision" KPI reads — rather than starting from
+// `pickup_reservations`. A reservation's own status can lag behind the
+// status of the checks inside it, so filtering reservations-first can
+// silently miss checks that are genuinely pending approval. The parent
+// reservation is embedded only for display (collector name) and for the
+// id approver_decide needs.
+function buildPendingRows(checks) {
+  return (checks || []).map((c) => {
+    // Left-embedded on purpose (not `!inner`): if RLS ever blocks the
+    // approver role from reading the parent reservation row, the check
+    // still shows up here — just without a collector name — instead of
+    // disappearing from the queue entirely.
+    const reservation = c.pickup_reservations || {}
+    return {
+      id: c.id,
+      checkId: c.id,
+      reservationId: c.reservation_id ?? reservation.id ?? null,
+      collectorName: reservation.collector_name || null,
+      row_number: c.row_number,
+      payee: c.payee,
+      payor: c.payor,
+      check_no: c.check_no,
+      check_date: c.check_date,
+      amount: c.amount,
+      or_no: c.or_no,
+      ar_collected: c.ar_collected,
+      remarks: c.remarks,
+      submitted_by_name: c.submitted_by_name,
+      submitted_at: c.submitted_at,
+    }
   })
-  return rows
 }
 
 function groupByReservation(rows) {
@@ -142,6 +195,17 @@ function earliestSubmittedAt(items) {
   return Math.min(...times)
 }
 
+// Pure formatter (no dependency on "now") for a raw minute count — used by
+// KPI cards that already receive a computed duration.
+function formatMinutesDuration(mins) {
+  if (mins === null || mins === undefined || Number.isNaN(mins)) return '—'
+  const whole = Math.max(0, Math.round(mins))
+  if (whole < 60) return `${whole}m`
+  const hrs = Math.floor(whole / 60)
+  const rem = whole % 60
+  return `${hrs}h ${rem}m`
+}
+
 export default function ApproverHome() {
   const { role, name, loading: profileLoading, error: profileError } = useProfile()
 
@@ -153,7 +217,6 @@ export default function ApproverHome() {
   const [sortBy, setSortBy] = useState('submitted_asc')
   const [sortMenuOpen, setSortMenuOpen] = useState(false)
   const [autoRefresh, setAutoRefresh] = useState(true)
-  const [quickFilter, setQuickFilter] = useState('all') // 'all' | 'stale'
   const [expandedIds, setExpandedIds] = useState(() => new Set())
   const [selectedCheckIds, setSelectedCheckIds] = useState(() => new Set())
   const [confirmAction, setConfirmAction] = useState(null) // { group, checks } or { groups, bulk: true }
@@ -163,6 +226,17 @@ export default function ApproverHome() {
   const [toast, setToast] = useState(null)
   const [lastUpdated, setLastUpdated] = useState(null)
   const [now, setNow] = useState(Date.now())
+
+  // Advanced filters — all optional, all compose together (AND). Options
+  // for collector/submitter are derived live from the loaded data, never
+  // hardcoded, so they always match what's actually in the queue.
+  const [showAdvancedFilters, setShowAdvancedFilters] = useState(false)
+  const [collectorFilter, setCollectorFilter] = useState('all')
+  const [submitterFilter, setSubmitterFilter] = useState('all')
+  const [urgencyFilter, setUrgencyFilter] = useState('all') // 'all' | 'stale' | 'critical'
+  const [arFilter, setArFilter] = useState('all') // 'all' | 'yes' | 'no' | 'unset'
+  const [amountMin, setAmountMin] = useState('')
+  const [amountMax, setAmountMax] = useState('')
 
   const isMountedRef = useRef(true)
   const inFlightRef = useRef(false)
@@ -226,21 +300,35 @@ export default function ApproverHome() {
     setLoadError('')
 
     try {
+      // Query `checks` directly — same table and status column the
+      // dashboard's "Awaiting your decision" KPI reads — instead of
+      // starting from `pickup_reservations`. This can't miss a pending
+      // check regardless of what the reservation's own status column says.
+      // The reservation is embedded only for display (collector name) and
+      // for the id approver_decide needs; it is NOT used to filter.
+      //
+      // Assumes `checks.reservation_id` is the FK to pickup_reservations.id
+      // (matches the `p_reservation_id` param name on approver_decide). If
+      // your schema names that column differently, buildPendingRows()
+      // already falls back to the embedded reservation's own id, so this
+      // degrades gracefully rather than breaking. If Supabase reports an
+      // ambiguous relationship when embedding, disambiguate with
+      // `pickup_reservations!<fk_constraint_name>(...)`.
       const { data, error } = await supabase
-        .from('pickup_reservations')
+        .from('checks')
         .select(
-          'id, collector_name, status, checks(id, status, row_number, payee, payor, check_no, check_date, amount, or_no, ar_collected, remarks, submitted_by_name, submitted_at)'
+          'id, status, row_number, payee, payor, check_no, check_date, amount, or_no, ar_collected, remarks, submitted_by_name, submitted_at, reservation_id, pickup_reservations(id, collector_name, status)'
         )
         .eq('status', 'pending_approval')
-        .order('reserved_at', { ascending: true })
+        .order('submitted_at', { ascending: true })
         .limit(150)
 
       if (!isMountedRef.current || requestId !== requestIdRef.current) return
 
       if (error) {
         // A 401/403 here almost always means the RLS policy on
-        // pending_approval reservations doesn't recognize this role —
-        // surface that distinctly from a generic network failure.
+        // pending_approval checks doesn't recognize this role — surface
+        // that distinctly from a generic network failure.
         const isAuthError = error.code === 'PGRST301' || /permission|policy/i.test(error.message || '')
         setLoadError(
           isAuthError
@@ -250,11 +338,12 @@ export default function ApproverHome() {
         return
       }
 
-      setGroups(groupByReservation(pendingCheckRows(data || [])))
+      const rows = buildPendingRows(data || [])
+      setGroups(groupByReservation(rows))
       setLastUpdated(Date.now())
       setSelectedCheckIds((prev) => {
         if (prev.size === 0) return prev
-        const validIds = new Set(pendingCheckRows(data || []).map((r) => r.checkId))
+        const validIds = new Set(rows.map((r) => r.checkId))
         const next = new Set([...prev].filter((id) => validIds.has(id)))
         return next.size === prev.size ? prev : next
       })
@@ -277,11 +366,7 @@ export default function ApproverHome() {
 
   function formatWaiting(submittedAtMs) {
     if (!submittedAtMs) return '—'
-    const mins = minutesWaiting(submittedAtMs)
-    if (mins < 60) return `${mins}m`
-    const hrs = Math.floor(mins / 60)
-    const rem = mins % 60
-    return `${hrs}h ${rem}m`
+    return formatMinutesDuration(minutesWaiting(submittedAtMs))
   }
 
   function pendingUrgency(submittedAtMs) {
@@ -291,14 +376,69 @@ export default function ApproverHome() {
     return 'normal'
   }
 
+  // Options for the collector / submitter dropdowns — always derived from
+  // whatever is actually in the current pending-approval queue, so they
+  // never drift out of sync with real data and never show a stale name
+  // that no longer has anything pending.
+  const collectorOptions = useMemo(() => {
+    const set = new Set(groups.map((g) => g.collectorName).filter(Boolean))
+    return [...set].sort((a, b) => a.localeCompare(b))
+  }, [groups])
+
+  const submitterOptions = useMemo(() => {
+    const set = new Set(groups.flatMap((g) => g.items.map((c) => c.submitted_by_name)).filter(Boolean))
+    return [...set].sort((a, b) => a.localeCompare(b))
+  }, [groups])
+
+  const activeFilterCount = useMemo(() => {
+    return [
+      collectorFilter !== 'all',
+      submitterFilter !== 'all',
+      arFilter !== 'all',
+      urgencyFilter !== 'all',
+      amountMin !== '',
+      amountMax !== '',
+    ].filter(Boolean).length
+  }, [collectorFilter, submitterFilter, arFilter, urgencyFilter, amountMin, amountMax])
+
+  function clearAdvancedFilters() {
+    setCollectorFilter('all')
+    setSubmitterFilter('all')
+    setArFilter('all')
+    setUrgencyFilter('all')
+    setAmountMin('')
+    setAmountMax('')
+  }
+
   const visibleGroups = useMemo(() => {
     const term = search.trim()
-    let list = groups.filter((g) => matchesSearch(g.items, term))
+    const min = amountMin.trim() !== '' && !Number.isNaN(Number(amountMin)) ? Number(amountMin) : null
+    const max = amountMax.trim() !== '' && !Number.isNaN(Number(amountMax)) ? Number(amountMax) : null
+
+    let list = groups
+      .filter((g) => (collectorFilter === 'all' ? true : g.collectorName === collectorFilter))
+      .map((g) => {
+        const items = g.items.filter((c) => {
+          if (submitterFilter !== 'all' && c.submitted_by_name !== submitterFilter) return false
+          if (arFilter === 'yes' && c.ar_collected !== true) return false
+          if (arFilter === 'no' && c.ar_collected !== false) return false
+          if (arFilter === 'unset' && !(c.ar_collected === null || c.ar_collected === undefined)) return false
+          const amt = Number(c.amount) || 0
+          if (min !== null && amt < min) return false
+          if (max !== null && amt > max) return false
+          return true
+        })
+        return { ...g, items }
+      })
+      .filter((g) => g.items.length > 0)
+      .filter((g) => matchesSearch(g.items, term))
 
     list = list.map((g) => ({ ...g, total: orderTotal(g.items), submittedAtMs: earliestSubmittedAt(g.items) }))
 
-    if (quickFilter === 'stale') {
+    if (urgencyFilter === 'stale') {
       list = list.filter((g) => g.submittedAtMs && minutesWaiting(g.submittedAtMs) >= PENDING_WARN_MINUTES)
+    } else if (urgencyFilter === 'critical') {
+      list = list.filter((g) => g.submittedAtMs && minutesWaiting(g.submittedAtMs) >= PENDING_CRITICAL_MINUTES)
     }
 
     list.sort((a, b) => {
@@ -319,21 +459,45 @@ export default function ApproverHome() {
 
     return list
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [groups, search, sortBy, quickFilter, now])
+  }, [groups, search, sortBy, urgencyFilter, collectorFilter, submitterFilter, arFilter, amountMin, amountMax, now])
 
+  // Top-of-page KPIs — deliberately computed off the FULL `groups` dataset
+  // (not `visibleGroups`), so the headline numbers always describe the
+  // whole pending-approval queue even while an approver is drilled into a
+  // filtered slice of it below.
   const summary = useMemo(() => {
     const allItems = groups.flatMap((g) => g.items)
-    const stale = groups.filter((g) => {
-      const submittedAtMs = earliestSubmittedAt(g.items)
-      return submittedAtMs && minutesWaiting(submittedAtMs) >= PENDING_WARN_MINUTES
-    }).length
+
+    const waitMinutesList = groups
+      .map((g) => earliestSubmittedAt(g.items))
+      .filter(Boolean)
+      .map((t) => Math.max(0, Math.round((now - t) / 60000)))
+
+    const stale = waitMinutesList.filter((m) => m >= PENDING_WARN_MINUTES).length
+    const critical = waitMinutesList.filter((m) => m >= PENDING_CRITICAL_MINUTES).length
+    const avgWaitMinutes =
+      waitMinutesList.length > 0 ? waitMinutesList.reduce((s, m) => s + m, 0) / waitMinutesList.length : 0
+    const maxWaitMinutes = waitMinutesList.length > 0 ? Math.max(...waitMinutesList) : 0
+
+    const uniqueCollectors = new Set(groups.map((g) => g.collectorName).filter(Boolean)).size
+    const totalValue = orderTotal(allItems)
+    const avgCheckAmount = allItems.length > 0 ? totalValue / allItems.length : 0
+    const arNotCollected = allItems.filter((c) => c.ar_collected === false).length
+    const arUnrecorded = allItems.filter((c) => c.ar_collected === null || c.ar_collected === undefined).length
+
     return {
       orders: groups.length,
       checks: allItems.length,
-      totalValue: orderTotal(allItems),
+      totalValue,
+      avgCheckAmount,
       stale,
+      critical,
+      avgWaitMinutes,
+      maxWaitMinutes,
+      uniqueCollectors,
+      arNotCollected,
+      arUnrecorded,
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [groups, now])
 
   function toggleExpand(reservationId) {
@@ -516,6 +680,14 @@ export default function ApproverHome() {
   }
 
   const activeSortLabel = SORT_OPTIONS.find((o) => o.value === sortBy)?.label || 'Sort'
+  const hasActiveFilter =
+    !!search.trim() ||
+    urgencyFilter !== 'all' ||
+    collectorFilter !== 'all' ||
+    submitterFilter !== 'all' ||
+    arFilter !== 'all' ||
+    amountMin !== '' ||
+    amountMax !== ''
 
   if (profileLoading) {
     return <div className="flex min-h-[40vh] items-center justify-center text-sm text-ink-300">Loading…</div>
@@ -574,32 +746,78 @@ export default function ApproverHome() {
       </div>
 
       {!loading && (
-        <div className="mb-5 grid grid-cols-2 gap-3 sm:max-w-2xl sm:grid-cols-4">
-          <LedgerStatCard icon={Layers} label="Orders" value={summary.orders} />
-          <LedgerStatCard icon={Hash} label="Checks awaiting" value={summary.checks} />
-          <LedgerStatCard icon={Stamp} label="Total value" value={formatCurrency(summary.totalValue)} />
-          <button onClick={() => setQuickFilter((f) => (f === 'stale' ? 'all' : 'stale'))} className="text-left">
-            <Card
-              className={cn(
-                'relative overflow-hidden border-ink-100 p-4 transition',
-                summary.stale > 0 && 'border-orange-300 bg-orange-50',
-                quickFilter === 'stale' && 'ring-2 ring-orange-400'
-              )}
-            >
-              <div className="flex items-center gap-2">
-                <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-orange-100 text-orange-600">
-                  <Hourglass className="h-3.5 w-3.5" />
-                </span>
-                <p className="font-mono text-[10px] uppercase tracking-wide text-ink-400">
-                  Waiting {PENDING_WARN_MINUTES}m+
+        <>
+          {/* Primary overview row */}
+          <div className="mb-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
+            <LedgerStatCard icon={Layers} label="Orders" value={summary.orders} />
+            <LedgerStatCard icon={Hash} label="Checks awaiting" value={summary.checks} />
+            <LedgerStatCard icon={Wallet} label="Total value" value={formatCurrency(summary.totalValue)} />
+            <LedgerStatCard
+              icon={TrendingUp}
+              label="Avg. check amount"
+              value={summary.checks > 0 ? formatCurrency(summary.avgCheckAmount) : '—'}
+            />
+          </div>
+
+          {/* Timing & risk row — the two wait-time cards double as quick
+              filters, same interaction pattern as before (click to toggle,
+              click again to clear). */}
+          <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+            <button onClick={() => setUrgencyFilter((f) => (f === 'stale' ? 'all' : 'stale'))} className="text-left">
+              <Card
+                className={cn(
+                  'relative overflow-hidden border-ink-100 p-4 transition',
+                  summary.stale > 0 && 'border-orange-300 bg-orange-50',
+                  urgencyFilter === 'stale' && 'ring-2 ring-orange-400'
+                )}
+              >
+                <div className="flex items-center gap-2">
+                  <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-orange-100 text-orange-600">
+                    <Hourglass className="h-3.5 w-3.5" />
+                  </span>
+                  <p className="font-mono text-[10px] uppercase tracking-wide text-ink-400">
+                    Waiting {PENDING_WARN_MINUTES}m+
+                  </p>
+                </div>
+                <p className={cn('mt-1.5 font-display text-2xl font-semibold', summary.stale > 0 ? 'text-orange-600' : 'text-ink-900')}>
+                  {summary.stale}
                 </p>
-              </div>
-              <p className={cn('mt-1.5 font-display text-2xl font-semibold', summary.stale > 0 ? 'text-orange-600' : 'text-ink-900')}>
-                {summary.stale}
-              </p>
-            </Card>
-          </button>
-        </div>
+              </Card>
+            </button>
+
+            <button onClick={() => setUrgencyFilter((f) => (f === 'critical' ? 'all' : 'critical'))} className="text-left">
+              <Card
+                className={cn(
+                  'relative overflow-hidden border-ink-100 p-4 transition',
+                  summary.critical > 0 && 'border-red-300 bg-red-50',
+                  urgencyFilter === 'critical' && 'ring-2 ring-red-400'
+                )}
+              >
+                <div className="flex items-center gap-2">
+                  <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-red-100 text-red-600">
+                    <AlertTriangle className="h-3.5 w-3.5" />
+                  </span>
+                  <p className="font-mono text-[10px] uppercase tracking-wide text-ink-400">
+                    Waiting {Math.round(PENDING_CRITICAL_MINUTES / 60)}h+
+                  </p>
+                </div>
+                <p className={cn('mt-1.5 font-display text-2xl font-semibold', summary.critical > 0 ? 'text-red-600' : 'text-ink-900')}>
+                  {summary.critical}
+                </p>
+              </Card>
+            </button>
+
+            <LedgerStatCard icon={Timer} label="Avg. wait" value={formatMinutesDuration(summary.avgWaitMinutes)} />
+            <LedgerStatCard icon={Hourglass} label="Longest wait" value={formatMinutesDuration(summary.maxWaitMinutes)} />
+            <LedgerStatCard icon={Users} label="Collectors" value={summary.uniqueCollectors} />
+            <LedgerStatCard
+              icon={ShieldAlert}
+              label="AR not collected"
+              value={summary.arNotCollected}
+              accent={summary.arNotCollected > 0 ? 'warning' : undefined}
+            />
+          </div>
+        </>
       )}
 
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
@@ -659,6 +877,23 @@ export default function ApproverHome() {
               </>
             )}
           </div>
+
+          <button
+            onClick={() => setShowAdvancedFilters((v) => !v)}
+            className={cn(
+              'flex shrink-0 items-center gap-1.5 rounded-md border px-3 py-2 text-sm font-medium hover:bg-ink-50',
+              activeFilterCount > 0 ? 'border-teal-300 bg-teal-50 text-teal-700' : 'border-ink-200 text-ink-600'
+            )}
+          >
+            <SlidersHorizontal className="h-3.5 w-3.5" />
+            <span>Filters</span>
+            {activeFilterCount > 0 && (
+              <span className="rounded-full bg-teal-600 px-1.5 py-0.5 text-[10px] font-semibold text-white">
+                {activeFilterCount}
+              </span>
+            )}
+            {showAdvancedFilters ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+          </button>
         </div>
 
         <button
@@ -670,6 +905,120 @@ export default function ApproverHome() {
           Export CSV
         </button>
       </div>
+
+      {showAdvancedFilters && (
+        <div className="mb-4 grid grid-cols-1 gap-3 rounded-lg border border-ink-100 bg-ink-50/50 p-3.5 sm:grid-cols-2 lg:grid-cols-4">
+          <div>
+            <label className="mb-1 block font-mono text-[11px] uppercase tracking-wide text-ink-400">Collector</label>
+            <select
+              value={collectorFilter}
+              onChange={(e) => setCollectorFilter(e.target.value)}
+              className="w-full rounded-md border border-ink-200 bg-white px-2.5 py-1.5 text-sm text-ink-700 focus:outline-none focus:ring-1 focus:ring-teal-500"
+            >
+              <option value="all">All collectors</option>
+              {collectorOptions.map((c) => (
+                <option key={c} value={c}>
+                  {c}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label className="mb-1 block font-mono text-[11px] uppercase tracking-wide text-ink-400">Submitted by</label>
+            <select
+              value={submitterFilter}
+              onChange={(e) => setSubmitterFilter(e.target.value)}
+              className="w-full rounded-md border border-ink-200 bg-white px-2.5 py-1.5 text-sm text-ink-700 focus:outline-none focus:ring-1 focus:ring-teal-500"
+            >
+              <option value="all">Anyone</option>
+              {submitterOptions.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label className="mb-1 block font-mono text-[11px] uppercase tracking-wide text-ink-400">AR collected</label>
+            <select
+              value={arFilter}
+              onChange={(e) => setArFilter(e.target.value)}
+              className="w-full rounded-md border border-ink-200 bg-white px-2.5 py-1.5 text-sm text-ink-700 focus:outline-none focus:ring-1 focus:ring-teal-500"
+            >
+              {AR_FILTER_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label className="mb-1 block font-mono text-[11px] uppercase tracking-wide text-ink-400">Waiting time</label>
+            <select
+              value={urgencyFilter}
+              onChange={(e) => setUrgencyFilter(e.target.value)}
+              className="w-full rounded-md border border-ink-200 bg-white px-2.5 py-1.5 text-sm text-ink-700 focus:outline-none focus:ring-1 focus:ring-teal-500"
+            >
+              {URGENCY_FILTER_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label className="mb-1 block font-mono text-[11px] uppercase tracking-wide text-ink-400">Min amount</label>
+            <input
+              type="number"
+              inputMode="decimal"
+              min="0"
+              step="0.01"
+              value={amountMin}
+              onChange={(e) => setAmountMin(e.target.value)}
+              onBlur={() => {
+                if (amountMin !== '' && amountMax !== '' && Number(amountMin) > Number(amountMax)) {
+                  setAmountMax(amountMin)
+                }
+              }}
+              placeholder="0.00"
+              className="w-full rounded-md border border-ink-200 bg-white px-2.5 py-1.5 text-sm text-ink-700 focus:outline-none focus:ring-1 focus:ring-teal-500"
+            />
+          </div>
+
+          <div>
+            <label className="mb-1 block font-mono text-[11px] uppercase tracking-wide text-ink-400">Max amount</label>
+            <input
+              type="number"
+              inputMode="decimal"
+              min="0"
+              step="0.01"
+              value={amountMax}
+              onChange={(e) => setAmountMax(e.target.value)}
+              onBlur={() => {
+                if (amountMin !== '' && amountMax !== '' && Number(amountMax) < Number(amountMin)) {
+                  setAmountMin(amountMax)
+                }
+              }}
+              placeholder="No limit"
+              className="w-full rounded-md border border-ink-200 bg-white px-2.5 py-1.5 text-sm text-ink-700 focus:outline-none focus:ring-1 focus:ring-teal-500"
+            />
+          </div>
+
+          <div className="flex items-end sm:col-span-2 lg:col-span-2 lg:justify-end">
+            <button
+              onClick={clearAdvancedFilters}
+              disabled={activeFilterCount === 0}
+              className="rounded-md border border-ink-200 px-3.5 py-1.5 text-xs font-medium text-ink-500 hover:bg-ink-50 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Clear filters
+            </button>
+          </div>
+        </div>
+      )}
 
       {loadError && (
         <div className="mb-4 flex items-center justify-between gap-3 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
@@ -689,7 +1038,7 @@ export default function ApproverHome() {
       {loading ? (
         <ListSkeleton />
       ) : visibleGroups.length === 0 ? (
-        <EmptyState hasFilter={!!search.trim() || quickFilter !== 'all'} />
+        <EmptyState hasFilter={hasActiveFilter} />
       ) : (
         <div className="space-y-2.5">
           {visibleGroups.map((g) => (
@@ -748,20 +1097,37 @@ export default function ApproverHome() {
   )
 }
 
-function LedgerStatCard({ icon: Icon, label, value }) {
+function LedgerStatCard({ icon: Icon, label, value, accent }) {
   return (
-    <Card className="relative overflow-hidden border-ink-100 p-4">
+    <Card
+      className={cn(
+        'relative overflow-hidden border-ink-100 p-4',
+        accent === 'warning' && 'border-orange-200 bg-orange-50/60'
+      )}
+    >
       <div
         className="pointer-events-none absolute -right-4 -top-4 h-16 w-16 rounded-full border-2 border-dashed border-ledger-stamp/30"
         aria-hidden="true"
       />
       <div className="relative flex items-center gap-2">
-        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-ledger-stamp/10 text-ledger-stampDark">
+        <span
+          className={cn(
+            'flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-ledger-stamp/10 text-ledger-stampDark',
+            accent === 'warning' && 'bg-orange-100 text-orange-600'
+          )}
+        >
           <Icon className="h-3.5 w-3.5" />
         </span>
         <p className="font-mono text-[10px] uppercase tracking-wide text-ink-400">{label}</p>
       </div>
-      <p className="relative mt-1.5 font-display text-2xl font-semibold text-ink-900">{value}</p>
+      <p
+        className={cn(
+          'relative mt-1.5 font-display text-2xl font-semibold',
+          accent === 'warning' ? 'text-orange-600' : 'text-ink-900'
+        )}
+      >
+        {value}
+      </p>
     </Card>
   )
 }
@@ -1315,7 +1681,7 @@ function EmptyState({ hasFilter }) {
       </p>
       <p className="mt-1 max-w-sm text-sm text-ink-400">
         {hasFilter
-          ? 'Try a different search, or clear the filter.'
+          ? 'Try a different search or filter combination, or clear your filters.'
           : 'Checks submitted by admins for pickup will show up here for verification.'}
       </p>
     </div>

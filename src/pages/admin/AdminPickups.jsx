@@ -59,6 +59,9 @@ import {
   ShieldCheck,
   XCircle,
   Hourglass,
+  Wallet,
+  Timer,
+  Flame,
 } from 'lucide-react'
 import { supabase } from '../../lib/supabaseClient'
 import { Input } from '../../components/ui/input'
@@ -496,17 +499,18 @@ export default function AdminPickups() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reservations, checkSearch, quickFilter, sortBy, tab, now])
 
-  const activeSummary = useMemo(() => {
+ const activeSummary = useMemo(() => {
     if (tab !== 'active') return null
-    const expiringSoon = reservations.filter(
-      (r) => minutesLeft(r.expires_at) <= EXPIRING_SOON_MINUTES
-    ).length
+    const minutesLeftAll = reservations.map((r) => minutesLeft(r.expires_at))
+    const expiringSoon = minutesLeftAll.filter((m) => m <= EXPIRING_SOON_MINUTES).length
+    const critical = minutesLeftAll.filter((m) => m <= CRITICAL_MINUTES).length
     const totalChecks = reservations.reduce(
       (sum, r) => sum + (Array.isArray(r.checks) ? r.checks.length : 0),
       0
     )
     const totalValue = reservations.reduce((sum, r) => sum + orderTotal(lineItems(r, 'active')), 0)
-    return { total: reservations.length, expiringSoon, totalChecks, totalValue }
+    const avgChecksPerOrder = reservations.length ? (totalChecks / reservations.length).toFixed(1) : '0'
+    return { total: reservations.length, expiringSoon, critical, totalChecks, totalValue, avgChecksPerOrder }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reservations, tab, now])
 
@@ -514,18 +518,31 @@ export default function AdminPickups() {
     if (tab !== 'pending_approval') return null
     let totalChecks = 0
     let stale = 0
+    let critical = 0
     let totalValue = 0
+    let earliestMs = null
     reservations.forEach((r) => {
       const items = sortedLineItems(r, 'pending_approval')
       totalChecks += items.length
       totalValue += orderTotal(items)
       const submittedAtMs = earliestSubmittedAt(items)
-      if (submittedAtMs && minutesWaiting(submittedAtMs) >= PENDING_WARN_MINUTES) stale += 1
+      if (submittedAtMs) {
+        const waited = minutesWaiting(submittedAtMs)
+        if (waited >= PENDING_WARN_MINUTES) stale += 1
+        if (waited >= PENDING_CRITICAL_MINUTES) critical += 1
+        if (earliestMs === null || submittedAtMs < earliestMs) earliestMs = submittedAtMs
+      }
     })
-    return { total: reservations.length, totalChecks, totalValue, stale }
+    return {
+      total: reservations.length,
+      totalChecks,
+      totalValue,
+      stale,
+      critical,
+      oldestWaitingLabel: earliestMs ? formatWaiting(earliestMs) : null,
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reservations, tab, now])
-
   function toggleExpand(id) {
     setExpandedIds((prev) => {
       const next = new Set(prev)
@@ -924,89 +941,94 @@ export default function AdminPickups() {
         </div>
       </div>
 
-      {tab === 'active' && activeSummary && !loading && (
-        <div className="mb-5 grid grid-cols-2 gap-3 sm:max-w-2xl sm:grid-cols-4">
-          <Card className="p-4">
-            <p className="text-xs font-medium uppercase tracking-wide text-ink-400">Active orders</p>
-            <p className="mt-1 text-2xl font-semibold text-ink-900">{activeSummary.total}</p>
-          </Card>
-          <Card className="p-4">
-            <p className="text-xs font-medium uppercase tracking-wide text-ink-400">Checks on hold</p>
-            <p className="mt-1 text-2xl font-semibold text-ink-900">{activeSummary.totalChecks}</p>
-          </Card>
-          <Card className="p-4">
-            <p className="text-xs font-medium uppercase tracking-wide text-ink-400">Total value</p>
-            <p className="mt-1 text-2xl font-semibold text-ink-900">
-              {formatCurrency(activeSummary.totalValue)}
-            </p>
-          </Card>
-          <button
+   {tab === 'active' && activeSummary && (
+        <div className="mb-5 grid grid-cols-2 gap-3 lg:grid-cols-5">
+          <KpiCard
+            icon={User}
+            label="Active orders"
+            value={loading ? null : activeSummary.total}
+            secondary={loading ? null : `${activeSummary.avgChecksPerOrder} checks/order avg`}
+            accent="ink"
+          />
+          <KpiCard
+            icon={Layers}
+            label="Checks on hold"
+            value={loading ? null : activeSummary.totalChecks}
+            secondary={loading ? null : formatCurrency(activeSummary.totalValue)}
+            accent="ink"
+          />
+          <KpiCard
+            icon={Wallet}
+            label="Total value"
+            value={loading ? null : formatCurrency(activeSummary.totalValue)}
+            secondary={
+              loading
+                ? null
+                : `${formatCurrency(activeSummary.totalValue / (activeSummary.total || 1))} avg/order`
+            }
+            accent="ink"
+          />
+          <KpiCard
+            icon={Timer}
+            label={`Expiring ≤ ${EXPIRING_SOON_MINUTES}m`}
+            value={loading ? null : activeSummary.expiringSoon}
+            secondary={loading ? null : `${activeSummary.critical} of these ≤ ${CRITICAL_MINUTES}m`}
+            accent={!loading && activeSummary.expiringSoon > 0 ? 'amber' : 'ink'}
+            active={quickFilter === 'expiring'}
             onClick={() => setQuickFilter((f) => (f === 'expiring' ? 'all' : 'expiring'))}
-            className="text-left"
-          >
-            <Card
-              className={cn(
-                'p-4 transition',
-                activeSummary.expiringSoon > 0 && 'border-orange-300 bg-orange-50',
-                quickFilter === 'expiring' && 'ring-2 ring-orange-400'
-              )}
-            >
-              <p className="text-xs font-medium uppercase tracking-wide text-ink-400">
-                Expiring within {EXPIRING_SOON_MINUTES}m
-              </p>
-              <p
-                className={cn(
-                  'mt-1 text-2xl font-semibold',
-                  activeSummary.expiringSoon > 0 ? 'text-orange-600' : 'text-ink-900'
-                )}
-              >
-                {activeSummary.expiringSoon}
-              </p>
-            </Card>
-          </button>
+          />
+          <KpiCard
+            icon={Flame}
+            label={`Critical ≤ ${CRITICAL_MINUTES}m`}
+            value={loading ? null : activeSummary.critical}
+            secondary={!loading && activeSummary.critical > 0 ? 'Needs immediate attention' : null}
+            accent={!loading && activeSummary.critical > 0 ? 'red' : 'ink'}
+          />
         </div>
-      )}
-
-      {tab === 'pending_approval' && pendingSummary && !loading && (
-        <div className="mb-5 grid grid-cols-2 gap-3 sm:max-w-2xl sm:grid-cols-4">
-          <Card className="p-4">
-            <p className="text-xs font-medium uppercase tracking-wide text-ink-400">Awaiting approval</p>
-            <p className="mt-1 text-2xl font-semibold text-ink-900">{pendingSummary.total}</p>
-          </Card>
-          <Card className="p-4">
-            <p className="text-xs font-medium uppercase tracking-wide text-ink-400">Checks submitted</p>
-            <p className="mt-1 text-2xl font-semibold text-ink-900">{pendingSummary.totalChecks}</p>
-          </Card>
-          <Card className="p-4">
-            <p className="text-xs font-medium uppercase tracking-wide text-ink-400">Total value</p>
-            <p className="mt-1 text-2xl font-semibold text-ink-900">
-              {formatCurrency(pendingSummary.totalValue)}
-            </p>
-          </Card>
-          <button
+      )}   
+{tab === 'pending_approval' && pendingSummary && (
+        <div className="mb-5 grid grid-cols-2 gap-3 lg:grid-cols-5">
+          <KpiCard
+            icon={ShieldCheck}
+            label="Awaiting approval"
+            value={loading ? null : pendingSummary.total}
+            secondary={loading ? null : pendingSummary.oldestWaitingLabel ? `Oldest: ${pendingSummary.oldestWaitingLabel}` : null}
+            accent="ink"
+          />
+          <KpiCard
+            icon={Hash}
+            label="Checks submitted"
+            value={loading ? null : pendingSummary.totalChecks}
+            secondary={loading ? null : formatCurrency(pendingSummary.totalValue)}
+            accent="ink"
+          />
+          <KpiCard
+            icon={Wallet}
+            label="Total value"
+            value={loading ? null : formatCurrency(pendingSummary.totalValue)}
+            secondary={
+              loading
+                ? null
+                : `${formatCurrency(pendingSummary.totalValue / (pendingSummary.total || 1))} avg/submission`
+            }
+            accent="ink"
+          />
+          <KpiCard
+            icon={Hourglass}
+            label={`Waiting ${PENDING_WARN_MINUTES}m+`}
+            value={loading ? null : pendingSummary.stale}
+            secondary={loading ? null : `${pendingSummary.critical} of these ${PENDING_CRITICAL_MINUTES}m+`}
+            accent={!loading && pendingSummary.stale > 0 ? 'amber' : 'ink'}
+            active={quickFilter === 'stale'}
             onClick={() => setQuickFilter((f) => (f === 'stale' ? 'all' : 'stale'))}
-            className="text-left"
-          >
-            <Card
-              className={cn(
-                'p-4 transition',
-                pendingSummary.stale > 0 && 'border-orange-300 bg-orange-50',
-                quickFilter === 'stale' && 'ring-2 ring-orange-400'
-              )}
-            >
-              <p className="text-xs font-medium uppercase tracking-wide text-ink-400">
-                Waiting {PENDING_WARN_MINUTES}m+
-              </p>
-              <p
-                className={cn(
-                  'mt-1 text-2xl font-semibold',
-                  pendingSummary.stale > 0 ? 'text-orange-600' : 'text-ink-900'
-                )}
-              >
-                {pendingSummary.stale}
-              </p>
-            </Card>
-          </button>
+          />
+          <KpiCard
+            icon={Flame}
+            label={`Critical ${PENDING_CRITICAL_MINUTES}m+`}
+            value={loading ? null : pendingSummary.critical}
+            secondary={!loading && pendingSummary.critical > 0 ? 'Escalate to an approver' : null}
+            accent={!loading && pendingSummary.critical > 0 ? 'red' : 'ink'}
+          />
         </div>
       )}
 
@@ -1289,7 +1311,58 @@ function TabButton({ active, onClick, children }) {
     </button>
   )
 }
+function KpiCard({ icon: Icon, label, value, secondary, accent = 'ink', onClick, active }) {
+  const accents = {
+    teal: { ring: 'border-teal-200', badge: 'bg-teal-100 text-teal-700', activeRing: 'ring-teal-400' },
+    amber: { ring: 'border-amber-200', badge: 'bg-amber-100 text-amber-700', activeRing: 'ring-amber-400' },
+    red: { ring: 'border-red-200', badge: 'bg-red-100 text-red-600', activeRing: 'ring-red-400' },
+    ink: { ring: 'border-ink-100', badge: 'bg-ink-100 text-ink-600', activeRing: 'ring-ink-400' },
+  }
+  const style = accents[accent] || accents.ink
+  const isLoading = value === null || value === undefined
+  const isInteractive = typeof onClick === 'function'
 
+  const card = (
+    <Card
+      className={cn(
+        'relative overflow-hidden p-4 transition',
+        isInteractive && 'hover:border-ink-200 hover:shadow-sm',
+        active && cn('ring-2', style.activeRing),
+      )}
+    >
+      <div
+        className={cn(
+          'pointer-events-none absolute -right-4 -top-4 h-16 w-16 rounded-full border-2 border-dashed',
+          style.ring,
+        )}
+        aria-hidden="true"
+      />
+      <div className="relative flex items-start gap-3">
+        <div className={cn('flex h-9 w-9 shrink-0 items-center justify-center rounded-full', style.badge)}>
+          <Icon className="h-4 w-4" />
+        </div>
+        <div className="min-w-0 flex-1">
+          {isLoading ? (
+            <div className="h-6 w-12 animate-pulse rounded bg-ink-100" />
+          ) : (
+            <p className="truncate text-2xl font-semibold text-ink-900">{value}</p>
+          )}
+          <p className="truncate text-xs font-medium uppercase tracking-wide text-ink-400">{label}</p>
+          {!isLoading && secondary && <p className="mt-0.5 truncate text-xs text-ink-500">{secondary}</p>}
+        </div>
+      </div>
+    </Card>
+  )
+
+  if (isInteractive) {
+    return (
+      <button type="button" onClick={onClick} className="text-left" aria-pressed={!!active}>
+        {card}
+      </button>
+    )
+  }
+  return card
+}
 function StatusBadge({ status }) {
   const styles = {
     reserved: 'bg-teal-100 text-teal-700',
