@@ -40,7 +40,7 @@ import { formatCurrency, formatDate, cn } from '../../lib/utils'
 const PAGE_SIZE_OPTIONS = [25, 50, 100]
 const SORTABLE_COLUMNS = ['payee', 'check_date', 'amount', 'uploaded_at', 'bank']
 const DEBOUNCE_MS = 300
-const RECEIPT_TYPES = ['PR', 'CR', 'AR', 'OR']
+const RECEIPT_TYPES = ['PR', 'AR', 'OR']
 
 // Every status a single check row can be in. 'reserved' and 'returned'
 // checks are NOT submissions this page can act on directly — they're
@@ -995,10 +995,12 @@ export default function AdminChecks() {
                     <br />
                     Row {row.row_number}
                   </td>
-                  <td className={cn(cellPad, 'max-w-[140px]')}>
-                    <BankBadge bank={row.bank} />
-                  </td>
-                  <td className={cn(cellPad, 'max-w-[140px] truncate font-medium text-ink-800')}>{row.payee || '—'}</td>
+<td className={cn(cellPad, 'max-w-[150px]')}>
+  <BankBadge bank={row.bank} />
+</td>
+    <td className={cn(cellPad, 'max-w-[180px] truncate font-medium text-ink-800')} title={row.payee || undefined}>
+  {row.payee || '—'}
+</td>
                   <td className={cn(cellPad, 'max-w-[140px] truncate text-ink-600')}>{row.payor || '—'}</td>
                   <td className={cn(cellPad, 'font-mono text-ink-600')}>
                     <CopyableCheckNo value={row.check_no} />
@@ -1186,13 +1188,13 @@ function BankBadge({ bank }) {
     )
   }
   return (
-    <span
-      className="inline-flex max-w-[130px] items-center gap-1 truncate rounded-full bg-teal-50 px-2 py-0.5 text-[9px] font-medium text-teal-700"
-      title={bank}
-    >
-      <Landmark className="h-2.5 w-2.5 shrink-0" />
-      <span className="truncate">{bank}</span>
-    </span>
+ <span
+  className="inline-flex max-w-[140px] items-center gap-1 truncate rounded-full bg-teal-50 px-2 py-0.5 text-[9px] font-medium text-teal-700"
+  title={bank}
+>
+  <Landmark className="h-2.5 w-2.5 shrink-0" />
+  <span className="truncate">{bank}</span>
+</span>
   )
 }
 
@@ -1500,7 +1502,7 @@ function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
         role="dialog"
         aria-modal="true"
         aria-labelledby="submit-approval-title"
-        className="relative flex h-[90vh] w-full max-w-6xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl"
+        className="relative flex max-h-[65vh] w-full max-w-6xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl"
       >
         {/* ── Header ───────────────────────────────────────────────── */}
         <div className="flex shrink-0 items-start justify-between gap-4 border-b border-ink-100 px-7 py-5">

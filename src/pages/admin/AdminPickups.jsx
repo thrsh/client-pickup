@@ -149,7 +149,7 @@ const PENDING_CRITICAL_MINUTES = 240
 // checks.or_no is the only schema column available for this, so the type
 // is captured alongside the number and folded into that single column by
 // composeReceiptNo() below rather than requiring a new migration.
-const RECEIPT_TYPES = ['PR', 'CR', 'AR', 'OR']
+const RECEIPT_TYPES = ['PR', 'AR', 'OR']
 
 // Check-level statuses that belong in the Active tab. A check that has
 // been approved (picked_up), is awaiting approval (pending_approval), or
@@ -1898,13 +1898,13 @@ function BankBadge({ bank }) {
     )
   }
   return (
-    <span
-      className="inline-flex max-w-[160px] items-center gap-1 truncate rounded-full bg-teal-50 px-2 py-0.5 text-[11px] font-medium text-teal-700"
-      title={bank}
-    >
-      <Landmark className="h-3 w-3 shrink-0" />
-      <span className="truncate">{bank}</span>
-    </span>
+  <span
+  className="inline-flex max-w-[150px] items-center gap-1 truncate rounded-full bg-teal-50 px-2 py-0.5 text-[11px] font-medium text-teal-700"
+  title={bank}
+>
+  <Landmark className="h-3 w-3 shrink-0" />
+  <span className="truncate">{bank}</span>
+</span>
   )
 }
 
@@ -2139,10 +2139,12 @@ function ReservationRow({
                           {c.check_no || '—'}
                         </span>
                       </td>
-                      <td className="max-w-[160px] truncate px-2 py-2.5 font-medium text-ink-900">
-                        {c.payee || '—'}
-                      </td>
-                      <td className="max-w-[160px] truncate px-2 py-2.5 text-ink-600">{c.payor || '—'}</td>
+                   <td className="max-w-[180px] truncate px-2 py-2.5 font-medium text-ink-900" title={c.payee || undefined}>
+  {c.payee || '—'}
+</td>
+<td className="max-w-[180px] truncate px-2 py-2.5 text-ink-600" title={c.payor || undefined}>
+  {c.payor || '—'}
+</td>
                       <td className="px-2 py-2.5 text-xs text-ink-500">
                         <span className="flex items-center gap-1">
                           <CalendarDays className="h-3 w-3 text-ink-300" />
@@ -2557,10 +2559,10 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
         role="dialog"
         aria-modal="true"
         aria-labelledby="pickup-action-title"
-        className={cn(
-          'relative flex w-full flex-col overflow-hidden rounded-2xl bg-white shadow-2xl',
-          isSubmit ? 'h-[90vh] max-w-6xl' : 'max-h-[85vh] max-w-2xl',
-        )}
+       className={cn(
+  'relative flex w-full flex-col overflow-hidden rounded-2xl bg-white shadow-2xl',
+  isSubmit ? 'max-h-[65vh] max-w-6xl' : 'max-h-[65vh] max-w-2xl',
+)}
       >
         {/* ── Header ───────────────────────────────────────────────── */}
         <div className="flex shrink-0 items-start justify-between gap-4 border-b border-ink-100 px-7 py-5">
@@ -2937,8 +2939,12 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
                         <BankBadge bank={c.bank} />
                       </td>
                       <td className="px-3 py-2 font-mono text-ink-700">{c.check_no || '—'}</td>
-                      <td className="max-w-[110px] truncate px-3 py-2 text-ink-900">{c.payee || '—'}</td>
-                      <td className="max-w-[110px] truncate px-3 py-2 text-ink-600">{c.payor || '—'}</td>
+                   <td className="max-w-[130px] truncate px-3 py-2 text-ink-900" title={c.payee || undefined}>
+  {c.payee || '—'}
+</td>
+<td className="max-w-[130px] truncate px-3 py-2 text-ink-600" title={c.payor || undefined}>
+  {c.payor || '—'}
+</td>
                       <td className="px-3 py-2 text-ink-500">
                         {c.check_date ? formatDate(c.check_date) : '—'}
                       </td>
