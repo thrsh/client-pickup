@@ -15,6 +15,7 @@ import {
   X,
   Check,
   Users,
+  Landmark,
 } from 'lucide-react'
 // npm install exceljs — used to build the formatted .xlsx report workbooks below.
 import ExcelJS from 'exceljs'
@@ -54,6 +55,12 @@ const BRAND_TEAL_RGB = [13, 148, 136]
 /* it, so if this mapping ever needs to change it only needs to       */
 /* change in one place.                                               */
 /*                                                                    */
+/* "Bank" is `checks.bank` — the issuing bank captured at upload      */
+/* time. It's filterable (see the Bank multi-select in the form step) */
+/* and rendered as its own column on every report, right after the    */
+/* row number, so admins can tell at a glance (or filter down to)     */
+/* which bank each check came from.                                   */
+/*                                                                    */
 /* "Date Uploaded" is `checks.created_at` — when the check record     */
 /* was entered into this system. "Aging (Days)" is how many days the  */
 /* check has been (or was) in our hands: for still-unreleased checks  */
@@ -77,6 +84,7 @@ const HEADER_FILL_COLOR = 'FF0D9488' // teal
 const BORDER_COLOR = 'FFD1D5DB'
 
 const ALL_PAYEES_LABEL = 'All Payees'
+const ALL_BANKS_LABEL = 'All Banks'
 
 // "Client Name" = the payor. Kept as a single function so every report
 // (and the preview table) reads it from one place.
@@ -151,22 +159,25 @@ function todayDateInputValue() {
   return `${yyyy}-${mm}-${dd}`
 }
 
-// Shared display text for the selected-payee(s) filter, used in the preview
-// header, the workbook/PDF header, and the on-screen summary.
-function formatPayeeDisplay(payeeAll, payees) {
-  if (payeeAll) return ALL_PAYEES_LABEL
-  if (!payees || payees.length === 0) return '—'
-  if (payees.length <= 3) return payees.join(', ')
-  return `${payees.length} payees selected (${payees.slice(0, 2).join(', ')}, +${payees.length - 2} more)`
+// Shared display text for a multi-select filter (Payee or Bank), used in
+// the preview header, the workbook/PDF header, and the on-screen summary.
+// `allLabel` is whatever the "select everything" option is called for that
+// particular filter (e.g. "All Payees" vs "All Banks").
+function formatMultiSelectDisplay(allSelected, values, allLabel) {
+  if (allSelected) return allLabel
+  if (!values || values.length === 0) return '—'
+  if (values.length <= 3) return values.join(', ')
+  return `${values.length} selected (${values.slice(0, 2).join(', ')}, +${values.length - 2} more)`
 }
 
 // Short, filesystem-safe tag for filenames — kept separate from the
-// display text above so long payee lists don't produce unwieldy filenames.
-function payeeFileTag(payeeAll, payees) {
-  if (payeeAll) return 'all-payees'
-  if (!payees || payees.length === 0) return 'payee'
-  if (payees.length === 1) return payees[0].replace(/[^a-z0-9]+/gi, '_')
-  return `${payees.length}-payees`
+// display text above so long selections don't produce unwieldy filenames.
+// `allTag` is the tag used when every option is included (e.g. "all-payees").
+function multiSelectFileTag(allSelected, values, allTag) {
+  if (allSelected) return allTag
+  if (!values || values.length === 0) return allTag
+  if (values.length === 1) return values[0].replace(/[^a-z0-9]+/gi, '_')
+  return `${values.length}-selected`
 }
 
 function thinBorder() {
@@ -192,15 +203,16 @@ function formatCellDisplay(cell) {
 }
 
 const REPORT_CONFIG = {
-released: {
+  released: {
     fileTag: 'released-check-report',
     title: 'RELEASED CHECK REPORT',
     statusFilter: 'picked_up',
     showReleasedDate: true,
-    amountColIndex: 6, // Check Amount column position (1-indexed)
+    amountColIndex: 7, // Check Amount column position (1-indexed)
     legendText: 'Highlighted cells are blank in the file — fill them in manually after export.',
     columns: [
       { header: 'NO', width: 6 },
+      { header: 'Bank', width: 20 },
       { header: 'Check Date', width: 14 },
       { header: 'Date Uploaded', width: 14 },
       { header: 'Payee', width: 26 },
@@ -217,6 +229,7 @@ released: {
     ],
     buildRow: (r, no) => [
       { value: no, align: 'center' },
+      { value: r.bank || '', align: 'center' },
       { value: r.check_date ? new Date(r.check_date) : null, numFmt: 'mm/dd/yyyy', align: 'center' },
       { value: r.created_at ? new Date(r.created_at) : null, numFmt: 'mm/dd/yyyy', align: 'center' },
       { value: r.payee || '' },
@@ -239,16 +252,17 @@ released: {
   // when each of those happened. Only ever selected via
   // effectiveReportKey() when the admin checks "Include full audit
   // trail" on the Released report.
- released_audit: {
+  released_audit: {
     fileTag: 'released-check-report-audit-trail',
     title: 'RELEASED CHECK REPORT — FULL AUDIT TRAIL',
     statusFilter: 'picked_up',
     showReleasedDate: true,
-    amountColIndex: 8, // Check Amount column position (1-indexed)
+    amountColIndex: 9, // Check Amount column position (1-indexed)
     legendText:
       'Highlighted cells indicate missing audit data — the step may not have happened yet, or the record predates this tracking.',
     columns: [
       { header: 'NO', width: 6 },
+      { header: 'Bank', width: 20 },
       { header: 'Check Date', width: 14 },
       { header: 'Date Uploaded', width: 14 },
       { header: 'Uploaded By', width: 20 },
@@ -273,6 +287,7 @@ released: {
     ],
     buildRow: (r, no) => [
       { value: no, align: 'center' },
+      { value: r.bank || '', align: 'center' },
       { value: r.check_date ? new Date(r.check_date) : null, numFmt: 'mm/dd/yyyy', align: 'center' },
       { value: r.created_at ? new Date(r.created_at) : null, numFmt: 'mm/dd/yyyy', align: 'center' },
       {
@@ -346,10 +361,11 @@ released: {
     title: 'UNRELEASED CHECK REPORT',
     statusFilter: 'available',
     showReleasedDate: false,
-    amountColIndex: 5,
+    amountColIndex: 6,
     legendText: 'Highlighted cells are blank in the file — fill them in manually after export.',
     columns: [
       { header: 'No', width: 6 },
+      { header: 'Bank', width: 20 },
       { header: 'Payee Name', width: 26 },
       { header: 'Check No.', width: 16 },
       { header: 'Check Date', width: 14 },
@@ -360,6 +376,7 @@ released: {
     ],
     buildRow: (r, no) => [
       { value: no, align: 'center' },
+      { value: r.bank || '', align: 'center' },
       { value: r.payee || '' },
       { value: r.check_no || '', align: 'center' },
       { value: r.check_date ? new Date(r.check_date) : null, numFmt: 'mm/dd/yyyy', align: 'center' },
@@ -375,10 +392,11 @@ released: {
     title: 'OR / AR REPORT',
     statusFilter: 'picked_up',
     showReleasedDate: true,
-    amountColIndex: 9,
+    amountColIndex: 10,
     legendText: 'Highlighted cells are blank in the file — fill them in manually after export.',
     columns: [
       { header: 'No', width: 6 },
+      { header: 'Bank', width: 20 },
       { header: 'Releasing Unit Name', width: 22 },
       { header: 'Releasing Unit Code', width: 18 },
       { header: 'Date Returned to BPI', width: 16 },
@@ -396,6 +414,7 @@ released: {
     ],
     buildRow: (r, no) => [
       { value: no, align: 'center' },
+      { value: r.bank || '', align: 'center' },
       { value: '', fill: MANUAL_FILL_COLOR },
       { value: '', fill: MANUAL_FILL_COLOR, align: 'center' },
       { value: '', fill: MANUAL_FILL_COLOR, align: 'center' },
@@ -561,16 +580,31 @@ function NameCombobox({ label, value, onChange, onSelectOption, options, placeho
 }
 
 /* ------------------------------------------------------------------ */
-/* PayeeMultiSelect                                                    */
+/* MultiSelectFilter                                                  */
 /*                                                                    */
-/* Lets the user pick one payee, several payees, or every payee for   */
-/* the report. Selections render as removable chips; a pinned "All    */
-/* Payees" row at the top of the dropdown switches to the all-payees  */
-/* mode (which clears any specific selections, since the two are      */
-/* mutually exclusive).                                               */
+/* Lets the user pick one option, several options, or "all" of them   */
+/* for a given filter (currently used for Payee and Bank). Selections */
+/* render as removable chips; a pinned "All ..." row at the top of    */
+/* the dropdown switches to the all-selected mode (which clears any   */
+/* specific selections, since the two are mutually exclusive).        */
+/*                                                                    */
+/* Generalized out of what used to be a Payee-only component so Bank  */
+/* filtering could be added without duplicating the same ~150 lines   */
+/* of dropdown/chip/keyboard-outside-click logic a second time.       */
 /* ------------------------------------------------------------------ */
 
-function PayeeMultiSelect({ label, options, selected, onChangeSelected, allSelected, onSelectAll, onClearAll }) {
+function MultiSelectFilter({
+  label,
+  allLabel,
+  icon: Icon = Users,
+  options,
+  selected,
+  onChangeSelected,
+  allSelected,
+  onSelectAll,
+  onClearAll,
+  searchPlaceholder,
+}) {
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
   const containerRef = useRef(null)
@@ -590,7 +624,7 @@ function PayeeMultiSelect({ label, options, selected, onChangeSelected, allSelec
 
   function toggleOption(opt) {
     if (allSelected) {
-      // Picking a specific payee while "All" is active switches modes
+      // Picking a specific option while "All" is active switches modes
       // rather than adding to it — the two are mutually exclusive.
       onClearAll()
       onChangeSelected([opt])
@@ -612,8 +646,8 @@ function PayeeMultiSelect({ label, options, selected, onChangeSelected, allSelec
       >
         {allSelected && (
           <span className="flex items-center gap-1 rounded bg-teal-50 px-2 py-0.5 text-xs font-medium text-teal-700">
-            <Users className="h-3 w-3" />
-            {ALL_PAYEES_LABEL}
+            <Icon className="h-3 w-3" />
+            {allLabel}
             <button
               type="button"
               onClick={(e) => {
@@ -621,7 +655,7 @@ function PayeeMultiSelect({ label, options, selected, onChangeSelected, allSelec
                 onClearAll()
               }}
               className="text-teal-500 hover:text-teal-700"
-              aria-label="Clear all payees"
+              aria-label={`Clear ${label.toLowerCase()}`}
             >
               <X className="h-3 w-3" />
             </button>
@@ -652,7 +686,7 @@ function PayeeMultiSelect({ label, options, selected, onChangeSelected, allSelec
               setOpen(true)
             }}
             onFocus={() => setOpen(true)}
-            placeholder={selected.length === 0 ? 'Search or select payees…' : ''}
+            placeholder={selected.length === 0 ? searchPlaceholder : ''}
             className="min-w-[80px] flex-1 border-0 p-0.5 text-sm outline-none"
           />
         )}
@@ -674,11 +708,11 @@ function PayeeMultiSelect({ label, options, selected, onChangeSelected, allSelec
                   (allSelected ? 'bg-teal-50 text-teal-700' : 'text-teal-600 hover:bg-teal-50')
                 }
               >
-                <Users className="h-3.5 w-3.5" />
-                {ALL_PAYEES_LABEL}
+                <Icon className="h-3.5 w-3.5" />
+                {allLabel}
               </button>
             </li>
-            {filtered.length === 0 && <li className="px-3 py-2 text-xs text-gray-400">No matching payees.</li>}
+            {filtered.length === 0 && <li className="px-3 py-2 text-xs text-gray-400">No matching options.</li>}
             {filtered.map((opt) => {
               const checked = !allSelected && selected.includes(opt)
               return (
@@ -716,6 +750,11 @@ export default function AdminReports() {
   const [includeAuditTrail, setIncludeAuditTrail] = useState(false)
   const [reportPayees, setReportPayees] = useState([])
   const [reportPayeeAll, setReportPayeeAll] = useState(false)
+  // Bank filter — defaults to "All Banks" so it's an opt-in narrowing
+  // rather than something every admin has to configure before they can
+  // preview a report.
+  const [reportBanks, setReportBanks] = useState([])
+  const [reportBankAll, setReportBankAll] = useState(true)
   const [reportPayor, setReportPayor] = useState('')
   const [releasedDate, setReleasedDate] = useState('')
   const [reportDateFrom, setReportDateFrom] = useState('')
@@ -723,6 +762,7 @@ export default function AdminReports() {
   const [formError, setFormError] = useState('')
   const [payeeOptions, setPayeeOptions] = useState([])
   const [payorOptions, setPayorOptions] = useState([])
+  const [bankOptions, setBankOptions] = useState([])
 
   // Data behind the current preview (fetched once, reused for download —
   // no refetch needed unless the user explicitly refreshes)
@@ -764,26 +804,28 @@ export default function AdminReports() {
 
   async function loadDistinctNames() {
     try {
-      const { data, error } = await supabase.from('checks').select('payee, payor').limit(2000)
+      const { data, error } = await supabase.from('checks').select('payee, payor, bank').limit(2000)
       if (error) return
       const payees = [...new Set((data || []).map((r) => r.payee).filter(Boolean))].sort()
       const payors = [...new Set((data || []).map((r) => r.payor).filter(Boolean))].sort()
+      const banks = [...new Set((data || []).map((r) => r.bank).filter(Boolean))].sort()
       setPayeeOptions(payees)
       setPayorOptions(payors)
+      setBankOptions(banks)
     } catch {
       // Suggestions are a convenience only — silently ignore failures here.
     }
   }
 
   // Fetches every matching row in pages of 1000 (Supabase's per-request cap)
-  // so large payee/payor/date combinations don't get silently truncated.
-  // Audit-trail columns (collector_name, submitted_by_name, submitted_at,
-  // approved_by_name, approved_at, and the embedded reservation/batch
-  // fields) are always selected — they're harmless no-ops for report
-  // types whose buildRow doesn't reference them, and it means toggling
-  // "Include full audit trail" before clicking Preview needs no separate
-  // fetch path.
-  async function fetchAllChecks({ payees, payeeAll, payor, statusFilter, dateFrom, dateTo }) {
+  // so large payee/payor/bank/date combinations don't get silently
+  // truncated. Audit-trail columns (collector_name, submitted_by_name,
+  // submitted_at, approved_by_name, approved_at, and the embedded
+  // reservation/batch fields) are always selected — they're harmless
+  // no-ops for report types whose buildRow doesn't reference them, and it
+  // means toggling "Include full audit trail" before clicking Preview
+  // needs no separate fetch path.
+  async function fetchAllChecks({ payees, payeeAll, payor, banks, bankAll, statusFilter, dateFrom, dateTo }) {
     const PAGE = 1000
     let from = 0
     let all = []
@@ -792,13 +834,14 @@ export default function AdminReports() {
       let req = supabase
         .from('checks')
         .select(
-          'id, check_no, check_date, payee, payor, amount, status, picked_up_by, picked_up_at, created_at, or_no, ar_collected, attached_2307, collector_name, submitted_by_name, submitted_at, approved_by_name, approved_at, reservation_id, pickup_reservations(reserved_at, collector_name), upload_batches(uploaded_by)'
+          'id, check_no, check_date, bank, payee, payor, amount, status, picked_up_by, picked_up_at, created_at, or_no, ar_collected, attached_2307, collector_name, submitted_by_name, submitted_at, approved_by_name, approved_at, reservation_id, pickup_reservations(reserved_at, collector_name), upload_batches(uploaded_by)'
         )
         .order('check_date', { ascending: true })
         .range(from, from + PAGE - 1)
 
       if (!payeeAll && payees.length > 0) req = req.in('payee', payees)
       if (payor.trim()) req = req.ilike('payor', `%${payor.trim()}%`)
+      if (!bankAll && banks.length > 0) req = req.in('bank', banks)
       if (statusFilter) req = req.eq('status', statusFilter)
       if (dateFrom) req = req.gte('check_date', dateFrom)
       if (dateTo) req = req.lte('check_date', dateTo)
@@ -917,6 +960,9 @@ export default function AdminReports() {
     if (!reportPayeeAll && reportPayees.length === 0) {
       return `Please select at least one payee, or choose "${ALL_PAYEES_LABEL}".`
     }
+    if (!reportBankAll && reportBanks.length === 0) {
+      return `Please select at least one bank, or choose "${ALL_BANKS_LABEL}".`
+    }
     if (REPORT_CONFIG[effectiveReportKey(reportType, includeAuditTrail)].showReleasedDate) {
       if (!releasedDate) {
         return 'Please select a released date.'
@@ -949,6 +995,8 @@ export default function AdminReports() {
         payees: reportPayees,
         payeeAll: reportPayeeAll,
         payor: reportPayor,
+        banks: reportBanks,
+        bankAll: reportBankAll,
         statusFilter: config.statusFilter,
         dateFrom: reportDateFrom,
         dateTo: reportDateTo,
@@ -966,6 +1014,8 @@ export default function AdminReports() {
         includeAuditTrail: configKey === 'released_audit',
         payees: reportPayeeAll ? [] : reportPayees,
         payeeAll: reportPayeeAll,
+        banks: reportBankAll ? [] : reportBanks,
+        bankAll: reportBankAll,
         payor: reportPayor.trim(),
         releasedDate,
         dateFrom: reportDateFrom,
@@ -992,6 +1042,8 @@ export default function AdminReports() {
         payees: previewMeta.payees,
         payeeAll: previewMeta.payeeAll,
         payor: previewMeta.payor,
+        banks: previewMeta.banks,
+        bankAll: previewMeta.bankAll,
         statusFilter: config.statusFilter,
         dateFrom: previewMeta.dateFrom,
         dateTo: previewMeta.dateTo,
@@ -1028,10 +1080,11 @@ export default function AdminReports() {
   // Shared header text lines for the report's info block — used to build
   // both the Excel workbook header rows and the PDF header, so the two
   // outputs can't drift apart.
-  function buildHeaderLines(configKey, { payeeDisplay, payor, releasedDateValue, dateFrom, dateTo }) {
+  function buildHeaderLines(configKey, { payeeDisplay, bankDisplay, payor, releasedDateValue, dateFrom, dateTo }) {
     const config = REPORT_CONFIG[configKey]
     const lines = [{ text: `Client Name: ${payor || '—'}`, size: 11, bold: true }]
     lines.push({ text: `Payee: ${payeeDisplay || '—'}`, size: 10 })
+    lines.push({ text: `Bank: ${bankDisplay || '—'}`, size: 10 })
     lines.push({ text: `Report Date: ${formatExcelDateLabel(new Date())}`, size: 10 })
     if (dateFrom || dateTo) {
       const fromLabel = dateFrom ? formatExcelDateLabel(new Date(dateFrom)) : '—'
@@ -1045,7 +1098,7 @@ export default function AdminReports() {
     return lines
   }
 
-  async function buildWorkbook(configKey, rows, { payeeDisplay, payor, releasedDateValue, dateFrom, dateTo }) {
+  async function buildWorkbook(configKey, rows, { payeeDisplay, bankDisplay, payor, releasedDateValue, dateFrom, dateTo }) {
     const config = REPORT_CONFIG[configKey]
     const colCount = config.columns.length
 
@@ -1070,8 +1123,8 @@ export default function AdminReports() {
     addHeaderRow(sheet, r, colCount, config.title, { bold: true, size: 13, color: HEADER_FILL_COLOR })
     r++
 
-    // Remaining header lines (Client Name, Payee, Report Date, Date Range, Released Date)
-    for (const line of buildHeaderLines(configKey, { payeeDisplay, payor, releasedDateValue, dateFrom, dateTo })) {
+    // Remaining header lines (Client Name, Payee, Bank, Report Date, Date Range, Released Date)
+    for (const line of buildHeaderLines(configKey, { payeeDisplay, bankDisplay, payor, releasedDateValue, dateFrom, dateTo })) {
       addHeaderRow(sheet, r, colCount, line.text, { bold: line.bold, size: line.size })
       r++
     }
@@ -1140,7 +1193,7 @@ export default function AdminReports() {
   // header lines and row data as the Excel workbook (via buildHeaderLines
   // and config.buildRow), so all three surfaces — preview table, Excel,
   // PDF — always show identical numbers.
-  function buildPdfDocument(configKey, rows, { payeeDisplay, payor, releasedDateValue, dateFrom, dateTo }) {
+  function buildPdfDocument(configKey, rows, { payeeDisplay, bankDisplay, payor, releasedDateValue, dateFrom, dateTo }) {
     const config = REPORT_CONFIG[configKey]
     const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' })
     const margin = 32
@@ -1158,7 +1211,7 @@ export default function AdminReports() {
     doc.setFont('helvetica', 'normal')
     doc.setFontSize(10)
     doc.setTextColor(60, 60, 60)
-    for (const line of buildHeaderLines(configKey, { payeeDisplay, payor, releasedDateValue, dateFrom, dateTo })) {
+    for (const line of buildHeaderLines(configKey, { payeeDisplay, bankDisplay, payor, releasedDateValue, dateFrom, dateTo })) {
       if (line.bold) doc.setFont('helvetica', 'bold')
       doc.text(line.text, margin, y)
       if (line.bold) doc.setFont('helvetica', 'normal')
@@ -1214,19 +1267,31 @@ export default function AdminReports() {
     return doc
   }
 
+  function reportMetaArgs() {
+    return {
+      payeeDisplay: formatMultiSelectDisplay(previewMeta.payeeAll, previewMeta.payees, ALL_PAYEES_LABEL),
+      bankDisplay: formatMultiSelectDisplay(previewMeta.bankAll, previewMeta.banks, ALL_BANKS_LABEL),
+      payor: previewMeta.payor,
+      releasedDateValue: previewMeta.releasedDate,
+      dateFrom: previewMeta.dateFrom,
+      dateTo: previewMeta.dateTo,
+    }
+  }
+
+  function reportFilename(config) {
+    const stamp = new Date().toISOString().slice(0, 10)
+    const safePayor = previewMeta.payor.replace(/[^a-z0-9]+/gi, '_')
+    const payeeTag = multiSelectFileTag(previewMeta.payeeAll, previewMeta.payees, 'all-payees')
+    const bankTag = multiSelectFileTag(previewMeta.bankAll, previewMeta.banks, 'all-banks')
+    return `${config.fileTag}-${safePayor}-${payeeTag}-${bankTag}-${stamp}`
+  }
+
   async function handleDownload() {
     if (!previewMeta || rawRows.length === 0) return
     setDownloading(true)
     try {
       const config = REPORT_CONFIG[previewMeta.configKey]
-      const payeeDisplay = formatPayeeDisplay(previewMeta.payeeAll, previewMeta.payees)
-      const workbook = await buildWorkbook(previewMeta.configKey, rawRows, {
-        payeeDisplay,
-        payor: previewMeta.payor,
-        releasedDateValue: previewMeta.releasedDate,
-        dateFrom: previewMeta.dateFrom,
-        dateTo: previewMeta.dateTo,
-      })
+      const workbook = await buildWorkbook(previewMeta.configKey, rawRows, reportMetaArgs())
 
       const buffer = await workbook.xlsx.writeBuffer()
       const blob = new Blob([buffer], {
@@ -1234,11 +1299,8 @@ export default function AdminReports() {
       })
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
-      const stamp = new Date().toISOString().slice(0, 10)
-      const safePayor = previewMeta.payor.replace(/[^a-z0-9]+/gi, '_')
-      const payeeTag = payeeFileTag(previewMeta.payeeAll, previewMeta.payees)
       a.href = url
-      a.download = `${config.fileTag}-${safePayor}-${payeeTag}-${stamp}.xlsx`
+      a.download = `${reportFilename(config)}.xlsx`
       a.click()
       URL.revokeObjectURL(url)
 
@@ -1255,29 +1317,11 @@ export default function AdminReports() {
     }
   }
 
-  function pdfMetaArgs() {
-    return {
-      payeeDisplay: formatPayeeDisplay(previewMeta.payeeAll, previewMeta.payees),
-      payor: previewMeta.payor,
-      releasedDateValue: previewMeta.releasedDate,
-      dateFrom: previewMeta.dateFrom,
-      dateTo: previewMeta.dateTo,
-    }
-  }
-
-  function pdfFilename() {
-    const config = REPORT_CONFIG[previewMeta.configKey]
-    const stamp = new Date().toISOString().slice(0, 10)
-    const safePayor = previewMeta.payor.replace(/[^a-z0-9]+/gi, '_')
-    const payeeTag = payeeFileTag(previewMeta.payeeAll, previewMeta.payees)
-    return `${config.fileTag}-${safePayor}-${payeeTag}-${stamp}.pdf`
-  }
-
   function handlePreviewPdf() {
     if (!previewMeta || rawRows.length === 0) return
     setPdfState((s) => ({ ...s, generating: true }))
     try {
-      const doc = buildPdfDocument(previewMeta.configKey, rawRows, pdfMetaArgs())
+      const doc = buildPdfDocument(previewMeta.configKey, rawRows, reportMetaArgs())
       const blobUrl = doc.output('bloburl')
       setPdfState((s) => {
         if (s.url) URL.revokeObjectURL(s.url)
@@ -1300,8 +1344,9 @@ export default function AdminReports() {
     if (!previewMeta || rawRows.length === 0) return
     setDownloadingPdf(true)
     try {
-      const doc = buildPdfDocument(previewMeta.configKey, rawRows, pdfMetaArgs())
-      doc.save(pdfFilename())
+      const config = REPORT_CONFIG[previewMeta.configKey]
+      const doc = buildPdfDocument(previewMeta.configKey, rawRows, reportMetaArgs())
+      doc.save(`${reportFilename(config)}.pdf`)
     } catch (err) {
       push?.({ variant: 'error', title: 'PDF download failed', description: err?.message || 'Please try again.' })
     } finally {
@@ -1319,7 +1364,7 @@ export default function AdminReports() {
     const term = searchTerm.trim().toLowerCase()
     if (!term) return numberedRows
     return numberedRows.filter(({ row }) =>
-      [row.payee, row.payor, row.check_no].some((v) => String(v || '').toLowerCase().includes(term))
+      [row.payee, row.payor, row.check_no, row.bank].some((v) => String(v || '').toLowerCase().includes(term))
     )
   }, [numberedRows, searchTerm])
 
@@ -1327,6 +1372,11 @@ export default function AdminReports() {
     () => rawRows.reduce((sum, row) => sum + Number(row.amount || 0), 0),
     [rawRows]
   )
+
+  // Distinct banks actually present in the current result set — shown as
+  // a quick sanity check in the summary strip (e.g. confirming a
+  // multi-bank upload didn't accidentally include the wrong bank).
+  const banksInResults = useMemo(() => [...new Set(rawRows.map((r) => r.bank).filter(Boolean))].sort(), [rawRows])
 
   const totalPages = Math.max(1, Math.ceil(filteredRows.length / pageSize))
   const currentPage = Math.min(page, totalPages)
@@ -1360,7 +1410,7 @@ export default function AdminReports() {
         <Card className="border-gray-100 shadow-sm">
           <CardHeader>
             <CardTitle className="text-lg">Report filters</CardTitle>
-            <CardDescription>Choose a report type, then enter the payee(s) and payor to include.</CardDescription>
+            <CardDescription>Choose a report type, then enter the bank, payee(s), and payor to include.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="grid gap-4 sm:grid-cols-2">
@@ -1428,9 +1478,27 @@ export default function AdminReports() {
               </div>
             </div>
 
-            <div className="grid gap-4 sm:grid-cols-2">
-              <PayeeMultiSelect
+            <div className="grid gap-4 sm:grid-cols-3">
+              <MultiSelectFilter
+                label="Bank(s)"
+                allLabel={ALL_BANKS_LABEL}
+                icon={Landmark}
+                options={bankOptions}
+                selected={reportBanks}
+                onChangeSelected={setReportBanks}
+                allSelected={reportBankAll}
+                onSelectAll={() => {
+                  setReportBankAll(true)
+                  setReportBanks([])
+                }}
+                onClearAll={() => setReportBankAll(false)}
+                searchPlaceholder="Search or select banks…"
+              />
+
+              <MultiSelectFilter
                 label="Payee(s)"
+                allLabel={ALL_PAYEES_LABEL}
+                icon={Users}
                 options={payeeOptions}
                 selected={reportPayees}
                 onChangeSelected={setReportPayees}
@@ -1440,6 +1508,7 @@ export default function AdminReports() {
                   setReportPayees([])
                 }}
                 onClearAll={() => setReportPayeeAll(false)}
+                searchPlaceholder="Search or select payees…"
               />
 
               <NameCombobox
@@ -1488,9 +1557,13 @@ export default function AdminReports() {
                 </CardTitle>
                 <CardDescription>
                   Client Name (Payor): <span className="font-medium text-gray-700">{previewMeta.payor}</span>
+                  {' · '}Bank(s):{' '}
+                  <span className="font-medium text-gray-700">
+                    {formatMultiSelectDisplay(previewMeta.bankAll, previewMeta.banks, ALL_BANKS_LABEL)}
+                  </span>
                   {' · '}Payee(s):{' '}
                   <span className="font-medium text-gray-700">
-                    {formatPayeeDisplay(previewMeta.payeeAll, previewMeta.payees)}
+                    {formatMultiSelectDisplay(previewMeta.payeeAll, previewMeta.payees, ALL_PAYEES_LABEL)}
                   </span>
                   {(previewMeta.dateFrom || previewMeta.dateTo) && (
                     <>
@@ -1512,9 +1585,13 @@ export default function AdminReports() {
             </div>
 
             {/* Summary strip */}
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
               <SummaryStat label="Total rows" value={rawRows.length.toLocaleString()} />
               <SummaryStat label="Total amount" value={formatCurrency(totalAmount)} />
+              <SummaryStat
+                label="Banks included"
+                value={previewMeta.bankAll ? ALL_BANKS_LABEL : `${banksInResults.length.toLocaleString()}`}
+              />
               <SummaryStat
                 label="Filtered results"
                 value={searchTerm ? `${filteredRows.length.toLocaleString()} of ${rawRows.length.toLocaleString()}` : 'All shown'}
@@ -1528,7 +1605,7 @@ export default function AdminReports() {
                 <Input
                   value={searchTerm}
                   onChange={(e) => setSearchTerm(e.target.value)}
-                  placeholder="Quick search by payee, payor, or check no."
+                  placeholder="Quick search by bank, payee, payor, or check no."
                   className="pl-8"
                 />
               </div>
