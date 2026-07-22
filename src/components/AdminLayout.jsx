@@ -21,7 +21,7 @@ const links = [
 
 export default function AdminLayout() {
   return (
-    <div className="mx-auto flex max-w-7xl gap-8 px-4 py-8 sm:px-6 lg:px-8">
+   <div className="flex gap-8 px-4 py-8 sm:px-6 lg:px-8 xl:px-10">
       
       {/* Desktop Sidebar */}
       <aside className="hidden w-56 shrink-0 md:block">

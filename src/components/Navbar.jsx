@@ -38,7 +38,7 @@ export function Navbar({ user }) {
       {/* Thin teal → orange accent line, the header's one signature detail */}
       <div className="h-[3px] w-full bg-gradient-to-r from-teal-500 via-teal-400 to-orange-400" />
 
-      <div className="mx-auto flex h-16 max-w-7xl items-center justify-between px-4 sm:h-20 sm:px-6 lg:px-8">
+      <div className="flex h-16 w-full items-center justify-between px-4 sm:h-20 sm:px-6 lg:px-8 xl:px-10">
         {/* Logo only — no frame, no container, just the mark itself */}
         <Link to="/" className="flex items-center" aria-label="Go to homepage">
           <img

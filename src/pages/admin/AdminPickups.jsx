@@ -9,25 +9,83 @@
 //   - Reject    -> check is released straight back into the general
 //                  available pool for any collector to reserve.
 //   - Return    -> check goes back to THIS reservation's Active tab as
-//                  'reserved' so the admin can fix a mistake (e.g. a
-//                  mistyped OR number) and resubmit — it is NOT released
-//                  to the pool.
+//                  'returned' (a distinct status from 'reserved' -- see
+//                  the check-status note below) so the admin can fix a
+//                  mistake (e.g. a mistyped OR number) and resubmit — it
+//                  is NOT released to the pool.
 // Checks the admin marks as "not being picked up today" at submission
 // time skip approval entirely and are released immediately, same as
 // before — there's nothing for an approver to verify on a check nobody
 // is claiming.
 //
-// Requires migration_approval_workflow.sql to have been run first. That
-// migration must provide, at minimum:
-//   - checks.status extended with 'pending_approval'
-//   - checks.or_no / ar_collected / remarks / submitted_by / submitted_by_name / submitted_at
+// RECEIPT TYPE NOTE (added — read before touching the submit modal):
+//   The submit-for-approval modal used to have a single free-text "OR
+//   no." field, implicitly assuming every pickup produces an Official
+//   Receipt. In practice collectors can come back with a PR
+//   (Provisional Receipt), CR (Collection Receipt), or AR (Acknowledgment
+//   Receipt) instead. The schema only has one text column for this
+//   (checks.or_no — see the CREATE TABLE), so rather than adding a
+//   migration for a new column, the admin now picks a receipt TYPE from
+//   a dropdown (PR / CR / AR / OR) and only then sees a field for the
+//   receipt NUMBER; the two are folded into that single column as
+//   "TYPE-NUMBER" (e.g. "OR-12345") by composeReceiptNo() below. Every
+//   other page that reads checks.or_no (ApproverHome.jsx,
+//   ApproverHistory.jsx, this file's own Pending Approval / History tabs
+//   and CSV export) already just displays whatever string is in that
+//   column, so they need no changes — they'll simply show "OR-12345"
+//   instead of "12345". AR collected and 2307 Attached are untouched by
+//   this change; they were already separate yes/no answers, not part of
+//   the receipt number.
+//
+// CHECK-STATUS NOTE (read before touching the Active tab):
+//   A reservation can hold checks in several different states at once —
+//   e.g. one check already approved (picked_up), one still awaiting
+//   approval (pending_approval), and one just returned for correction
+//   (returned). The reservation row itself only carries a single status
+//   column, so the Active tab must NEVER assume "reservation.status ===
+//   reserved" implies every embedded check is itself reserved. This file
+//   always re-filters the embedded `checks` array down to the specific
+//   check statuses that belong in this tab (currently 'reserved' and
+//   'returned') both in load() and defensively again in lineItems().
+//   Skipping either filter is what previously caused already-approved
+//   checks to keep showing up in the Active tab as if the whole batch had
+//   been sent back for correction.
+//
+// HISTORY-TAB DATA NOTE:
+//   The History tab reads from check_activity_log rather than the live
+//   `checks` table, because a released/rejected check goes back to
+//   'available' and can be re-reserved by someone else — at which point
+//   its live row no longer points back to this reservation, but the
+//   activity log entry still does. That log is fetched in TWO separate
+//   queries (activity rows, then the referenced checks by id) instead of
+//   a single embedded `checks(...)` select. The previous single-query
+//   embed depended on PostgREST correctly inferring the
+//   check_activity_log -> checks relationship; when that inference
+//   failed or errored, the embed silently came back null for every row,
+//   `lineItems()` filtered every entry out (it drops any activity row
+//   whose `checks` is falsy), and the whole order rendered as "No linked
+//   checks found for this order" even though it had a full pickup
+//   history including approvals and returns. Doing the two fetches by
+//   hand and merging client-side removes that dependency entirely.
+//
+// Requires migration_approval_workflow.sql AND migration_return_tracking.sql
+// to have been run first. Together they provide, at minimum:
+//   - checks.status extended with 'pending_approval' and 'returned'
+//   - checks.or_no / ar_collected / attached_2307 / remarks / submitted_by / submitted_by_name / submitted_at
+//   - checks.return_reason / returned_at / returned_by / returned_by_name
 //   - pickup_reservations.status extended with 'pending_approval'
 //   - admin_submit_for_approval(p_reservation_id uuid, p_check_outcomes jsonb)
+//     (clears return_reason/returned_at/returned_by[_name] on resubmit)
 //   - admin_recall_submission(p_reservation_id uuid, p_check_ids uuid[])
 //   - approver_decide(p_reservation_id uuid, p_decisions jsonb) where each
 //     decision is { check_id, decision: 'approve' | 'reject' | 'return', remarks }
+//     and a 'return' decision touches ONLY that check_id (status ->
+//     'returned', return_reason/returned_at/returned_by[_name] stamped) —
+//     every other check in the same submission keeps whatever decision
+//     was made for it.
 //   - check_activity_log.action extended with 'rejected' | 'returned'
-// Deploying this component without that migration will break both this
+//   - check_activity_log.check_id references checks.id
+// Deploying this component without those migrations will break both this
 // file and ApproverHome.jsx.
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
@@ -62,11 +120,15 @@ import {
   Wallet,
   Timer,
   Flame,
+  Landmark,
 } from 'lucide-react'
 import { supabase } from '../../lib/supabaseClient'
 import { Input } from '../../components/ui/input'
 import { Card } from '../../components/ui/card'
 import { formatCurrency, formatDate, cn } from '../../lib/utils'
+// Same fixed bank list AdminChecks.jsx uses, pulled from one shared module
+// so the two pages can never drift apart on what counts as a valid bank.
+import { BANKS } from '../../lib/banks'
 
 const POLL_INTERVAL_MS = 20000
 const EXPIRING_SOON_MINUTES = 15
@@ -78,6 +140,19 @@ const SUCCESS_FLASH_MS = 900
 // ApproverHome.jsx so the two pages agree on what "stale" means.
 const PENDING_WARN_MINUTES = 60
 const PENDING_CRITICAL_MINUTES = 240
+
+// Receipt types an admin can pick between when recording what a collector
+// produced at pickup — see the RECEIPT TYPE NOTE at the top of this file.
+// checks.or_no is the only schema column available for this, so the type
+// is captured alongside the number and folded into that single column by
+// composeReceiptNo() below rather than requiring a new migration.
+const RECEIPT_TYPES = ['PR', 'CR', 'AR', 'OR']
+
+// Check-level statuses that belong in the Active tab. A check that has
+// been approved (picked_up), is awaiting approval (pending_approval), or
+// has been released (available) does NOT belong here even if it still
+// happens to reference this reservation_id.
+const ACTIVE_TAB_CHECK_STATUSES = new Set(['reserved', 'returned'])
 
 const SORT_OPTIONS = [
   { value: 'expires_asc', label: 'Expiring soonest', tabs: ['active'] },
@@ -93,46 +168,88 @@ const SORT_OPTIONS = [
 // ----------------------------------------------------------------------------
 // Line-item normalization
 //
-// - 'active' reads checks live off the reservation — nothing's been decided
-//   or submitted yet, so the live table is the whole truth.
+// - 'active' reads checks live off the reservation. Because a single
+//   reservation can hold checks in mixed states (one picked_up, one still
+//   pending_approval, one returned for correction), the checks embedded
+//   here are ALREADY filtered in load() down to ACTIVE_TAB_CHECK_STATUSES.
+//   This function filters again defensively — belt and suspenders — so a
+//   future change to load() can't silently regress the bug this fixes.
 // - 'pending_approval' also reads checks live off the reservation, but the
 //   embedded checks additionally carry the OR no. / AR collected / remarks
 //   / submitted_at data the admin entered at submission time.
 // - 'history' reads from check_activity_log instead, because a
 //   released/rejected check goes back to 'available' and can be re-reserved
 //   by someone else — at which point its live row no longer points back to
-//   this reservation. The activity log is what still does.
+//   this reservation. The activity log is what still does. See the
+//   HISTORY-TAB DATA NOTE at the top of this file for how that data is
+//   fetched and merged in load().
 // ----------------------------------------------------------------------------
 function lineItems(reservation, tab) {
   if (tab === 'history') {
     const activity = Array.isArray(reservation.activity) ? reservation.activity : []
-    return activity
-      .map((a) => {
-        const c = a.checks
+
+    // Multiple activity rows can exist for the same check — submitted,
+    // returned, resubmitted, approved, etc. Collapse them to ONE entry per
+    // check_id so History reflects the actual number of checks, not the
+    // number of things that happened to them. The FINAL action (latest
+    // performed_at) is the outcome shown, and its own remarks (e.g. a
+    // return reason) stay attached only to that action. OR no. / AR
+    // collected / 2307 Attached are filled from whichever row for this
+    // check most recently set them, since a return/approve decision only
+    // logs its own reason and doesn't re-log the original submission
+    // details that were captured on the earlier submitted_for_approval row.
+    const byCheck = new Map()
+    activity
+      .slice()
+      .sort((a, b) => new Date(a.performed_at || 0) - new Date(b.performed_at || 0))
+      .forEach((a) => {
+        if (!a.check_id) return
+        const entry = byCheck.get(a.check_id) || { or_no: null, ar_collected: null, attached_2307: null }
+        entry.latest = a
+        if (a.checks) entry.checks = a.checks
+        if (a.or_no !== null && a.or_no !== undefined) entry.or_no = a.or_no
+        if (a.ar_collected !== null && a.ar_collected !== undefined) entry.ar_collected = a.ar_collected
+        if (a.attached_2307 !== null && a.attached_2307 !== undefined) entry.attached_2307 = a.attached_2307
+        byCheck.set(a.check_id, entry)
+      })
+
+    return [...byCheck.values()]
+      .map(({ latest, checks: c, or_no, ar_collected, attached_2307 }) => {
         if (!c) return null
         return {
-          id: a.id,
+          id: latest.id,
           checkId: c.id,
           row_number: c.row_number,
+          bank: c.bank,
           payee: c.payee,
           payor: c.payor,
           check_no: c.check_no,
           check_date: c.check_date,
           amount: c.amount,
-          outcome: a.action, // 'picked_up' | 'released' | 'rejected' | 'returned' | 'expired'
-          or_no: a.or_no,
-          ar_collected: a.ar_collected,
-          remarks: a.remarks,
+          outcome: latest.action, // 'picked_up' | 'released' | 'rejected' | 'returned' | 'expired'
+          or_no,
+          ar_collected,
+          attached_2307,
+          remarks: latest.remarks,
         }
       })
       .filter(Boolean)
   }
 
-  const checks = Array.isArray(reservation.checks) ? reservation.checks : []
+  const rawChecks = Array.isArray(reservation.checks) ? reservation.checks : []
+  const checks =
+    tab === 'active'
+      ? rawChecks.filter((c) => {
+          const normalizedStatus = String(c?.status ?? 'reserved').trim().toLowerCase()
+          return ACTIVE_TAB_CHECK_STATUSES.has(normalizedStatus) || isReturnedCheck(c)
+        })
+      : rawChecks
+
   return checks.map((c) => ({
     id: c.id,
     checkId: c.id,
     row_number: c.row_number,
+    bank: c.bank,
     payee: c.payee,
     payor: c.payor,
     check_no: c.check_no,
@@ -141,9 +258,17 @@ function lineItems(reservation, tab) {
     outcome: null,
     or_no: tab === 'pending_approval' ? c.or_no ?? null : null,
     ar_collected: tab === 'pending_approval' ? c.ar_collected ?? null : null,
+    attached_2307: tab === 'pending_approval' ? c.attached_2307 ?? null : null,
     remarks: tab === 'pending_approval' ? c.remarks ?? null : null,
     submittedAt: tab === 'pending_approval' ? c.submitted_at ?? null : null,
     submittedByName: tab === 'pending_approval' ? c.submitted_by_name ?? null : null,
+    // Only meaningful on the Active tab: whether this specific check is
+    // sitting there because it was just reserved, or because an approver
+    // sent it back for correction (and if so, why/when/by whom).
+    checkStatus: tab === 'active' ? (isReturnedCheck(c) ? 'returned' : 'reserved') : null,
+    returnReason: tab === 'active' ? c.return_reason ?? null : null,
+    returnedAt: tab === 'active' ? c.returned_at ?? null : null,
+    returnedByName: tab === 'active' ? c.returned_by_name ?? null : null,
   }))
 }
 
@@ -164,7 +289,7 @@ function matchesCheckSearch(items, term) {
   if (!term) return true
   const needle = term.toLowerCase()
   return items.some((c) =>
-    [c.payee, c.payor, c.check_no, c.or_no]
+    [c.payee, c.payor, c.check_no, c.or_no, c.bank]
       .filter(Boolean)
       .some((field) => String(field).toLowerCase().includes(needle))
   )
@@ -186,6 +311,58 @@ function earliestSubmittedAt(items) {
   return Math.min(...times)
 }
 
+// Determines whether a check counts as "returned" for display purposes.
+// Deliberately does NOT rely solely on a strict `status === 'returned'`
+// string match:
+//   - normalizes case/whitespace, since a DB value like 'Returned' or
+//     ' returned ' would otherwise silently fail a strict comparison and
+//     fall back to looking like a plain reserved check
+//   - ALSO treats the check as returned if any of return_reason /
+//     returned_at / returned_by_name is present, even if `status` itself
+//     doesn't say so — that combination of fields only ever gets written
+//     by an approver's return decision, so if they're populated the
+//     check plainly was returned regardless of what the status column
+//     currently holds. This is what prevents "still shows Reserved" when
+//     the badge alone was trusting a single column that may be stale,
+//     miscased, or was written by an older version of the RPC.
+function isReturnedCheck(c) {
+  const normalizedStatus = String(c?.status ?? '').trim().toLowerCase()
+  return (
+    normalizedStatus === 'returned' ||
+    !!c?.return_reason ||
+    !!c?.returned_at ||
+    !!c?.returned_by_name
+  )
+}
+
+// Formats a full date + time (not just a date) — used for "returned at"
+// so admins can see exactly when an approver sent a check back, not just
+// which day.
+function formatDateTime(ts) {
+  if (!ts) return '—'
+  const d = new Date(ts)
+  if (Number.isNaN(d.getTime())) return '—'
+  return d.toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  })
+}
+
+// Combines the selected receipt type (PR/CR/AR/OR) and its number into the
+// single string actually persisted to checks.or_no — see the RECEIPT TYPE
+// NOTE at the top of this file for why there's no separate column for the
+// type. Returns '' whenever either half is missing, so every caller
+// (validation, duplicate detection, the RPC payload) can treat "not fully
+// entered yet" as one simple falsy check instead of two.
+function composeReceiptNo(entry) {
+  const type = entry?.receiptType || ''
+  const no = entry?.receiptNo?.trim() || ''
+  if (!type || !no) return ''
+  return `${type}-${no}`
+}
+
 export default function AdminPickups() {
   const [tab, setTab] = useState('active') // 'active' | 'pending_approval' | 'history'
   const [reservations, setReservations] = useState([])
@@ -193,8 +370,9 @@ export default function AdminPickups() {
   const [refreshing, setRefreshing] = useState(false)
   const [loadError, setLoadError] = useState('')
   const [collectorFilter, setCollectorFilter] = useState('')
+  const [bankFilter, setBankFilter] = useState('')
   const [checkSearch, setCheckSearch] = useState('')
-  const [quickFilter, setQuickFilter] = useState('all') // 'all' | 'expiring' | 'stale'
+  const [quickFilter, setQuickFilter] = useState('all') // 'all' | 'expiring' | 'stale' | 'returned' | history outcome keys
   const [sortBy, setSortBy] = useState('expires_asc')
   const [sortMenuOpen, setSortMenuOpen] = useState(false)
   const [now, setNow] = useState(Date.now())
@@ -240,13 +418,13 @@ export default function AdminPickups() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab])
 
-  // Debounced re-fetch when the collector filter changes
+  // Debounced re-fetch when the collector or bank filter changes
   useEffect(() => {
     clearTimeout(debounceRef.current)
     debounceRef.current = setTimeout(() => load(false), 250)
     return () => clearTimeout(debounceRef.current)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [collectorFilter])
+  }, [collectorFilter, bankFilter])
 
   // Keep countdowns/wait-timers live and periodically pull fresh data
   // (also catches reservations that expired naturally, or got decided by
@@ -316,15 +494,35 @@ export default function AdminPickups() {
             : ['picked_up', 'partial', 'expired', 'cancelled']
 
         // Active and Pending Approval both embed checks directly (nothing's
-        // been logged to history yet). Pending Approval additionally pulls
-        // the OR no. / AR collected / remarks / submitted_at the admin
-        // entered when submitting. History fetches the audit log
-        // separately below — see the comment on lineItems() above for why.
+        // been logged to history yet). The Active tab additionally selects
+        // each check's own `status` plus the return_* columns, because a
+        // reservation can hold checks in mixed states (see the file header
+        // CHECK-STATUS NOTE) — without `status` here there would be no way
+        // to tell a plain reserved check apart from one an approver just
+        // returned for correction, or to keep an already-approved check
+        // from wrongly reappearing here. Both tabs also select `bank` so
+        // the check's issuing bank can be shown/filtered here without a
+        // second round trip. Pending Approval additionally pulls the OR
+        // no. / AR collected / remarks / submitted_at the admin entered
+        // when submitting. History fetches the audit log separately below
+        // — see the HISTORY-TAB DATA NOTE at the top of this file for why.
+        //
+        // When a bank filter is active, the embedded `checks` resource is
+        // aliased with `!inner` instead of a plain left embed. PostgREST
+        // treats a bare `checks(...)` embed as a LEFT join — filtering it
+        // with `.eq('checks.bank', ...)` only trims which child rows come
+        // back, it does NOT exclude parent reservations that simply have
+        // no checks from that bank (they'd still show up with an empty
+        // checks array). `checks!inner(...)` makes it an INNER join, so
+        // `.eq('checks.bank', ...)` below actually restricts which
+        // reservations are returned at all, not just which of their
+        // checks are embedded.
+        const checksJoin = bankFilter && tab !== 'history' ? 'checks!inner' : 'checks'
         const selectClause =
           tab === 'active'
-            ? 'id, collector_name, status, reserved_at, expires_at, picked_up_at, checks(id, row_number, payee, payor, check_no, check_date, amount)'
+            ? `id, collector_name, status, reserved_at, expires_at, picked_up_at, ${checksJoin}(id, row_number, bank, payee, payor, check_no, check_date, amount, status, return_reason, returned_at, returned_by_name)`
             : tab === 'pending_approval'
-            ? 'id, collector_name, status, reserved_at, expires_at, checks(id, row_number, payee, payor, check_no, check_date, amount, or_no, ar_collected, remarks, submitted_at, submitted_by_name)'
+            ? `id, collector_name, status, reserved_at, expires_at, ${checksJoin}(id, row_number, bank, payee, payor, check_no, check_date, amount, or_no, ar_collected, attached_2307, remarks, submitted_at, submitted_by_name)`
             : 'id, collector_name, status, reserved_at, expires_at, picked_up_at'
 
         let req = supabase
@@ -337,6 +535,19 @@ export default function AdminPickups() {
         const trimmedFilter = collectorFilter.trim()
         if (trimmedFilter) {
           req = req.ilike('collector_name', `%${trimmedFilter}%`)
+        }
+
+        // With `checksJoin` set to `checks!inner` above whenever a bank
+        // filter is active, this `.eq()` does two things at once: it
+        // restricts which pickup_reservations rows come back at all (only
+        // ones with ≥1 matching check survive the inner join), AND it
+        // trims the embedded `checks` array down to just the matching
+        // checks — so the table only ever renders checks from the
+        // selected bank. History doesn't embed checks in this query at
+        // all (its checks come from a separate lookup below), so its bank
+        // filter is applied client-side after that data is merged.
+        if (bankFilter && tab !== 'history') {
+          req = req.eq('checks.bank', bankFilter)
         }
 
         const { data, error } = await req
@@ -352,12 +563,47 @@ export default function AdminPickups() {
 
         let rows = Array.isArray(data) ? data : []
 
+        // A reservation can stay at status='reserved' while some of its
+        // checks have already been approved (picked_up) or are mid-flight
+        // (pending_approval) elsewhere — e.g. a partial approval where one
+        // check was approved and another was returned for correction. Only
+        // the checks that are actually still 'reserved' or 'returned'
+        // belong in this tab; anything else tied to the same reservation_id
+        // must NOT be shown here, or an approved check ends up looking like
+        // it, too, got sent back for correction.
+        if (tab === 'active') {
+          rows = rows.map((r) => ({
+            ...r,
+            checks: (Array.isArray(r.checks) ? r.checks : []).filter((c) => {
+              const normalizedStatus = String(c?.status ?? 'reserved').trim().toLowerCase()
+              return ACTIVE_TAB_CHECK_STATUSES.has(normalizedStatus) || isReturnedCheck(c)
+            }),
+          }))
+        }
+
+        // Belt-and-suspenders, matching the same pattern used for
+        // ACTIVE_TAB_CHECK_STATUSES above: the `checks!inner` + `.eq()`
+        // combo already does the real filtering server-side, but
+        // re-filtering client-side means a future change to the select
+        // clause (e.g. someone drops the `!inner`) can't silently regress
+        // into showing checks from the wrong bank.
+        if (bankFilter && tab !== 'history') {
+          rows = rows.map((r) => ({
+            ...r,
+            checks: (Array.isArray(r.checks) ? r.checks : []).filter((c) => c.bank === bankFilter),
+          }))
+        }
+
         if (tab === 'history' && rows.length > 0) {
           const ids = rows.map((r) => r.id)
+
+          // Two separate queries instead of a single embedded
+          // `checks(...)` select — see the HISTORY-TAB DATA NOTE at the
+          // top of this file for why the embed was unreliable.
           const { data: activity, error: activityError } = await supabase
             .from('check_activity_log')
             .select(
-              'id, reservation_id, action, or_no, ar_collected, remarks, performed_at, checks(id, row_number, payee, payor, check_no, check_date, amount)'
+              'id, reservation_id, check_id, action, or_no, ar_collected, attached_2307, remarks, performed_at'
             )
             .in('reservation_id', ids)
             .order('performed_at', { ascending: true })
@@ -369,12 +615,49 @@ export default function AdminPickups() {
             // check breakdown until the next successful refresh.
             console.error('check_activity_log fetch failed:', activityError)
           } else {
+            const activityRows = activity || []
+            const checkIds = [...new Set(activityRows.map((a) => a.check_id).filter(Boolean))]
+
+            let checksById = new Map()
+            if (checkIds.length > 0) {
+              const { data: checksData, error: checksError } = await supabase
+                .from('checks')
+                .select('id, row_number, bank, payee, payor, check_no, check_date, amount')
+                .in('id', checkIds)
+
+              if (!isMountedRef.current || requestId !== requestIdRef.current) return
+
+              if (checksError) {
+                // Still non-fatal — activity rows will just render without
+                // check details (payee/amount/etc.) until the check lookup
+                // succeeds on a later refresh.
+                console.error('checks lookup for history failed:', checksError)
+              } else {
+                checksById = new Map((checksData || []).map((c) => [c.id, c]))
+              }
+            }
+
             const byReservation = new Map()
-            ;(activity || []).forEach((a) => {
+            activityRows.forEach((a) => {
+              const enriched = { ...a, checks: checksById.get(a.check_id) || null }
               if (!byReservation.has(a.reservation_id)) byReservation.set(a.reservation_id, [])
-              byReservation.get(a.reservation_id).push(a)
+              byReservation.get(a.reservation_id).push(enriched)
             })
             rows = rows.map((r) => ({ ...r, activity: byReservation.get(r.id) || [] }))
+
+            // History's bank filter is applied here, client-side, since the
+            // checks for this tab come from the separate lookup above
+            // rather than an embed the query itself can filter on. A
+            // reservation is kept only if at least one of its logged
+            // checks matches the selected bank; lineItems()/matchesCheckSearch
+            // will still only ever *display* checks matching whatever the
+            // bank column says, so this just controls which orders appear
+            // at all.
+            if (bankFilter) {
+              rows = rows.filter((r) =>
+                (r.activity || []).some((a) => a.checks && a.checks.bank === bankFilter)
+              )
+            }
           }
         }
 
@@ -400,7 +683,7 @@ export default function AdminPickups() {
         inFlightRef.current = false
       }
     },
-    [tab, collectorFilter]
+    [tab, collectorFilter, bankFilter]
   )
 
   function minutesLeft(expiresAt) {
@@ -450,9 +733,9 @@ export default function AdminPickups() {
     return 'normal'
   }
 
-  // Combines the (already server-filtered-by-collector) list with the
-  // client-side check search, the quick filter (expiring / stale
-  // depending on tab), and sort.
+  // Combines the (already server-filtered-by-collector/bank) list with the
+  // client-side check search, the quick filter (expiring / stale / returned
+  // / history outcome depending on tab), and sort.
   const visibleReservations = useMemo(() => {
     const term = checkSearch.trim()
     let list = reservations.filter((r) => matchesCheckSearch(sortedLineItems(r, tab), term))
@@ -460,11 +743,17 @@ export default function AdminPickups() {
     if (tab === 'active' && quickFilter === 'expiring') {
       list = list.filter((r) => minutesLeft(r.expires_at) <= EXPIRING_SOON_MINUTES)
     }
+    if (tab === 'active' && quickFilter === 'returned') {
+      list = list.filter((r) => sortedLineItems(r, 'active').some((c) => c.checkStatus === 'returned'))
+    }
     if (tab === 'pending_approval' && quickFilter === 'stale') {
       list = list.filter((r) => {
         const submittedAtMs = earliestSubmittedAt(sortedLineItems(r, 'pending_approval'))
         return submittedAtMs && minutesWaiting(submittedAtMs) >= PENDING_WARN_MINUTES
       })
+    }
+    if (tab === 'history' && quickFilter !== 'all') {
+      list = list.filter((r) => sortedLineItems(r, 'history').some((c) => c.outcome === quickFilter))
     }
 
     const withMeta = list.map((r) => ({
@@ -504,13 +793,29 @@ export default function AdminPickups() {
     const minutesLeftAll = reservations.map((r) => minutesLeft(r.expires_at))
     const expiringSoon = minutesLeftAll.filter((m) => m <= EXPIRING_SOON_MINUTES).length
     const critical = minutesLeftAll.filter((m) => m <= CRITICAL_MINUTES).length
+    // `reservations[].checks` is already filtered down to
+    // ACTIVE_TAB_CHECK_STATUSES in load(), so totalChecks / totalValue here
+    // never include checks that were actually approved or are still
+    // pending elsewhere.
     const totalChecks = reservations.reduce(
       (sum, r) => sum + (Array.isArray(r.checks) ? r.checks.length : 0),
       0
     )
+    const returnedCount = reservations.reduce(
+      (sum, r) => sum + (Array.isArray(r.checks) ? r.checks.filter((c) => isReturnedCheck(c)).length : 0),
+      0
+    )
     const totalValue = reservations.reduce((sum, r) => sum + orderTotal(lineItems(r, 'active')), 0)
     const avgChecksPerOrder = reservations.length ? (totalChecks / reservations.length).toFixed(1) : '0'
-    return { total: reservations.length, expiringSoon, critical, totalChecks, totalValue, avgChecksPerOrder }
+    return {
+      total: reservations.length,
+      expiringSoon,
+      critical,
+      totalChecks,
+      totalValue,
+      avgChecksPerOrder,
+      returnedCount,
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reservations, tab, now])
 
@@ -543,6 +848,44 @@ export default function AdminPickups() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reservations, tab, now])
+
+  // History KPI summary: breaks every logged outcome down by type so an
+  // admin can see at a glance how many checks were approved, released,
+  // rejected, returned, or expired across the currently loaded orders —
+  // mirroring the KPI treatment already used on Active / Pending Approval.
+  const historySummary = useMemo(() => {
+    if (tab !== 'history') return null
+    let totalChecks = 0
+    let totalValue = 0
+    let approved = 0
+    let released = 0
+    let rejected = 0
+    let returned = 0
+    let expired = 0
+    reservations.forEach((r) => {
+      const items = lineItems(r, 'history')
+      totalChecks += items.length
+      totalValue += orderTotal(items)
+      items.forEach((c) => {
+        if (c.outcome === 'picked_up' || c.outcome === 'approved') approved += 1
+        else if (c.outcome === 'released') released += 1
+        else if (c.outcome === 'rejected') rejected += 1
+        else if (c.outcome === 'returned') returned += 1
+        else if (c.outcome === 'expired') expired += 1
+      })
+    })
+    return {
+      total: reservations.length,
+      totalChecks,
+      totalValue,
+      approved,
+      released,
+      rejected,
+      returned,
+      expired,
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reservations, tab])
   function toggleExpand(id) {
     setExpandedIds((prev) => {
       const next = new Set(prev)
@@ -624,24 +967,27 @@ export default function AdminPickups() {
   const confirmTotal = useMemo(() => orderTotal(confirmChecks), [confirmChecks])
 
   // Validates that every check in the order has an explicit outcome: either
-  // "picking up" with a non-empty, unique OR number and a collected answer
-  // (plus a reason if AR wasn't collected), or "not picking up" with a
-  // reason. Used both to gate the submit button in the UI and as a server-
-  // call guard so a race between state updates can never slip an incomplete
-  // payload through.
+  // "picking up" with a non-empty, unique receipt (type + number) and a
+  // collected answer (plus a reason if AR wasn't collected), or "not
+  // picking up" with a reason. Used both to gate the submit button in the
+  // UI and as a server-call guard so a race between state updates can
+  // never slip an incomplete payload through.
   function findIncompleteEntry(checks, orData) {
-    const seenOrNos = new Map() // normalized OR no. -> check id, to catch duplicates
+    const seenOrNos = new Map() // normalized "TYPE-number" -> check id, to catch duplicates
     for (const c of checks) {
       const entry = orData?.[c.checkId]
       if (!entry) return { reason: 'incomplete', checkId: c.checkId }
 
       if (entry.include) {
-        const orNo = entry.orNo?.trim() ?? ''
-        if (!orNo || entry.collected === null || entry.collected === undefined) {
+        const orNo = composeReceiptNo(entry)
+        if (
+          !orNo ||
+          entry.collected === null ||
+          entry.collected === undefined ||
+          entry.attached2307 === null ||
+          entry.attached2307 === undefined
+        ) {
           return { reason: 'incomplete', checkId: c.checkId }
-        }
-        if (entry.collected === false && !entry.remarks?.trim()) {
-          return { reason: 'missing-reason', checkId: c.checkId }
         }
         const normalized = orNo.toLowerCase()
         if (seenOrNos.has(normalized)) {
@@ -682,7 +1028,7 @@ export default function AdminPickups() {
 
         if (failed > 0 && succeeded === 0) {
           setActionError(
-            `Could not ${isRecall ? 'recall' : 'release'} the selected reservations. Please try again.`
+            `Could not ${isRecall ? 'recall' : 'return'} the selected reservations. Please try again.`
           )
           return
         }
@@ -692,8 +1038,8 @@ export default function AdminPickups() {
         load(false)
         showToast(
           failed > 0
-            ? `${isRecall ? 'Recalled' : 'Released'} ${succeeded} of ${results.length}. ${failed} failed — try again.`
-            : `${isRecall ? 'Recalled' : 'Released'} ${succeeded} reservation${succeeded === 1 ? '' : 's'}.`,
+            ? `${isRecall ? 'Recalled' : 'Returned'} ${succeeded} of ${results.length}. ${failed} failed — try again.`
+            : `${isRecall ? 'Recalled' : 'Returned'} ${succeeded} reservation${succeeded === 1 ? '' : 's'}.`,
           failed > 0 ? 'warning' : 'success'
         )
         return
@@ -719,10 +1065,10 @@ export default function AdminPickups() {
         if (problem) {
           setActionError(
             problem.reason === 'duplicate'
-              ? 'Each check being picked up needs its own OR number — duplicates were found.'
+              ? 'Each check being picked up needs its own unique receipt type + number.'
               : problem.reason === 'missing-reason'
-              ? 'Enter a reason for every check marked "AR not collected" or left off the pickup.'
-              : 'Enter an OR number and collection status for every check being picked up.'
+              ? 'Enter a reason for every check left off the pickup.'
+              : 'Select a receipt type, enter its number, and set AR collected and 2307 Attached status for every check being picked up.'
           )
           return
         }
@@ -739,9 +1085,12 @@ export default function AdminPickups() {
             return {
               check_id: c.checkId,
               picked_up: true,
-              or_no: entry.orNo.trim(),
+              // "TYPE-number" (e.g. "OR-12345") — see composeReceiptNo()
+              // and the RECEIPT TYPE NOTE at the top of this file.
+              or_no: composeReceiptNo(entry),
               ar_collected: entry.collected,
-              remarks: entry.collected === false ? entry.remarks.trim() : null,
+              attached_2307: entry.attached2307,
+              remarks: null,
             }
           }
           releasedCount += 1
@@ -793,7 +1142,7 @@ export default function AdminPickups() {
             : `Sent ${collectorName}'s pickup to approval.`
           : isRecall
           ? `Recalled ${collectorName}'s submission for edits.`
-          : `Released ${collectorName}'s reservation.`
+          : `Returned ${collectorName}'s reservation.`
       )
     } catch (err) {
       if (!isMountedRef.current) return
@@ -806,11 +1155,14 @@ export default function AdminPickups() {
   function exportCsv() {
     const isHistory = tab === 'history'
     const isPending = tab === 'pending_approval'
+    const isActive = tab === 'active'
     const headers = isHistory
-      ? ['Collector', 'Status', 'Reserved at', 'Resolved at', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount', 'Outcome', 'OR no.', 'AR collected', 'Remarks']
+      ? ['Collector', 'Status', 'Reserved at', 'Resolved at', 'Bank', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount', 'Outcome', 'OR no.', 'AR collected', '2307 Attached', 'Remarks']
       : isPending
-      ? ['Collector', 'Status', 'Reserved at', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount', 'OR no.', 'AR collected', 'Remarks', 'Submitted by', 'Submitted at']
-      : ['Collector', 'Status', 'Reserved at', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount']
+      ? ['Collector', 'Status', 'Reserved at', 'Bank', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount', 'OR no.', 'AR collected', '2307 Attached', 'Remarks', 'Submitted by', 'Submitted at']
+      : isActive
+      ? ['Collector', 'Status', 'Reserved at', 'Bank', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount', 'Check status', 'Return reason', 'Returned by', 'Returned at']
+      : ['Collector', 'Status', 'Reserved at', 'Bank', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount']
 
     const rows = [headers]
     visibleReservations.forEach((r) => {
@@ -818,10 +1170,12 @@ export default function AdminPickups() {
       if (items.length === 0) {
         rows.push(
           isHistory
-            ? [r.collector_name || '', r.status || '', r.reserved_at || '', r.picked_up_at || '', '', '', '', '', '', '', '', '', '']
+            ? [r.collector_name || '', r.status || '', r.reserved_at || '', r.picked_up_at || '', '', '', '', '', '', '', '', '', '', '', '']
             : isPending
+            ? [r.collector_name || '', r.status || '', r.reserved_at || '', '', '', '', '', '', '', '', '', '', '', '', '']
+            : isActive
             ? [r.collector_name || '', r.status || '', r.reserved_at || '', '', '', '', '', '', '', '', '', '', '']
-            : [r.collector_name || '', r.status || '', r.reserved_at || '', '', '', '', '', '']
+            : [r.collector_name || '', r.status || '', r.reserved_at || '', '', '', '', '', '', '']
         )
         return
       }
@@ -833,6 +1187,7 @@ export default function AdminPickups() {
                 r.status || '',
                 r.reserved_at || '',
                 r.picked_up_at || '',
+                c.bank || '',
                 c.check_no || '',
                 c.payee || '',
                 c.payor || '',
@@ -841,6 +1196,7 @@ export default function AdminPickups() {
                 c.outcome || '',
                 c.or_no || '',
                 c.ar_collected === null || c.ar_collected === undefined ? '' : c.ar_collected ? 'Yes' : 'No',
+                c.attached_2307 === null || c.attached_2307 === undefined ? '' : c.attached_2307 ? 'Yes' : 'No',
                 c.remarks || '',
               ]
             : isPending
@@ -848,6 +1204,7 @@ export default function AdminPickups() {
                 r.collector_name || '',
                 r.status || '',
                 r.reserved_at || '',
+                c.bank || '',
                 c.check_no || '',
                 c.payee || '',
                 c.payor || '',
@@ -855,14 +1212,32 @@ export default function AdminPickups() {
                 c.amount ?? '',
                 c.or_no || '',
                 c.ar_collected === null || c.ar_collected === undefined ? '' : c.ar_collected ? 'Yes' : 'No',
+                c.attached_2307 === null || c.attached_2307 === undefined ? '' : c.attached_2307 ? 'Yes' : 'No',
                 c.remarks || '',
                 c.submittedByName || '',
                 c.submittedAt || '',
+              ]
+            : isActive
+            ? [
+                r.collector_name || '',
+                r.status || '',
+                r.reserved_at || '',
+                c.bank || '',
+                c.check_no || '',
+                c.payee || '',
+                c.payor || '',
+                c.check_date || '',
+                c.amount ?? '',
+                c.checkStatus === 'returned' ? 'Returned' : 'Reserved',
+                c.returnReason || '',
+                c.returnedByName || '',
+                c.returnedAt || '',
               ]
             : [
                 r.collector_name || '',
                 r.status || '',
                 r.reserved_at || '',
+                c.bank || '',
                 c.check_no || '',
                 c.payee || '',
                 c.payor || '',
@@ -906,8 +1281,8 @@ export default function AdminPickups() {
     <div className="pb-20 sm:pb-0">
       <div className="mb-6 flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-semibold text-ink-900">Pending pickups</h1>
-          <p className="mt-1 text-sm text-ink-500">
+          <h1 className="font-display text-2xl font-semibold text-ink-900">Pending pickups</h1>
+          <p className="mt-1 text-sm text-ink-400">
             Checks collectors have reserved and their remaining pickup window. Submitting a pickup
             sends it to an approver for verification before it's final — nothing leaves the
             building without a second set of eyes.
@@ -942,13 +1317,13 @@ export default function AdminPickups() {
       </div>
 
    {tab === 'active' && activeSummary && (
-        <div className="mb-5 grid grid-cols-2 gap-3 lg:grid-cols-5">
+        <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
           <KpiCard
             icon={User}
             label="Active orders"
             value={loading ? null : activeSummary.total}
             secondary={loading ? null : `${activeSummary.avgChecksPerOrder} checks/order avg`}
-            accent="ink"
+            accent="lightTeal"
           />
           <KpiCard
             icon={Layers}
@@ -966,14 +1341,14 @@ export default function AdminPickups() {
                 ? null
                 : `${formatCurrency(activeSummary.totalValue / (activeSummary.total || 1))} avg/order`
             }
-            accent="ink"
+            accent="sky"
           />
           <KpiCard
             icon={Timer}
             label={`Expiring ≤ ${EXPIRING_SOON_MINUTES}m`}
             value={loading ? null : activeSummary.expiringSoon}
             secondary={loading ? null : `${activeSummary.critical} of these ≤ ${CRITICAL_MINUTES}m`}
-            accent={!loading && activeSummary.expiringSoon > 0 ? 'amber' : 'ink'}
+            accent={!loading && activeSummary.expiringSoon > 0 ? 'orange' : 'ink'}
             active={quickFilter === 'expiring'}
             onClick={() => setQuickFilter((f) => (f === 'expiring' ? 'all' : 'expiring'))}
           />
@@ -984,16 +1359,25 @@ export default function AdminPickups() {
             secondary={!loading && activeSummary.critical > 0 ? 'Needs immediate attention' : null}
             accent={!loading && activeSummary.critical > 0 ? 'red' : 'ink'}
           />
+          <KpiCard
+            icon={RotateCcw}
+            label="Returned for correction"
+            value={loading ? null : activeSummary.returnedCount}
+            secondary={!loading && activeSummary.returnedCount > 0 ? 'An approver sent these back' : null}
+            accent={!loading && activeSummary.returnedCount > 0 ? 'amber' : 'ink'}
+            active={quickFilter === 'returned'}
+            onClick={() => setQuickFilter((f) => (f === 'returned' ? 'all' : 'returned'))}
+          />
         </div>
       )}   
 {tab === 'pending_approval' && pendingSummary && (
-        <div className="mb-5 grid grid-cols-2 gap-3 lg:grid-cols-5">
+        <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
           <KpiCard
             icon={ShieldCheck}
             label="Awaiting approval"
             value={loading ? null : pendingSummary.total}
             secondary={loading ? null : pendingSummary.oldestWaitingLabel ? `Oldest: ${pendingSummary.oldestWaitingLabel}` : null}
-            accent="ink"
+            accent="lightTeal"
           />
           <KpiCard
             icon={Hash}
@@ -1011,7 +1395,7 @@ export default function AdminPickups() {
                 ? null
                 : `${formatCurrency(pendingSummary.totalValue / (pendingSummary.total || 1))} avg/submission`
             }
-            accent="ink"
+            accent="sky"
           />
           <KpiCard
             icon={Hourglass}
@@ -1028,6 +1412,65 @@ export default function AdminPickups() {
             value={loading ? null : pendingSummary.critical}
             secondary={!loading && pendingSummary.critical > 0 ? 'Escalate to an approver' : null}
             accent={!loading && pendingSummary.critical > 0 ? 'red' : 'ink'}
+          />
+        </div>
+      )}
+
+      {tab === 'history' && historySummary && (
+        <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+          <KpiCard
+            icon={Layers}
+            label="Orders"
+            value={loading ? null : historySummary.total}
+            secondary={loading ? null : `${historySummary.totalChecks} checks total`}
+            accent="lightTeal"
+          />
+          <KpiCard
+            icon={Wallet}
+            label="Total value"
+            value={loading ? null : formatCurrency(historySummary.totalValue)}
+            secondary={loading ? null : `${historySummary.totalChecks} checks`}
+            accent="sky"
+          />
+          <KpiCard
+            icon={CheckCircle2}
+            label="Approved & picked up"
+            value={loading ? null : historySummary.approved}
+            secondary="Confirmed by an approver"
+            accent="teal"
+            active={quickFilter === 'picked_up'}
+            onClick={() => setQuickFilter((f) => (f === 'picked_up' ? 'all' : 'picked_up'))}
+          />
+          <KpiCard
+            icon={Undo2}
+            label="Released"
+            value={loading ? null : historySummary.released}
+            secondary="Left off at submission"
+            accent="ink"
+            active={quickFilter === 'released'}
+            onClick={() => setQuickFilter((f) => (f === 'released' ? 'all' : 'released'))}
+          />
+          <KpiCard
+            icon={XCircle}
+            label="Rejected"
+            value={loading ? null : historySummary.rejected}
+            secondary={!loading && historySummary.rejected > 0 ? 'Sent back to the pool' : null}
+            accent={!loading && historySummary.rejected > 0 ? 'red' : 'ink'}
+            active={quickFilter === 'rejected'}
+            onClick={() => setQuickFilter((f) => (f === 'rejected' ? 'all' : 'rejected'))}
+          />
+          <KpiCard
+            icon={RotateCcw}
+            label="Returned / Expired"
+            value={loading ? null : historySummary.returned + historySummary.expired}
+            secondary={
+              !loading
+                ? `${historySummary.returned} returned · ${historySummary.expired} expired`
+                : null
+            }
+            accent={!loading && historySummary.returned + historySummary.expired > 0 ? 'amber' : 'ink'}
+            active={quickFilter === 'returned' || quickFilter === 'expired'}
+            onClick={() => setQuickFilter((f) => (f === 'returned' ? 'all' : 'returned'))}
           />
         </div>
       )}
@@ -1076,15 +1519,32 @@ export default function AdminPickups() {
           )}
         </div>
 
+        <div className="relative shrink-0 sm:w-56">
+          <Landmark className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-ink-300" />
+          <select
+            value={bankFilter}
+            onChange={(e) => setBankFilter(e.target.value)}
+            aria-label="Filter by bank"
+            className="w-full rounded-md border border-ink-200 bg-white py-2 pl-9 pr-8 text-sm text-ink-700 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-teal-500"
+          >
+            <option value="">All banks</option>
+            {BANKS.map((b) => (
+              <option key={b} value={b}>
+                {b}
+              </option>
+            ))}
+          </select>
+        </div>
+
         <div className="relative flex-1">
           <Filter className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-ink-300" />
           <Input
             ref={searchInputRef}
             value={checkSearch}
             onChange={(e) => setCheckSearch(e.target.value)}
-            placeholder="Search check #, payee, payor, or OR no... (press /)"
+            placeholder="Search check #, payee, payor, OR no., or bank... (press /)"
             className="border-ink-200 pl-9 pr-8 text-sm focus-visible:ring-teal-500"
-            aria-label="Search checks by number, payee, payor, or OR no."
+            aria-label="Search checks by number, payee, payor, OR no., or bank"
           />
           {checkSearch && (
             <button
@@ -1182,7 +1642,7 @@ export default function AdminPickups() {
       ) : visibleReservations.length === 0 ? (
         <EmptyState
           tab={tab}
-          hasFilter={!!collectorFilter.trim() || !!checkSearch.trim() || quickFilter !== 'all'}
+          hasFilter={!!collectorFilter.trim() || !!bankFilter || !!checkSearch.trim() || quickFilter !== 'all'}
         />
       ) : (
         <div className="space-y-2.5">
@@ -1239,7 +1699,7 @@ export default function AdminPickups() {
                   className="flex items-center gap-1.5 rounded-md border border-ink-200 px-3 py-1.5 text-xs font-medium text-ink-700 hover:bg-ink-50"
                 >
                   <Undo2 className="h-3.5 w-3.5" />
-                  Release selected
+                  Return selected
                 </button>
               )}
               {tab === 'pending_approval' && (
@@ -1311,9 +1771,21 @@ function TabButton({ active, onClick, children }) {
     </button>
   )
 }
+
+// KPI card design shared across all three tabs (Active / Pending Approval /
+// History), deliberately matching the compact card language used on the
+// Checks Register page (AdminChecks.jsx): a small icon in a tinted circle,
+// a dashed decorative ring in the top-right corner, and compact
+// value/label/secondary typography. Kept in this file (rather than a
+// shared component) since the two pages currently don't share a UI module,
+// but the visual language — sizing, spacing, and the accent-color system —
+// is intentionally identical so the two pages read as one product.
 function KpiCard({ icon: Icon, label, value, secondary, accent = 'ink', onClick, active }) {
   const accents = {
     teal: { ring: 'border-teal-200', badge: 'bg-teal-100 text-teal-700', activeRing: 'ring-teal-400' },
+    lightTeal: { ring: 'border-teal-200', badge: 'bg-teal-50 text-teal-600', activeRing: 'ring-teal-400' },
+    sky: { ring: 'border-sky-200', badge: 'bg-sky-50 text-sky-600', activeRing: 'ring-sky-400' },
+    orange: { ring: 'border-orange-200', badge: 'bg-orange-100 text-orange-600', activeRing: 'ring-orange-400' },
     amber: { ring: 'border-amber-200', badge: 'bg-amber-100 text-amber-700', activeRing: 'ring-amber-400' },
     red: { ring: 'border-red-200', badge: 'bg-red-100 text-red-600', activeRing: 'ring-red-400' },
     ink: { ring: 'border-ink-100', badge: 'bg-ink-100 text-ink-600', activeRing: 'ring-ink-400' },
@@ -1325,7 +1797,7 @@ function KpiCard({ icon: Icon, label, value, secondary, accent = 'ink', onClick,
   const card = (
     <Card
       className={cn(
-        'relative overflow-hidden p-4 transition',
+        'relative overflow-hidden p-3 transition',
         isInteractive && 'hover:border-ink-200 hover:shadow-sm',
         active && cn('ring-2', style.activeRing),
       )}
@@ -1337,18 +1809,18 @@ function KpiCard({ icon: Icon, label, value, secondary, accent = 'ink', onClick,
         )}
         aria-hidden="true"
       />
-      <div className="relative flex items-start gap-3">
-        <div className={cn('flex h-9 w-9 shrink-0 items-center justify-center rounded-full', style.badge)}>
-          <Icon className="h-4 w-4" />
+      <div className="relative flex items-start gap-2.5">
+        <div className={cn('flex h-8 w-8 shrink-0 items-center justify-center rounded-full', style.badge)}>
+          <Icon className="h-3.5 w-3.5" />
         </div>
         <div className="min-w-0 flex-1">
           {isLoading ? (
-            <div className="h-6 w-12 animate-pulse rounded bg-ink-100" />
+            <div className="h-5 w-12 animate-pulse rounded bg-ink-100" />
           ) : (
-            <p className="truncate text-2xl font-semibold text-ink-900">{value}</p>
+            <p className="truncate font-display text-sm font-semibold text-ink-900">{value}</p>
           )}
-          <p className="truncate text-xs font-medium uppercase tracking-wide text-ink-400">{label}</p>
-          {!isLoading && secondary && <p className="mt-0.5 truncate text-xs text-ink-500">{secondary}</p>}
+          <p className="truncate text-[10px] font-medium uppercase tracking-wide text-ink-400">{label}</p>
+          {!isLoading && secondary && <p className="mt-0.5 truncate text-[10px] text-ink-500">{secondary}</p>}
         </div>
       </div>
     </Card>
@@ -1383,6 +1855,52 @@ function StatusBadge({ status }) {
   return (
     <span className={cn('rounded-full px-2.5 py-0.5 text-[11px] font-medium', styles[status] || 'bg-ink-100 text-ink-600')}>
       {labels[status] || status || 'Unknown'}
+    </span>
+  )
+}
+
+// Per-check status badge for the ACTIVE tab specifically. This is what
+// tells an admin apart a check that's simply reserved (never submitted, or
+// resubmitted and waiting) from one an approver just sent back for
+// correction. Deliberately distinct from StatusBadge above, which is for
+// the reservation as a whole.
+function ActiveCheckStatusBadge({ status }) {
+  if (status === 'returned') {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-700">
+        <RotateCcw className="h-3 w-3" />
+        Returned
+      </span>
+    )
+  }
+  return (
+    <span className="inline-flex items-center gap-1 rounded-full bg-teal-100 px-2 py-0.5 text-[11px] font-medium text-teal-700">
+      Reserved
+    </span>
+  )
+}
+
+// Small pill for the bank a check came from, matching the treatment used on
+// the Checks Register page (AdminChecks.jsx's BankBadge) so the two pages
+// read as one product. Falls back to a dashed "Unknown" pill for any check
+// that predates the bank column, or for banks somehow outside the fixed
+// BANKS list, rather than rendering blank or crashing.
+function BankBadge({ bank }) {
+  if (!bank) {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full border border-dashed border-ink-200 px-2 py-0.5 text-[11px] font-medium text-ink-400">
+        <Landmark className="h-3 w-3" />
+        Unknown
+      </span>
+    )
+  }
+  return (
+    <span
+      className="inline-flex max-w-[160px] items-center gap-1 truncate rounded-full bg-teal-50 px-2 py-0.5 text-[11px] font-medium text-teal-700"
+      title={bank}
+    >
+      <Landmark className="h-3 w-3 shrink-0" />
+      <span className="truncate">{bank}</span>
     </span>
   )
 }
@@ -1453,6 +1971,13 @@ function ReservationRow({
   const preview = payeePreview(items)
   const isHistory = tab === 'history'
   const isPending = tab === 'pending_approval'
+  const isActive = tab === 'active'
+  // Whether this specific order currently has one or more checks sitting
+  // in the Active tab because an approver returned them for correction —
+  // drives the extra "Status / Return reason / Returned by / Returned at"
+  // columns below, and an at-a-glance banner on the collapsed row.
+  const anyReturned = isActive && items.some((c) => c.checkStatus === 'returned')
+  const returnedCount = isActive ? items.filter((c) => c.checkStatus === 'returned').length : 0
 
   const pickedCount = isHistory ? items.filter((c) => c.outcome === 'picked_up').length : 0
   const releasedCount = isHistory ? items.filter((c) => c.outcome === 'released').length : 0
@@ -1462,6 +1987,8 @@ function ReservationRow({
       ? 'border-red-300'
       : urgencyLevel === 'warning'
       ? 'border-orange-300'
+      : anyReturned
+      ? 'border-amber-300'
       : 'border-ink-100'
 
   return (
@@ -1493,6 +2020,12 @@ function ReservationRow({
                   {reservation.collector_name || 'Unknown collector'}
                 </span>
                 <StatusBadge status={reservation.status} />
+                {anyReturned && (
+                  <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-700">
+                    <RotateCcw className="h-3 w-3" />
+                    {returnedCount} returned for correction
+                  </span>
+                )}
               </div>
               {preview && <p className="truncate text-xs text-ink-400">{preview}</p>}
               {reservation.status === 'partial' && (
@@ -1556,7 +2089,9 @@ function ReservationRow({
         <>
           {checkCount === 0 ? (
             <p className="border-t border-ink-100 px-4 py-3 text-xs text-ink-400">
-              No linked checks found for this order.
+              {isHistory
+                ? "No logged activity found for this order yet — it may not have been fully processed, or its activity log entries couldn't be matched to a check."
+                : 'No linked checks found for this order.'}
             </p>
           ) : (
             <div className="overflow-x-auto border-t border-ink-100">
@@ -1564,24 +2099,37 @@ function ReservationRow({
                 <thead>
                   <tr className="border-b border-ink-50 text-left text-[11px] uppercase tracking-wide text-ink-400">
                     <th className="px-4 py-2 font-medium">#</th>
+                    <th className="px-2 py-2 font-medium">Bank</th>
                     <th className="px-2 py-2 font-medium">Check no.</th>
                     <th className="px-2 py-2 font-medium">Payee</th>
                     <th className="px-2 py-2 font-medium">Payor</th>
                     <th className="px-2 py-2 font-medium">Check date</th>
                     <th className="px-4 py-2 text-right font-medium">Amount</th>
+                    {isActive && <th className="px-2 py-2 font-medium">Status</th>}
+                    {isActive && anyReturned && <th className="px-2 py-2 font-medium">Return reason</th>}
+                    {isActive && anyReturned && <th className="px-2 py-2 font-medium">Returned by</th>}
+                    {isActive && anyReturned && <th className="px-4 py-2 font-medium">Returned at</th>}
                     {isPending && <th className="px-2 py-2 font-medium">OR no.</th>}
                     {isPending && <th className="px-2 py-2 font-medium">AR collected</th>}
+                    {isPending && <th className="px-2 py-2 font-medium">2307 Attached</th>}
                     {isPending && <th className="px-4 py-2 font-medium">Remarks</th>}
                     {isHistory && <th className="px-2 py-2 font-medium">Outcome</th>}
                     {isHistory && <th className="px-2 py-2 font-medium">OR no.</th>}
                     {isHistory && <th className="px-2 py-2 font-medium">AR collected</th>}
+                    {isHistory && <th className="px-2 py-2 font-medium">2307 Attached</th>}
                     {isHistory && <th className="px-4 py-2 font-medium">Remarks</th>}
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-ink-50">
                   {items.map((c, idx) => (
-                    <tr key={c.id ?? `${reservation.id}-${idx}`}>
+                    <tr
+                      key={c.id ?? `${reservation.id}-${idx}`}
+                      className={cn(isActive && c.checkStatus === 'returned' && 'bg-amber-50/60')}
+                    >
                       <td className="px-4 py-2.5 font-mono text-xs text-ink-400">{idx + 1}</td>
+                      <td className="px-2 py-2.5">
+                        <BankBadge bank={c.bank} />
+                      </td>
                       <td className="px-2 py-2.5 font-mono text-xs text-ink-700">
                         <span className="flex items-center gap-1">
                           <Hash className="h-3 w-3 text-ink-300" />
@@ -1601,6 +2149,30 @@ function ReservationRow({
                       <td className="px-4 py-2.5 text-right font-mono font-medium text-ink-700">
                         {formatCurrency(c.amount)}
                       </td>
+                      {isActive && (
+                        <td className="px-2 py-2.5">
+                          <ActiveCheckStatusBadge status={c.checkStatus} />
+                        </td>
+                      )}
+                      {isActive && anyReturned && (
+                        <td className="max-w-[220px] px-2 py-2.5 text-xs text-ink-600">
+                          {c.checkStatus === 'returned' ? (
+                            <span title={c.returnReason || undefined}>{c.returnReason || '—'}</span>
+                          ) : (
+                            <span className="text-ink-300">—</span>
+                          )}
+                        </td>
+                      )}
+                      {isActive && anyReturned && (
+                        <td className="px-2 py-2.5 text-xs text-ink-600">
+                          {c.checkStatus === 'returned' ? c.returnedByName || '—' : <span className="text-ink-300">—</span>}
+                        </td>
+                      )}
+                      {isActive && anyReturned && (
+                        <td className="px-4 py-2.5 text-xs text-ink-500">
+                          {c.checkStatus === 'returned' ? formatDateTime(c.returnedAt) : <span className="text-ink-300">—</span>}
+                        </td>
+                      )}
                       {isPending && (
                         <td className="px-2 py-2.5 font-mono text-xs text-ink-600">{c.or_no || '—'}</td>
                       )}
@@ -1609,6 +2181,17 @@ function ReservationRow({
                           {c.ar_collected === null || c.ar_collected === undefined ? (
                             '—'
                           ) : c.ar_collected ? (
+                            <span className="rounded-full bg-teal-100 px-2 py-0.5 text-[11px] font-medium text-teal-700">Yes</span>
+                          ) : (
+                            <span className="rounded-full bg-orange-100 px-2 py-0.5 text-[11px] font-medium text-orange-700">No</span>
+                          )}
+                        </td>
+                      )}
+                      {isPending && (
+                        <td className="px-2 py-2.5">
+                          {c.attached_2307 === null || c.attached_2307 === undefined ? (
+                            '—'
+                          ) : c.attached_2307 ? (
                             <span className="rounded-full bg-teal-100 px-2 py-0.5 text-[11px] font-medium text-teal-700">Yes</span>
                           ) : (
                             <span className="rounded-full bg-orange-100 px-2 py-0.5 text-[11px] font-medium text-orange-700">No</span>
@@ -1638,6 +2221,17 @@ function ReservationRow({
   </td>
 )}
 {isHistory && (
+  <td className="px-2 py-2.5">
+    {c.attached_2307 === null || c.attached_2307 === undefined ? (
+      '—'
+    ) : c.attached_2307 ? (
+      <span className="rounded-full bg-teal-100 px-2 py-0.5 text-[11px] font-medium text-teal-700">Yes</span>
+    ) : (
+      <span className="rounded-full bg-orange-100 px-2 py-0.5 text-[11px] font-medium text-orange-700">No</span>
+    )}
+  </td>
+)}
+{isHistory && (
   <td className="max-w-[220px] px-4 py-2.5 text-xs text-ink-500">
     {c.remarks || '—'}
   </td>
@@ -1647,14 +2241,15 @@ function ReservationRow({
                 </tbody>
                 <tfoot>
                   <tr className="border-t border-ink-100 bg-ink-50/40">
-                    <td colSpan={5} className="px-4 py-2 text-right text-xs font-medium text-ink-500">
+                    <td colSpan={6} className="px-4 py-2 text-right text-xs font-medium text-ink-500">
                       Order total
                     </td>
                     <td className="px-4 py-2 text-right font-mono font-semibold text-ink-900">
                       {formatCurrency(total)}
                     </td>
-                 {isHistory && <td colSpan={4} />}
-{isPending && <td colSpan={3} />}
+                 {isHistory && <td colSpan={5} />}
+{isPending && <td colSpan={4} />}
+{isActive && <td colSpan={anyReturned ? 4 : 1} />}
                   </tr>
                 </tfoot>
               </table>
@@ -1668,14 +2263,14 @@ function ReservationRow({
                 className="flex items-center gap-1.5 rounded-md border border-ink-200 px-3 py-1.5 text-xs font-medium text-ink-600 hover:bg-ink-50"
               >
                 <Undo2 className="h-3.5 w-3.5" />
-                Release
+                Return
               </button>
               <button
                 onClick={onConfirmPickup}
                 className="flex items-center gap-1.5 rounded-md bg-orange-500 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-orange-600"
               >
                 <Send className="h-3.5 w-3.5" />
-                Submit for Approval
+                {anyReturned ? 'Fix & Resubmit for Approval' : 'Submit for Approval'}
               </button>
             </div>
           )}
@@ -1703,13 +2298,20 @@ function ReservationRow({
 }
 
 // Builds the initial per-check entry map: every check starts "included"
-// (assumed picked up) with an empty OR number and no "AR collected" answer,
-// so the admin's default action is a full pickup — they only need to touch
-// rows for checks that are actually being left behind.
+// (assumed picked up) with no receipt type/number chosen yet and no "AR
+// collected" answer, so the admin's default action is a full pickup — they
+// only need to touch rows for checks that are actually being left behind.
 function buildInitialCheckEntries(checks) {
   const initial = {}
   checks.forEach((c) => {
-    initial[c.checkId] = { include: true, orNo: '', collected: null, remarks: '' }
+    initial[c.checkId] = {
+      include: true,
+      receiptType: '',
+      receiptNo: '',
+      collected: null,
+      attached2307: null,
+      remarks: '',
+    }
   })
   return initial
 }
@@ -1724,12 +2326,21 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
   const checkCount = checks.length
   const dialogRef = useRef(null)
   const cancelButtonRef = useRef(null)
-  const firstOrInputRef = useRef(null)
+  // Focuses the first row's receipt-TYPE dropdown on open (see the mount
+  // effect below) — the number field for that row doesn't exist until a
+  // type is picked, so the dropdown is the right thing to land focus on,
+  // not the (not-yet-rendered) number input.
+  const firstReceiptFieldRef = useRef(null)
+
+  // Whether any check in THIS submit flow was previously returned by an
+  // approver — if so we surface the reason/who/when right in the outcome
+  // table so the admin knows exactly what to fix before resubmitting.
+  const anyReturnedInModal = isSubmit && checks.some((c) => c.checkStatus === 'returned')
 
   // Per-check state for the submit flow: whether it's included in this
-  // pickup, its OR number + AR collected answer if so, and a reason
-  // (required either when AR wasn't collected, or when the check isn't
-  // included at all). Irrelevant for the release/recall flows.
+  // pickup, its receipt type + number and AR collected answer if so, its
+  // 2307 attached answer, and a reason (required only when the check
+  // isn't included at all). Irrelevant for the release/recall flows.
   const [orEntries, setOrEntries] = useState(() => buildInitialCheckEntries(checks))
 
   const updateInclude = useCallback((checkId, value) => {
@@ -1737,19 +2348,33 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
       ...prev,
       [checkId]: {
         include: value,
-        orNo: value ? prev[checkId]?.orNo || '' : '',
+        receiptType: value ? prev[checkId]?.receiptType || '' : '',
+        receiptNo: value ? prev[checkId]?.receiptNo || '' : '',
         collected: value ? prev[checkId]?.collected ?? null : null,
+        attached2307: value ? prev[checkId]?.attached2307 ?? null : null,
         remarks: '',
       },
     }))
   }, [])
 
-  const updateOrNo = useCallback((checkId, value) => {
-    setOrEntries((prev) => ({ ...prev, [checkId]: { ...prev[checkId], orNo: value } }))
+  // Changing the receipt type clears any previously entered number — a
+  // number typed while "OR" was selected shouldn't silently carry over and
+  // get treated as, say, a "CR" number just because the admin corrected a
+  // wrong type selection.
+  const updateReceiptType = useCallback((checkId, value) => {
+    setOrEntries((prev) => ({ ...prev, [checkId]: { ...prev[checkId], receiptType: value, receiptNo: '' } }))
+  }, [])
+
+  const updateReceiptNo = useCallback((checkId, value) => {
+    setOrEntries((prev) => ({ ...prev, [checkId]: { ...prev[checkId], receiptNo: value } }))
   }, [])
 
   const updateCollected = useCallback((checkId, value) => {
     setOrEntries((prev) => ({ ...prev, [checkId]: { ...prev[checkId], collected: value } }))
+  }, [])
+
+  const updateAttached2307 = useCallback((checkId, value) => {
+    setOrEntries((prev) => ({ ...prev, [checkId]: { ...prev[checkId], attached2307: value } }))
   }, [])
 
   const updateRemarks = useCallback((checkId, value) => {
@@ -1757,8 +2382,8 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
   }, [])
 
   // How many checks currently have a complete outcome, how many are
-  // included (being submitted for pickup), and whether any entered OR
-  // numbers collide.
+  // included (being submitted for pickup), and whether any composed
+  // receipt values (type + number together) collide.
   const { completedCount, duplicateOrNos, includeCount } = useMemo(() => {
     const seenCounts = {}
     let completed = 0
@@ -1768,9 +2393,10 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
       if (!entry) return
       if (entry.include) {
         included += 1
-        const orNo = entry.orNo?.trim() ?? ''
-        const reasonOk = entry.collected !== false || !!entry.remarks?.trim()
-        if (orNo && entry.collected !== null && entry.collected !== undefined && reasonOk) {
+        const orNo = composeReceiptNo(entry)
+        const hasCollectedAnswer = entry.collected !== null && entry.collected !== undefined
+        const hasAttachedAnswer = entry.attached2307 !== null && entry.attached2307 !== undefined
+        if (orNo && hasCollectedAnswer && hasAttachedAnswer) {
           completed += 1
         }
         if (orNo) {
@@ -1793,16 +2419,17 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
   const allComplete = !isSubmit || (checkCount > 0 && completedCount === checkCount && !hasDuplicates)
   const releaseCount = checkCount - includeCount
 
-  // Runs once on mount: focuses the first OR no. field (so an admin can
-  // start typing immediately) or, if there's nothing to type into, the
-  // Cancel button as a safe default. Deliberately an empty dependency
-  // array — this must NOT re-run whenever `onCancel`/`loading` change, or
-  // it steals focus back away from whatever the admin is doing every time
-  // this component re-renders for an unrelated reason.
+  // Runs once on mount: focuses the first row's receipt-type dropdown (so
+  // an admin can start choosing immediately) or, if there's nothing to
+  // interact with, the Cancel button as a safe default. Deliberately an
+  // empty dependency array — this must NOT re-run whenever
+  // `onCancel`/`loading` change, or it steals focus back away from
+  // whatever the admin is doing every time this component re-renders for
+  // an unrelated reason.
   useEffect(() => {
     const previouslyFocused = document.activeElement
-    if (isSubmit && firstOrInputRef.current) {
-      firstOrInputRef.current.focus()
+    if (isSubmit && firstReceiptFieldRef.current) {
+      firstReceiptFieldRef.current.focus()
     } else {
       cancelButtonRef.current?.focus()
     }
@@ -1861,8 +2488,8 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
     : isBulkRecall
     ? 'Recall selected submissions'
     : isBulkRelease
-    ? 'Release selected orders'
-    : 'Release reservation'
+    ? 'Return selected orders'
+    : 'Return reservation'
 
   const confirmLabel = isSubmit
     ? includeCount === 0
@@ -1875,8 +2502,8 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
     : isBulkRecall
     ? `Recall ${action.reservations.length}`
     : isBulkRelease
-    ? `Release ${action.reservations.length}`
-    : 'Release'
+    ? `Return ${action.reservations.length}`
+    : 'Return'
 
   const isSimpleList = isRelease || isRecall
 
@@ -1921,7 +2548,7 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
                   </>
                 ) : (
                   <>
-                    This releases {action.reservations.length} order
+                    This returns {action.reservations.length} order
                     {action.reservations.length === 1 ? '' : 's'} back into the available pool
                     immediately. Use this if the collectors cancelled or won't be coming.
                   </>
@@ -1949,6 +2576,13 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
                   the collector isn't taking today — you'll be asked why, and it goes straight back
                   into the available pool for someone else to reserve. Checks you submit will go to
                   an approver for verification before they're final.
+                  {anyReturnedInModal && (
+                    <>
+                      {' '}
+                      Rows highlighted below were sent back by an approver — the reason they gave is
+                      shown so you know what to fix before resubmitting.
+                    </>
+                  )}
                 </>
               ) : isRecall ? (
                 <>
@@ -1959,7 +2593,7 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
                 </>
               ) : (
                 <>
-                  This releases this order of {checkCount} check{checkCount === 1 ? '' : 's'} held for{' '}
+                  This returns this order of {checkCount} check{checkCount === 1 ? '' : 's'} held for{' '}
                   <span className="font-medium text-ink-900">{reservation.collector_name}</span> back into the
                   available pool immediately. Use this if the collector cancelled or won't be coming.
                 </>
@@ -1995,24 +2629,43 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
                   <thead className="sticky top-0 bg-ink-50">
                     <tr className="text-left uppercase tracking-wide text-ink-400">
                       <th className="px-3 py-1.5 font-medium">Pick up</th>
+                      <th className="px-3 py-1.5 font-medium">Bank</th>
                       <th className="px-3 py-1.5 font-medium">Check no.</th>
                       <th className="px-3 py-1.5 font-medium">Payee</th>
                       <th className="px-3 py-1.5 text-right font-medium">Amount</th>
-                      <th className="px-3 py-1.5 font-medium">OR no.</th>
+                      <th className="px-3 py-1.5 font-medium">Receipt</th>
                       <th className="px-3 py-1.5 font-medium">AR collected</th>
+                      <th className="px-3 py-1.5 font-medium">2307 Attached</th>
                       <th className="px-3 py-1.5 font-medium">Reason</th>
+                      {anyReturnedInModal && <th className="px-3 py-1.5 font-medium">Returned note</th>}
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-ink-50">
                     {checks.map((c, idx) => {
-                      const entry = orEntries[c.checkId] || { include: true, orNo: '', collected: null, remarks: '' }
-                      const trimmedOrNo = entry.orNo?.trim() ?? ''
-                      const isDuplicate = entry.include && trimmedOrNo && duplicateOrNos.has(trimmedOrNo.toLowerCase())
-                      const needsReason = entry.include ? entry.collected === false : true
+                      const entry =
+                        orEntries[c.checkId] || {
+                          include: true,
+                          receiptType: '',
+                          receiptNo: '',
+                          collected: null,
+                          attached2307: null,
+                          remarks: '',
+                        }
+                      const composedReceipt = composeReceiptNo(entry)
+                      const isDuplicate = entry.include && composedReceipt && duplicateOrNos.has(composedReceipt.toLowerCase())
+                      // A free-text reason is only needed when a check is being
+                      // released outright. AR collected and 2307 Attached are
+                      // plain yes/no answers with no justification required.
+                      const needsReason = !entry.include
                       const missingReason = needsReason && !entry.remarks?.trim()
                       const rowIncomplete = entry.include
-                        ? !trimmedOrNo || entry.collected === null || entry.collected === undefined || missingReason
+                        ? !composedReceipt ||
+                          entry.collected === null ||
+                          entry.collected === undefined ||
+                          entry.attached2307 === null ||
+                          entry.attached2307 === undefined
                         : missingReason
+                      const wasReturned = c.checkStatus === 'returned'
 
                       return (
                         <tr
@@ -2020,7 +2673,8 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
                           className={cn(
                             !entry.include && 'bg-slate-50/70',
                             entry.include && isDuplicate && 'bg-red-50/70',
-                            !isDuplicate && rowIncomplete && 'bg-amber-50/50'
+                            !isDuplicate && rowIncomplete && 'bg-amber-50/50',
+                            !rowIncomplete && !isDuplicate && wasReturned && 'bg-amber-50/30'
                           )}
                         >
                           <td className="px-3 py-2">
@@ -2038,6 +2692,9 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
                               {entry.include ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
                             </button>
                           </td>
+                          <td className="px-3 py-2">
+                            <BankBadge bank={c.bank} />
+                          </td>
                           <td className="px-3 py-2 font-mono text-ink-700">{c.check_no || '—'}</td>
                           <td className="max-w-[110px] truncate px-3 py-2 text-ink-900">{c.payee || '—'}</td>
                           <td className="px-3 py-2 text-right font-mono text-ink-700">
@@ -2045,26 +2702,43 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
                           </td>
                           <td className="px-2 py-1.5">
                             {entry.include ? (
-                              <>
-                                <input
-                                  ref={idx === 0 ? firstOrInputRef : undefined}
-                                  type="text"
-                                  inputMode="numeric"
-                                  value={entry.orNo}
-                                  onChange={(e) => updateOrNo(c.checkId, e.target.value)}
-                                  onBlur={(e) => updateOrNo(c.checkId, e.target.value.trim())}
-                                  placeholder="OR no."
-                                  maxLength={40}
-                                  aria-label={`OR number for check ${c.check_no || idx + 1}`}
-                                  className={cn(
-                                    'w-24 rounded border px-2 py-1 text-xs text-ink-800 focus:outline-none focus:ring-1 focus:ring-teal-500',
-                                    isDuplicate ? 'border-red-400' : 'border-ink-200'
-                                  )}
-                                />
-                                {isDuplicate && (
-                                  <p className="mt-0.5 text-[10px] leading-tight text-red-600">Duplicate</p>
+                              <div className="flex flex-col gap-1">
+                                <select
+                                  ref={idx === 0 ? firstReceiptFieldRef : undefined}
+                                  value={entry.receiptType}
+                                  onChange={(e) => updateReceiptType(c.checkId, e.target.value)}
+                                  aria-label={`Receipt type for check ${c.check_no || idx + 1}`}
+                                  className="w-20 rounded border border-ink-200 px-1.5 py-1 text-xs text-ink-800 focus:outline-none focus:ring-1 focus:ring-teal-500"
+                                >
+                                  <option value="">Type</option>
+                                  {RECEIPT_TYPES.map((rt) => (
+                                    <option key={rt} value={rt}>
+                                      {rt}
+                                    </option>
+                                  ))}
+                                </select>
+                                {entry.receiptType && (
+                                  <>
+                                    <input
+                                      type="text"
+                                      inputMode="numeric"
+                                      value={entry.receiptNo}
+                                      onChange={(e) => updateReceiptNo(c.checkId, e.target.value)}
+                                      onBlur={(e) => updateReceiptNo(c.checkId, e.target.value.trim())}
+                                      placeholder={`${entry.receiptType} no.`}
+                                      maxLength={40}
+                                      aria-label={`${entry.receiptType} number for check ${c.check_no || idx + 1}`}
+                                      className={cn(
+                                        'w-24 rounded border px-2 py-1 text-xs text-ink-800 focus:outline-none focus:ring-1 focus:ring-teal-500',
+                                        isDuplicate ? 'border-red-400' : 'border-ink-200'
+                                      )}
+                                    />
+                                    {isDuplicate && (
+                                      <p className="text-[10px] leading-tight text-red-600">Duplicate</p>
+                                    )}
+                                  </>
                                 )}
-                              </>
+                              </div>
                             ) : (
                               <span className="text-ink-300">—</span>
                             )}
@@ -2110,12 +2784,50 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
                             )}
                           </td>
                           <td className="px-2 py-1.5">
+                            {entry.include ? (
+                              <div
+                                className="flex gap-1"
+                                role="group"
+                                aria-label={`2307 Attached for check ${c.check_no || idx + 1}`}
+                              >
+                                <button
+                                  type="button"
+                                  onClick={() => updateAttached2307(c.checkId, true)}
+                                  aria-pressed={entry.attached2307 === true}
+                                  className={cn(
+                                    'rounded border px-2 py-1 text-[11px] font-medium transition',
+                                    entry.attached2307 === true
+                                      ? 'border-teal-600 bg-teal-600 text-white'
+                                      : 'border-ink-200 text-ink-500 hover:bg-ink-50'
+                                  )}
+                                >
+                                  Yes
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => updateAttached2307(c.checkId, false)}
+                                  aria-pressed={entry.attached2307 === false}
+                                  className={cn(
+                                    'rounded border px-2 py-1 text-[11px] font-medium transition',
+                                    entry.attached2307 === false
+                                      ? 'border-ink-700 bg-ink-700 text-white'
+                                      : 'border-ink-200 text-ink-500 hover:bg-ink-50'
+                                  )}
+                                >
+                                  No
+                                </button>
+                              </div>
+                            ) : (
+                              <span className="text-ink-300">—</span>
+                            )}
+                          </td>
+                          <td className="px-2 py-1.5">
                             {needsReason ? (
                               <input
                                 type="text"
                                 value={entry.remarks}
                                 onChange={(e) => updateRemarks(c.checkId, e.target.value)}
-                                placeholder={entry.include ? 'Why wasn\u2019t AR collected?' : 'Why isn\u2019t this being picked up?'}
+                                placeholder="Why isn&rsquo;t this being picked up?"
                                 maxLength={200}
                                 aria-label={`Reason for check ${c.check_no || idx + 1}`}
                                 className={cn(
@@ -2127,19 +2839,41 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
                               <span className="text-ink-300">—</span>
                             )}
                           </td>
+                          {anyReturnedInModal && (
+                            <td className="max-w-[170px] px-3 py-1.5 align-top">
+                              {wasReturned ? (
+                                <div className="text-[11px] leading-snug text-amber-700">
+                                  <div className="flex items-center gap-1 font-medium">
+                                    <RotateCcw className="h-3 w-3 shrink-0" />
+                                    Returned
+                                  </div>
+                                  <div className="mt-0.5 text-ink-600" title={c.returnReason || undefined}>
+                                    {c.returnReason || 'No reason given'}
+                                  </div>
+                                  <div className="mt-0.5 text-ink-400">
+                                    {formatDateTime(c.returnedAt)}
+                                    {c.returnedByName ? ` · ${c.returnedByName}` : ''}
+                                  </div>
+                                </div>
+                              ) : (
+                                <span className="text-ink-300">—</span>
+                              )}
+                            </td>
+                          )}
                         </tr>
                       )
                     })}
                   </tbody>
                   <tfoot>
                     <tr className="border-t border-ink-100 bg-ink-50/60">
-                      <td colSpan={3} className="px-3 py-1.5 text-right font-medium text-ink-500">
+                      <td colSpan={4} className="px-3 py-1.5 text-right font-medium text-ink-500">
                         Total
                       </td>
                       <td className="px-3 py-1.5 text-right font-mono font-semibold text-ink-900">
                         {formatCurrency(total)}
                       </td>
-                      <td colSpan={3} />
+                      <td colSpan={4} />
+                      {anyReturnedInModal && <td />}
                     </tr>
                   </tfoot>
                 </table>
@@ -2148,8 +2882,8 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
                 <p className="mt-2 flex items-center gap-1.5 text-xs text-orange-600">
                   <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
                   {hasDuplicates
-                    ? 'Each check being picked up needs its own unique OR number.'
-                    : 'Every check needs an outcome: OR number + AR collected status if picking up, or a reason if not.'}
+                    ? 'Each check being picked up needs its own unique receipt type + number.'
+                    : 'Every check needs an outcome: receipt type & number, AR collected, and 2307 Attached status if picking up, or a reason if not.'}
                 </p>
               )}
             </div>
@@ -2160,6 +2894,7 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
               <table className="w-full text-xs">
                 <thead className="sticky top-0 bg-ink-50">
                   <tr className="text-left uppercase tracking-wide text-ink-400">
+                    <th className="px-3 py-1.5 font-medium">Bank</th>
                     <th className="px-3 py-1.5 font-medium">Check no.</th>
                     <th className="px-3 py-1.5 font-medium">Payee</th>
                     <th className="px-3 py-1.5 font-medium">Payor</th>
@@ -2170,6 +2905,9 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
                 <tbody className="divide-y divide-ink-50">
                   {checks.map((c, idx) => (
                     <tr key={c.checkId ?? idx}>
+                      <td className="px-3 py-1.5">
+                        <BankBadge bank={c.bank} />
+                      </td>
                       <td className="px-3 py-1.5 font-mono text-ink-700">{c.check_no || '—'}</td>
                       <td className="max-w-[110px] truncate px-3 py-1.5 text-ink-900">{c.payee || '—'}</td>
                       <td className="max-w-[110px] truncate px-3 py-1.5 text-ink-600">{c.payor || '—'}</td>
@@ -2184,7 +2922,7 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
                 </tbody>
                 <tfoot>
                   <tr className="border-t border-ink-100 bg-ink-50/60">
-                    <td colSpan={4} className="px-3 py-1.5 text-right font-medium text-ink-500">
+                    <td colSpan={5} className="px-3 py-1.5 text-right font-medium text-ink-500">
                       Total
                     </td>
                     <td className="px-3 py-1.5 text-right font-mono font-semibold text-ink-900">

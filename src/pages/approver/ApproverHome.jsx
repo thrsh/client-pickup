@@ -2,19 +2,23 @@
 //
 // This is the other half of the submit-for-approval flow started in
 // AdminPickups.jsx. An admin submits per-check pickup data (OR no., AR
-// collected, remarks); those checks land here as 'pending_approval'. For
-// each one, an approver makes one of three decisions:
+// collected, 2307 attached, remarks); those checks land here as
+// 'pending_approval'. For each one, an approver makes one of two decisions
+// exposed in this UI:
 //   - Approve -> check is finally marked picked_up. Done.
-//   - Reject  -> check is released straight back into the general
-//                available pool. Use this when the collector isn't
-//                actually taking the check (wrong call by admin, collector
-//                backed out, etc.) — anyone can reserve it again.
 //   - Return  -> check goes back to the SAME reservation as 'reserved',
 //                landing back in the submitting admin's Active tab so they
 //                can fix a mistake (e.g. a mistyped OR number) and
 //                resubmit. It is NOT released to the pool, so nobody else
 //                can grab it out from under the original collector while
 //                the correction is made.
+//
+// NOTE: the underlying approver_decide RPC still accepts a 'reject'
+// decision (check released straight back into the general available
+// pool), but the Reject button has intentionally been removed from this
+// page's UI — Return covers the "this needs to change" case, and pool
+// release for a submitted check is no longer offered as a one-click
+// approver action here.
 //
 // Requires the approval-workflow migration (admin_submit_for_approval,
 // admin_recall_submission, approver_decide, checks.status =
@@ -58,13 +62,24 @@
 //     only for display (collector name) and for the id approver_decide
 //     needs. See buildPendingRows() and load() below. Do not reintroduce a
 //     `pickup_reservations`-first query here.
+//
+// ReviewModal notes (read before touching):
+//   - The modal is deliberately wide (max-w-6xl / xl:max-w-7xl) with a
+//     table-fixed layout and explicit column widths so it never needs
+//     horizontal scrolling at normal viewport sizes — don't reintroduce
+//     truncate-without-title cells or shrink the modal back down without
+//     re-checking that long payee/payor/check-no values still fit or are
+//     at least fully readable via the title tooltip.
+//   - The modal has a real focus trap (Tab/Shift+Tab wrap within the
+//     dialog) and restores focus to whatever triggered it on close, on
+//     top of the existing "focus cancel button on open" and "Escape to
+//     close" behavior. Keep all three if you touch this.
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   RefreshCw,
   Search,
   X,
   Check,
-  XCircle,
   RotateCcw,
   Loader2,
   AlertTriangle,
@@ -90,6 +105,7 @@ import {
   Users,
   Timer,
   Wallet,
+  Landmark,
 } from 'lucide-react'
 import { supabase } from '../../lib/supabaseClient'
 import { Input } from '../../components/ui/input'
@@ -127,6 +143,22 @@ const URGENCY_FILTER_OPTIONS = [
   { value: 'critical', label: `Waiting ${Math.round(PENDING_CRITICAL_MINUTES / 60)}h or more` },
 ]
 
+// Fallback label whenever a check's bank field is blank/null — upload
+// batches created before the `bank` column existed, or rows where the
+// uploader left it empty, will hit this. Keep it distinct from a real
+// bank name so it's obviously a data gap rather than a bank called
+// "Unspecified".
+const UNKNOWN_BANK_LABEL = 'Unspecified'
+
+// Normalizes a raw checks.bank value for display, grouping, and filtering
+// so that '', null, undefined, and whitespace-only values are all treated
+// as the same "unknown" bucket instead of silently creating near-duplicate
+// filter options (e.g. '' vs null both showing up separately).
+function normalizeBank(bank) {
+  const trimmed = typeof bank === 'string' ? bank.trim() : ''
+  return trimmed || UNKNOWN_BANK_LABEL
+}
+
 // One row per check pending approval. The query in load() below starts
 // from `checks` — the same table and status column the dashboard's
 // "Awaiting your decision" KPI reads — rather than starting from
@@ -155,9 +187,14 @@ function buildPendingRows(checks) {
       amount: c.amount,
       or_no: c.or_no,
       ar_collected: c.ar_collected,
+      attached_2307: c.attached_2307,
       remarks: c.remarks,
       submitted_by_name: c.submitted_by_name,
       submitted_at: c.submitted_at,
+      // checks.bank is NOT NULL DEFAULT '' at the schema level, so this is
+      // usually a real (if possibly empty) string rather than null/undefined
+      // — normalizeBank() below is what turns '' into a real display value.
+      bank: c.bank,
     }
   })
 }
@@ -177,7 +214,7 @@ function matchesSearch(items, term) {
   if (!term) return true
   const needle = term.toLowerCase()
   return items.some((c) =>
-    [c.payee, c.payor, c.check_no, c.collectorName, c.or_no]
+    [c.payee, c.payor, c.check_no, c.collectorName, c.or_no, c.bank]
       .filter(Boolean)
       .some((field) => String(field).toLowerCase().includes(needle))
   )
@@ -206,6 +243,55 @@ function formatMinutesDuration(mins) {
   return `${hrs}h ${rem}m`
 }
 
+// Small shared helper so every table cell in this file formats a currency
+// amount the same defensive way — a bad/missing amount renders as '—'
+// instead of throwing or showing '₱NaN'.
+function safeCurrency(amount) {
+  const n = Number(amount)
+  return Number.isFinite(n) ? formatCurrency(n) : '—'
+}
+
+// Deterministic small color set for bank badges, keyed off the bank name
+// itself (hashed) so the same bank always gets the same color across
+// renders/sessions without needing a hardcoded bank->color map that would
+// go stale the moment a new bank shows up in an upload.
+const BANK_BADGE_PALETTE = [
+  'bg-teal-100 text-teal-700',
+  'bg-blue-100 text-blue-700',
+  'bg-purple-100 text-purple-700',
+  'bg-amber-100 text-amber-700',
+  'bg-rose-100 text-rose-700',
+  'bg-indigo-100 text-indigo-700',
+  'bg-cyan-100 text-cyan-700',
+  'bg-lime-100 text-lime-700',
+]
+
+function bankBadgeClass(bank) {
+  if (bank === UNKNOWN_BANK_LABEL) return 'bg-ink-100 text-ink-500'
+  let hash = 0
+  for (let i = 0; i < bank.length; i += 1) {
+    hash = (hash * 31 + bank.charCodeAt(i)) >>> 0
+  }
+  return BANK_BADGE_PALETTE[hash % BANK_BADGE_PALETTE.length]
+}
+
+function BankBadge({ bank, className }) {
+  const label = normalizeBank(bank)
+  return (
+    <span
+      className={cn(
+        'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium',
+        bankBadgeClass(label),
+        className
+      )}
+      title={label}
+    >
+      <Landmark className="h-3 w-3 shrink-0" />
+      <span className="max-w-[110px] truncate">{label}</span>
+    </span>
+  )
+}
+
 export default function ApproverHome() {
   const { role, name, loading: profileLoading, error: profileError } = useProfile()
 
@@ -228,11 +314,12 @@ export default function ApproverHome() {
   const [now, setNow] = useState(Date.now())
 
   // Advanced filters — all optional, all compose together (AND). Options
-  // for collector/submitter are derived live from the loaded data, never
-  // hardcoded, so they always match what's actually in the queue.
+  // for collector/submitter/bank are derived live from the loaded data,
+  // never hardcoded, so they always match what's actually in the queue.
   const [showAdvancedFilters, setShowAdvancedFilters] = useState(false)
   const [collectorFilter, setCollectorFilter] = useState('all')
   const [submitterFilter, setSubmitterFilter] = useState('all')
+  const [bankFilter, setBankFilter] = useState('all')
   const [urgencyFilter, setUrgencyFilter] = useState('all') // 'all' | 'stale' | 'critical'
   const [arFilter, setArFilter] = useState('all') // 'all' | 'yes' | 'no' | 'unset'
   const [amountMin, setAmountMin] = useState('')
@@ -244,6 +331,10 @@ export default function ApproverHome() {
   const toastTimerRef = useRef(null)
   const successTimerRef = useRef(null)
   const searchInputRef = useRef(null)
+  // Whatever had focus right before the review modal opened — restored on
+  // close so keyboard/screen-reader users land back where they were
+  // instead of at the top of the page.
+  const lastFocusedElRef = useRef(null)
 
   const authorized = hasRole(role, ALLOWED_ROLES)
 
@@ -317,7 +408,7 @@ export default function ApproverHome() {
       const { data, error } = await supabase
         .from('checks')
         .select(
-          'id, status, row_number, payee, payor, check_no, check_date, amount, or_no, ar_collected, remarks, submitted_by_name, submitted_at, reservation_id, pickup_reservations(id, collector_name, status)'
+          'id, status, row_number, payee, payor, check_no, check_date, amount, or_no, ar_collected, attached_2307, remarks, submitted_by_name, submitted_at, reservation_id, bank, pickup_reservations(id, collector_name, status)'
         )
         .eq('status', 'pending_approval')
         .order('submitted_at', { ascending: true })
@@ -376,10 +467,10 @@ export default function ApproverHome() {
     return 'normal'
   }
 
-  // Options for the collector / submitter dropdowns — always derived from
-  // whatever is actually in the current pending-approval queue, so they
-  // never drift out of sync with real data and never show a stale name
-  // that no longer has anything pending.
+  // Options for the collector / submitter / bank dropdowns — always
+  // derived from whatever is actually in the current pending-approval
+  // queue, so they never drift out of sync with real data and never show
+  // a stale name that no longer has anything pending.
   const collectorOptions = useMemo(() => {
     const set = new Set(groups.map((g) => g.collectorName).filter(Boolean))
     return [...set].sort((a, b) => a.localeCompare(b))
@@ -390,20 +481,33 @@ export default function ApproverHome() {
     return [...set].sort((a, b) => a.localeCompare(b))
   }, [groups])
 
+  const bankOptions = useMemo(() => {
+    const set = new Set(groups.flatMap((g) => g.items.map((c) => normalizeBank(c.bank))))
+    // Keep "Unspecified" pinned last rather than sorted alphabetically in
+    // with real bank names — it's a data-quality bucket, not a bank.
+    return [...set].sort((a, b) => {
+      if (a === UNKNOWN_BANK_LABEL) return 1
+      if (b === UNKNOWN_BANK_LABEL) return -1
+      return a.localeCompare(b)
+    })
+  }, [groups])
+
   const activeFilterCount = useMemo(() => {
     return [
       collectorFilter !== 'all',
       submitterFilter !== 'all',
+      bankFilter !== 'all',
       arFilter !== 'all',
       urgencyFilter !== 'all',
       amountMin !== '',
       amountMax !== '',
     ].filter(Boolean).length
-  }, [collectorFilter, submitterFilter, arFilter, urgencyFilter, amountMin, amountMax])
+  }, [collectorFilter, submitterFilter, bankFilter, arFilter, urgencyFilter, amountMin, amountMax])
 
   function clearAdvancedFilters() {
     setCollectorFilter('all')
     setSubmitterFilter('all')
+    setBankFilter('all')
     setArFilter('all')
     setUrgencyFilter('all')
     setAmountMin('')
@@ -420,6 +524,7 @@ export default function ApproverHome() {
       .map((g) => {
         const items = g.items.filter((c) => {
           if (submitterFilter !== 'all' && c.submitted_by_name !== submitterFilter) return false
+          if (bankFilter !== 'all' && normalizeBank(c.bank) !== bankFilter) return false
           if (arFilter === 'yes' && c.ar_collected !== true) return false
           if (arFilter === 'no' && c.ar_collected !== false) return false
           if (arFilter === 'unset' && !(c.ar_collected === null || c.ar_collected === undefined)) return false
@@ -459,7 +564,7 @@ export default function ApproverHome() {
 
     return list
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [groups, search, sortBy, urgencyFilter, collectorFilter, submitterFilter, arFilter, amountMin, amountMax, now])
+  }, [groups, search, sortBy, urgencyFilter, collectorFilter, submitterFilter, bankFilter, arFilter, amountMin, amountMax, now])
 
   // Top-of-page KPIs — deliberately computed off the FULL `groups` dataset
   // (not `visibleGroups`), so the headline numbers always describe the
@@ -480,6 +585,7 @@ export default function ApproverHome() {
     const maxWaitMinutes = waitMinutesList.length > 0 ? Math.max(...waitMinutesList) : 0
 
     const uniqueCollectors = new Set(groups.map((g) => g.collectorName).filter(Boolean)).size
+    const uniqueBanks = new Set(allItems.map((c) => normalizeBank(c.bank))).size
     const totalValue = orderTotal(allItems)
     const avgCheckAmount = allItems.length > 0 ? totalValue / allItems.length : 0
     const arNotCollected = allItems.filter((c) => c.ar_collected === false).length
@@ -495,6 +601,7 @@ export default function ApproverHome() {
       avgWaitMinutes,
       maxWaitMinutes,
       uniqueCollectors,
+      uniqueBanks,
       arNotCollected,
       arUnrecorded,
     }
@@ -532,6 +639,7 @@ export default function ApproverHome() {
   const selectedCount = selectedCheckIds.size
 
   function openReviewForGroup(group) {
+    lastFocusedElRef.current = document.activeElement
     setActionError('')
     setSuccessFlash(null)
     setConfirmAction({ group, checks: group.items })
@@ -549,6 +657,7 @@ export default function ApproverHome() {
         byReservation.get(g.reservationId).items.push(c)
       })
     })
+    lastFocusedElRef.current = document.activeElement
     setActionError('')
     setSuccessFlash(null)
     setConfirmAction({ groups: [...byReservation.values()], bulk: true })
@@ -558,6 +667,10 @@ export default function ApproverHome() {
     clearTimeout(successTimerRef.current)
     setSuccessFlash(null)
     setConfirmAction(null)
+    // Give React a tick to unmount the dialog before restoring focus.
+    requestAnimationFrame(() => {
+      lastFocusedElRef.current?.focus?.()
+    })
   }, [])
 
   async function runDecision(decisionsByCheckId) {
@@ -573,23 +686,20 @@ export default function ApproverHome() {
       const targets = confirmAction.bulk ? confirmAction.groups : [{ reservationId: confirmAction.group.reservationId, items: confirmAction.checks }]
 
       let approvedTotal = 0
-      let rejectedTotal = 0
       let returnedTotal = 0
       const results = []
 
       for (const t of targets) {
+        // Only 'approve' and 'return' are ever produced here — the Reject
+        // button/decision was removed from this UI (see file header note).
         const p_decisions = t.items.map((c) => {
           const d = decisionsByCheckId[c.checkId]
           if (d.decision === 'approve') {
             approvedTotal += 1
             return { check_id: c.checkId, decision: 'approve' } // no remarks — nothing to explain on approval
           }
-          if (d.decision === 'return') {
-            returnedTotal += 1
-            return { check_id: c.checkId, decision: 'return', remarks: d.remarks.trim() }
-          }
-          rejectedTotal += 1
-          return { check_id: c.checkId, decision: 'reject', remarks: d.remarks.trim() }
+          returnedTotal += 1
+          return { check_id: c.checkId, decision: 'return', remarks: d.remarks.trim() }
         })
         // The RPC is SECURITY DEFINER and re-checks the caller's role /
         // auth.uid() server-side — the client-side `authorized` check above
@@ -613,7 +723,6 @@ export default function ApproverHome() {
       const parts = []
       if (approvedTotal > 0) parts.push(`${approvedTotal} approved`)
       if (returnedTotal > 0) parts.push(`${returnedTotal} returned for correction`)
-      if (rejectedTotal > 0) parts.push(`${rejectedTotal} rejected`)
       const summaryMsg = parts.length > 0 ? parts.join(', ') : 'Decisions recorded'
 
       setSuccessFlash({ message: summaryMsg })
@@ -623,6 +732,9 @@ export default function ApproverHome() {
         setSuccessFlash(null)
         setConfirmAction(null)
         setSelectedCheckIds(new Set())
+        requestAnimationFrame(() => {
+          lastFocusedElRef.current?.focus?.()
+        })
       }, SUCCESS_FLASH_MS)
 
       load(false)
@@ -639,12 +751,13 @@ export default function ApproverHome() {
   }
 
   function exportCsv() {
-    const headers = ['Collector', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount', 'OR no.', 'AR collected', 'Remarks', 'Submitted by', 'Submitted at']
+    const headers = ['Collector', 'Bank', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount', 'Receipt', 'AR collected', '2307 Attached', 'Remarks', 'Submitted by', 'Submitted at']
     const rows = [headers]
     visibleGroups.forEach((g) => {
       g.items.forEach((c) => {
         rows.push([
           g.collectorName || '',
+          normalizeBank(c.bank),
           c.check_no || '',
           c.payee || '',
           c.payor || '',
@@ -652,6 +765,7 @@ export default function ApproverHome() {
           c.amount ?? '',
           c.or_no || '',
           c.ar_collected === null || c.ar_collected === undefined ? '' : c.ar_collected ? 'Yes' : 'No',
+          c.attached_2307 === null || c.attached_2307 === undefined ? '' : c.attached_2307 ? 'Yes' : 'No',
           c.remarks || '',
           c.submitted_by_name || '',
           c.submitted_at || '',
@@ -685,6 +799,7 @@ export default function ApproverHome() {
     urgencyFilter !== 'all' ||
     collectorFilter !== 'all' ||
     submitterFilter !== 'all' ||
+    bankFilter !== 'all' ||
     arFilter !== 'all' ||
     amountMin !== '' ||
     amountMax !== ''
@@ -715,8 +830,7 @@ export default function ApproverHome() {
             <h1 className="font-display text-2xl font-semibold text-ink-900">Pending approvals</h1>
             <p className="mt-1 text-sm text-ink-400">
               {name ? `Signed in as ${name}. ` : ''}Physically verify each check against what was
-              submitted, then approve for release, return to the admin to fix a mistake, or reject
-              to send it back into the available pool.
+              submitted, then approve for release, or return it to the admin to fix a mistake.
             </p>
           </div>
         </div>
@@ -762,7 +876,7 @@ export default function ApproverHome() {
           {/* Timing & risk row — the two wait-time cards double as quick
               filters, same interaction pattern as before (click to toggle,
               click again to clear). */}
-          <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+          <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-7">
             <button onClick={() => setUrgencyFilter((f) => (f === 'stale' ? 'all' : 'stale'))} className="text-left">
               <Card
                 className={cn(
@@ -810,6 +924,7 @@ export default function ApproverHome() {
             <LedgerStatCard icon={Timer} label="Avg. wait" value={formatMinutesDuration(summary.avgWaitMinutes)} />
             <LedgerStatCard icon={Hourglass} label="Longest wait" value={formatMinutesDuration(summary.maxWaitMinutes)} />
             <LedgerStatCard icon={Users} label="Collectors" value={summary.uniqueCollectors} />
+            <LedgerStatCard icon={Landmark} label="Banks" value={summary.uniqueBanks} />
             <LedgerStatCard
               icon={ShieldAlert}
               label="AR not collected"
@@ -828,7 +943,7 @@ export default function ApproverHome() {
               ref={searchInputRef}
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search collector, check #, payee, payor, or OR no... (press /)"
+              placeholder="Search collector, bank, check #, payee, payor, or receipt... (press /)"
               className="border-ink-200 pl-9 pr-8 text-sm focus-visible:ring-teal-500"
             />
             {search && (
@@ -919,6 +1034,22 @@ export default function ApproverHome() {
               {collectorOptions.map((c) => (
                 <option key={c} value={c}>
                   {c}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label className="mb-1 block font-mono text-[11px] uppercase tracking-wide text-ink-400">Bank</label>
+            <select
+              value={bankFilter}
+              onChange={(e) => setBankFilter(e.target.value)}
+              className="w-full rounded-md border border-ink-200 bg-white px-2.5 py-1.5 text-sm text-ink-700 focus:outline-none focus:ring-1 focus:ring-teal-500"
+            >
+              <option value="all">All banks</option>
+              {bankOptions.map((b) => (
+                <option key={b} value={b}>
+                  {b}
                 </option>
               ))}
             </select>
@@ -1187,6 +1318,14 @@ function ApprovalGroupRow({
   const allSelected = items.every((c) => selectedCheckIds.has(c.checkId))
   const someSelected = items.some((c) => selectedCheckIds.has(c.checkId))
 
+  // The banks represented in this order, deduped, used for the small badge
+  // row in the group header so an approver can tell at a glance whether an
+  // order spans multiple banks without having to expand it first.
+  const distinctBanks = useMemo(() => {
+    const set = new Set(items.map((c) => normalizeBank(c.bank)))
+    return [...set]
+  }, [items])
+
   const borderClass =
     urgencyLevel === 'critical'
       ? 'border-red-300'
@@ -1218,9 +1357,13 @@ function ApprovalGroupRow({
           <div className="flex min-w-0 flex-1 items-center gap-2">
             <User className="h-4 w-4 shrink-0 text-ink-400" />
             <div className="min-w-0">
-              <span className="truncate font-display font-medium text-ink-900">{group.collectorName || 'Unknown collector'}</span>
+              <span className="truncate font-display font-medium text-ink-900" title={group.collectorName || undefined}>
+                {group.collectorName || 'Unknown collector'}
+              </span>
               {items[0]?.submitted_by_name && (
-                <p className="truncate font-mono text-xs text-ink-400">Submitted by {items[0].submitted_by_name}</p>
+                <p className="truncate font-mono text-xs text-ink-400" title={items[0].submitted_by_name}>
+                  Submitted by {items[0].submitted_by_name}
+                </p>
               )}
             </div>
           </div>
@@ -1230,6 +1373,17 @@ function ApprovalGroupRow({
               <Layers className="h-3 w-3" />
               {items.length} awaiting
             </span>
+            {distinctBanks.length <= 2 ? (
+              distinctBanks.map((b) => <BankBadge key={b} bank={b} />)
+            ) : (
+              <span
+                className="inline-flex items-center gap-1 rounded-full bg-ink-100 px-2 py-0.5 text-[11px] font-medium text-ink-500"
+                title={distinctBanks.join(', ')}
+              >
+                <Landmark className="h-3 w-3 shrink-0" />
+                {distinctBanks.length} banks
+              </span>
+            )}
             <span className="font-mono font-semibold text-ink-800">{formatCurrency(total)}</span>
             <span
               className={cn(
@@ -1252,16 +1406,18 @@ function ApprovalGroupRow({
       {expanded && (
         <>
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[640px] text-sm">
+            <table className="w-full min-w-[800px] text-sm">
               <thead>
                 <tr className="border-b border-dashed border-ink-100 text-left font-mono text-[11px] uppercase tracking-wide text-ink-400">
                   <th className="px-4 py-2 font-medium"></th>
                   <th className="px-2 py-2 font-medium">Check no.</th>
+                  <th className="px-2 py-2 font-medium">Bank</th>
                   <th className="px-2 py-2 font-medium">Payee</th>
                   <th className="px-2 py-2 font-medium">Payor</th>
                   <th className="px-4 py-2 text-right font-medium">Amount</th>
-                  <th className="px-2 py-2 font-medium">OR no.</th>
+                  <th className="px-2 py-2 font-medium">Receipt</th>
                   <th className="px-2 py-2 font-medium">AR collected</th>
+                  <th className="px-2 py-2 font-medium">2307 Attached</th>
                   <th className="px-4 py-2 font-medium">Remarks</th>
                 </tr>
               </thead>
@@ -1277,16 +1433,25 @@ function ApprovalGroupRow({
                         {selectedCheckIds.has(c.checkId) ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
                       </button>
                     </td>
-                    <td className="px-2 py-2.5 font-mono text-xs text-ink-700">
-                      <span className="flex items-center gap-1">
-                        <Hash className="h-3 w-3 text-ink-300" />
-                        {c.check_no || '—'}
-                      </span>
+                  <td className="px-4 py-3 font-mono text-xs text-ink-700">
+  <span className="flex items-start gap-1">
+    <Hash className="mt-0.5 h-3 w-3 shrink-0 text-ink-300" />
+    <span className="break-all">{c.check_no ?? '—'}</span>
+  </span>
+</td>
+                    <td className="px-2 py-2.5">
+                      <BankBadge bank={c.bank} />
                     </td>
-                    <td className="max-w-[140px] truncate px-2 py-2.5 font-medium text-ink-900">{c.payee || '—'}</td>
-                    <td className="max-w-[140px] truncate px-2 py-2.5 text-ink-600">{c.payor || '—'}</td>
-                    <td className="px-4 py-2.5 text-right font-mono font-medium text-ink-700">{formatCurrency(c.amount)}</td>
-                    <td className="px-2 py-2.5 font-mono text-xs text-ink-700">{c.or_no || '—'}</td>
+                    <td className="max-w-[140px] truncate px-2 py-2.5 font-medium text-ink-900" title={c.payee || undefined}>
+                      {c.payee || '—'}
+                    </td>
+                    <td className="max-w-[140px] truncate px-2 py-2.5 text-ink-600" title={c.payor || undefined}>
+                      {c.payor || '—'}
+                    </td>
+                    <td className="px-4 py-2.5 text-right font-mono font-medium text-ink-700">{safeCurrency(c.amount)}</td>
+                    <td className="px-2 py-2.5 font-mono text-xs text-ink-700" title={c.or_no || undefined}>
+                      {c.or_no || '—'}
+                    </td>
                     <td className="px-2 py-2.5">
                       {c.ar_collected === null || c.ar_collected === undefined ? (
                         '—'
@@ -1296,7 +1461,18 @@ function ApprovalGroupRow({
                         <span className="rounded-full bg-orange-100 px-2 py-0.5 text-[11px] font-medium text-orange-700">No</span>
                       )}
                     </td>
-                    <td className="max-w-[200px] px-4 py-2.5 text-xs text-ink-500">{c.remarks || '—'}</td>
+                    <td className="px-2 py-2.5">
+                      {c.attached_2307 === null || c.attached_2307 === undefined ? (
+                        '—'
+                      ) : c.attached_2307 ? (
+                        <span className="rounded-full bg-teal-100 px-2 py-0.5 text-[11px] font-medium text-teal-700">Yes</span>
+                      ) : (
+                        <span className="rounded-full bg-orange-100 px-2 py-0.5 text-[11px] font-medium text-orange-700">No</span>
+                      )}
+                    </td>
+                    <td className="max-w-[200px] truncate px-4 py-2.5 text-xs text-ink-500" title={c.remarks || undefined}>
+                      {c.remarks || '—'}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -1320,7 +1496,7 @@ function ApprovalGroupRow({
 // Every check starts as "approve" by default — for a queue that's usually
 // full of correctly-submitted checks, this keeps the approver's job to
 // "click through the good ones, stop and act on the bad ones" rather than
-// re-confirming every single row. Remarks only ever matter for return/reject;
+// re-confirming every single row. Remarks only ever matter for a return;
 // an approval never carries or requires an explanation.
 function buildInitialDecisions(checks) {
   const initial = {}
@@ -1329,6 +1505,11 @@ function buildInitialDecisions(checks) {
   })
   return initial
 }
+
+// Selector for anything a keyboard user could legitimately tab to inside
+// the dialog — used to build/maintain the focus trap below.
+const FOCUSABLE_SELECTOR =
+  'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
 
 function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash }) {
   const allChecks = action.bulk ? action.groups.flatMap((g) => g.items) : action.checks
@@ -1339,8 +1520,8 @@ function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash
 
   const [decisions, setDecisions] = useState(() => buildInitialDecisions(allChecks))
   // Only start nagging about a missing reason after the approver has
-  // actually tried to confirm once — flagging every return/reject row red
-  // the instant it's picked is noisy, not helpful.
+  // actually tried to confirm once — flagging every return row red the
+  // instant it's picked is noisy, not helpful.
   const [showValidation, setShowValidation] = useState(false)
 
   const updateDecision = useCallback((checkId, decision) => {
@@ -1356,9 +1537,8 @@ function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash
     setDecisions((prev) => ({ ...prev, [checkId]: { ...prev[checkId], remarks: value.slice(0, REMARKS_MAX_LEN) } }))
   }, [])
 
-  const { approveCount, rejectCount, returnCount, allComplete, firstIncompleteId } = useMemo(() => {
+  const { approveCount, returnCount, allComplete, firstIncompleteId } = useMemo(() => {
     let approve = 0
-    let reject = 0
     let ret = 0
     let complete = true
     let firstIncomplete = null
@@ -1373,16 +1553,15 @@ function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash
         approve += 1
         return // approvals never need a reason — nothing more to validate
       }
-      if (d.decision === 'reject') reject += 1
-      else ret += 1
-      // Reasons must be real text, not just whitespace, and only ever
-      // required for return/reject.
+      ret += 1
+      // Reasons must be real text, not just whitespace, and are only ever
+      // required for a return.
       if (!d.remarks?.trim()) {
         complete = false
         if (!firstIncomplete) firstIncomplete = c.checkId
       }
     })
-    return { approveCount: approve, rejectCount: reject, returnCount: ret, allComplete: complete, firstIncompleteId: firstIncomplete }
+    return { approveCount: approve, returnCount: ret, allComplete: complete, firstIncompleteId: firstIncomplete }
   }, [decisions, allChecks])
 
   useEffect(() => {
@@ -1396,7 +1575,27 @@ function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash
 
   useEffect(() => {
     function handleKeyDown(e) {
-      if (e.key === 'Escape' && !loading) onCancel()
+      if (e.key === 'Escape' && !loading) {
+        onCancel()
+        return
+      }
+      // Basic focus trap: keep Tab / Shift+Tab cycling within the dialog
+      // rather than escaping into the page behind it.
+      if (e.key === 'Tab' && dialogRef.current) {
+        const focusable = Array.from(dialogRef.current.querySelectorAll(FOCUSABLE_SELECTOR)).filter(
+          (el) => el.offsetParent !== null // skip hidden elements (e.g. inputs in collapsed rows)
+        )
+        if (focusable.length === 0) return
+        const first = focusable[0]
+        const last = focusable[focusable.length - 1]
+        if (e.shiftKey && document.activeElement === first) {
+          e.preventDefault()
+          last.focus()
+        } else if (!e.shiftKey && document.activeElement === last) {
+          e.preventDefault()
+          first.focus()
+        }
+      }
     }
     document.addEventListener('keydown', handleKeyDown)
     return () => document.removeEventListener('keydown', handleKeyDown)
@@ -1427,11 +1626,12 @@ function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash
         ref={dialogRef}
         role="dialog"
         aria-modal="true"
-        className="relative flex h-full max-h-[94vh] w-full max-w-6xl flex-col overflow-hidden rounded-xl bg-white shadow-2xl"
+        aria-labelledby="review-modal-title"
+        className="relative flex max-h-[85vh] w-full max-w-6xl flex-col overflow-hidden rounded-xl bg-white shadow-2xl xl:max-w-7xl"
       >
         <div className="flex shrink-0 items-center justify-between border-b border-dashed border-ink-100 bg-ink-50/50 px-6 py-4">
           <div>
-            <h2 className="flex items-center gap-2 font-display text-xl font-semibold text-ink-900">
+            <h2 id="review-modal-title" className="flex items-center gap-2 font-display text-xl font-semibold text-ink-900">
               <Stamp className="h-5 w-5 text-ledger-stampDark" />
               Verify and decide
             </h2>
@@ -1448,8 +1648,7 @@ function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash
           <p className="text-sm text-ink-600">
             Physically match each check against what was entered. <span className="font-medium text-ink-800">Approve</span> what
             checks out for release — no explanation needed. <span className="font-medium text-ink-800">Return</span> anything with
-            a fixable mistake back to the submitting admin, or <span className="font-medium text-ink-800">reject</span> if the
-            collector isn't actually taking it. Return and reject each require a short reason.
+            a fixable mistake back to the submitting admin for correction. A return requires a short reason.
           </p>
 
           <div className="mt-3 mb-3 flex flex-wrap items-center gap-1.5">
@@ -1457,24 +1656,35 @@ function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash
             {returnCount > 0 && (
               <span className="rounded-full bg-amber-100 px-2.5 py-1 text-xs font-medium text-amber-700">{returnCount} to return</span>
             )}
-            {rejectCount > 0 && (
-              <span className="rounded-full bg-red-100 px-2.5 py-1 text-xs font-medium text-red-700">{rejectCount} to reject</span>
-            )}
           </div>
 
           <div className="overflow-hidden rounded-lg border border-ink-100">
-            <div className="max-h-[52vh] overflow-y-auto">
-              <table className="w-full text-sm">
+            <div className="max-h-[42vh] overflow-y-auto">
+              <table className="w-full table-fixed text-sm">
+                <colgroup>
+                <col className="w-[12%]" />  {/* check no. */}
+<col className="w-[9%]" />  {/* bank */}
+<col className="w-[13%]" />  {/* payee */}
+<col className="w-[9%]" />  {/* payor */}
+                  <col className="w-[9%]" />
+                  <col className="w-[8%]" />
+                  <col className="w-[5%]" />
+                  <col className="w-[5%]" />
+                  <col className="w-[15%]" />
+                  <col className="w-[15%]" />
+                </colgroup>
                 <thead className="sticky top-0 z-10 bg-ink-50 shadow-[0_1px_0_rgba(0,0,0,0.04)]">
                   <tr className="text-left font-mono text-[11px] uppercase tracking-wide text-ink-400">
                     <th className="px-4 py-2.5 font-medium">Check no.</th>
+                    <th className="px-4 py-2.5 font-medium">Bank</th>
                     <th className="px-4 py-2.5 font-medium">Payee</th>
                     <th className="px-4 py-2.5 font-medium">Payor</th>
                     <th className="px-4 py-2.5 text-right font-medium">Amount</th>
-                    <th className="px-4 py-2.5 font-medium">OR no.</th>
+                    <th className="px-4 py-2.5 font-medium">Receipt</th>
                     <th className="px-4 py-2.5 font-medium">AR</th>
+                    <th className="px-4 py-2.5 font-medium">2307</th>
                     <th className="px-4 py-2.5 font-medium">Decision</th>
-                    <th className="px-4 py-2.5 font-medium">Reason (return / reject only)</th>
+                    <th className="px-4 py-2.5 font-medium">Reason (return only)</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-dashed divide-ink-50">
@@ -1488,23 +1698,36 @@ function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash
                         key={c.checkId ?? idx}
                         className={cn(
                           'align-top transition-colors',
-                          d.decision === 'reject' && 'bg-red-50/50',
                           d.decision === 'return' && 'bg-amber-50/50',
                           flagRow && 'bg-orange-50 ring-1 ring-inset ring-orange-300'
                         )}
                       >
-                        <td className="px-4 py-3 font-mono text-xs text-ink-700">
+                        <td className="truncate px-4 py-3 font-mono text-xs text-ink-700" title={c.check_no || undefined}>
                           <span className="flex items-center gap-1">
-                            <Hash className="h-3 w-3 text-ink-300" />
-                            {c.check_no || '—'}
+                            <Hash className="h-3 w-3 shrink-0 text-ink-300" />
+                            <span className="truncate">{c.check_no ?? '—'}</span>
                           </span>
                         </td>
-                        <td className="max-w-[160px] truncate px-4 py-3 font-medium text-ink-900">{c.payee || '—'}</td>
-                        <td className="max-w-[160px] truncate px-4 py-3 text-ink-600">{c.payor || '—'}</td>
-                        <td className="px-4 py-3 text-right font-mono text-ink-700">{formatCurrency(c.amount)}</td>
-                        <td className="px-4 py-3 font-mono text-xs text-ink-700">{c.or_no || '—'}</td>
+                        <td className="px-4 py-3">
+                          <BankBadge bank={c.bank} />
+                        </td>
+                        <td className="truncate px-4 py-3 font-medium text-ink-900" title={c.payee || undefined}>
+                          {c.payee ?? '—'}
+                        </td>
+                        <td className="truncate px-4 py-3 text-ink-600" title={c.payor || undefined}>
+                          {c.payor ?? '—'}
+                        </td>
+                        <td className="px-4 py-3 text-right font-mono text-ink-700" title={c.amount != null ? String(c.amount) : undefined}>
+                          {safeCurrency(c.amount)}
+                        </td>
+                        <td className="truncate px-4 py-3 font-mono text-xs text-ink-700" title={c.or_no || undefined}>
+                          {c.or_no ?? '—'}
+                        </td>
                         <td className="px-4 py-3">
                           {c.ar_collected === null || c.ar_collected === undefined ? '—' : c.ar_collected ? 'Yes' : 'No'}
+                        </td>
+                        <td className="px-4 py-3">
+                          {c.attached_2307 === null || c.attached_2307 === undefined ? '—' : c.attached_2307 ? 'Yes' : 'No'}
                         </td>
                         <td className="px-3 py-2.5">
                           <div className="flex gap-1.5" role="group" aria-label={`Decision for check ${c.check_no || idx + 1}`}>
@@ -1512,8 +1735,9 @@ function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash
                               type="button"
                               onClick={() => updateDecision(c.checkId, 'approve')}
                               title="Approve for release — no explanation needed"
+                              aria-pressed={d.decision === 'approve'}
                               className={cn(
-                                'flex items-center gap-1 rounded border px-2 py-1.5 text-xs font-medium transition',
+                                'flex items-center gap-1 rounded border px-2 py-1.5 text-xs font-medium transition focus:outline-none focus:ring-1 focus:ring-teal-500',
                                 d.decision === 'approve' ? 'border-teal-600 bg-teal-600 text-white' : 'border-ink-200 text-ink-500 hover:bg-ink-50'
                               )}
                             >
@@ -1524,25 +1748,14 @@ function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash
                               type="button"
                               onClick={() => updateDecision(c.checkId, 'return')}
                               title="Send back to admin for correction"
+                              aria-pressed={d.decision === 'return'}
                               className={cn(
-                                'flex items-center gap-1 rounded border px-2 py-1.5 text-xs font-medium transition',
+                                'flex items-center gap-1 rounded border px-2 py-1.5 text-xs font-medium transition focus:outline-none focus:ring-1 focus:ring-amber-500',
                                 d.decision === 'return' ? 'border-amber-600 bg-amber-600 text-white' : 'border-ink-200 text-ink-500 hover:bg-ink-50'
                               )}
                             >
                               <RotateCcw className="h-3.5 w-3.5" />
                               Return
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => updateDecision(c.checkId, 'reject')}
-                              title="Release back into the available pool"
-                              className={cn(
-                                'flex items-center gap-1 rounded border px-2 py-1.5 text-xs font-medium transition',
-                                d.decision === 'reject' ? 'border-red-600 bg-red-600 text-white' : 'border-ink-200 text-ink-500 hover:bg-ink-50'
-                              )}
-                            >
-                              <XCircle className="h-3.5 w-3.5" />
-                              Reject
                             </button>
                           </div>
                         </td>
@@ -1558,13 +1771,13 @@ function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash
                                 value={d.remarks}
                                 onChange={(e) => updateRemarks(c.checkId, e.target.value)}
                                 onBlur={(e) => updateRemarks(c.checkId, e.target.value.trim())}
-                                placeholder={d.decision === 'return' ? 'What needs fixing?' : 'Why is this being rejected?'}
+                                placeholder="What needs fixing?"
                                 maxLength={REMARKS_MAX_LEN}
                                 required
                                 aria-required="true"
                                 aria-invalid={missingReason}
                                 className={cn(
-                                  'w-56 rounded border px-2.5 py-1.5 text-sm text-ink-800 focus:outline-none focus:ring-1 focus:ring-teal-500',
+                                  'w-full rounded border px-2.5 py-1.5 text-sm text-ink-800 focus:outline-none focus:ring-1 focus:ring-teal-500',
                                   flagRow ? 'border-orange-400' : 'border-ink-200'
                                 )}
                               />
@@ -1590,9 +1803,9 @@ function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash
                 </tbody>
                 <tfoot>
                   <tr className="border-t border-ink-100 bg-ink-50/60">
-                    <td colSpan={3} className="px-4 py-2.5 text-right font-medium text-ink-500">Total</td>
+                    <td colSpan={4} className="px-4 py-2.5 text-right font-medium text-ink-500">Total</td>
                     <td className="px-4 py-2.5 text-right font-mono font-semibold text-ink-900">{formatCurrency(total)}</td>
-                    <td colSpan={4} />
+                    <td colSpan={5} />
                   </tr>
                 </tfoot>
               </table>
@@ -1602,7 +1815,7 @@ function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash
           {showValidation && !allComplete && (
             <p className="mt-2 flex items-center gap-1.5 text-xs text-orange-600">
               <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-              Enter a reason for every returned or rejected check before confirming.
+              Enter a reason for every returned check before confirming.
             </p>
           )}
 
@@ -1611,14 +1824,6 @@ function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash
               <RotateCcw className="mt-0.5 h-3.5 w-3.5 shrink-0" />
               Returned checks go back to the submitting admin's Active list — the collector's
               reservation is unaffected and nobody else can claim it while it's corrected.
-            </div>
-          )}
-
-          {rejectCount > 0 && (
-            <div className="mt-3 flex items-start gap-2 rounded-md bg-red-50 px-3 py-2 text-xs text-red-700">
-              <XCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-              Rejected checks are released immediately into the available pool for any collector
-              to reserve.
             </div>
           )}
 

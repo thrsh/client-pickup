@@ -10,6 +10,7 @@ import { useAuth } from './hooks/useAuth'
 import { ProfileProvider } from './context/ProfileContext'
 
 import PublicSearch from './pages/PublicSearch'
+import PublicSearch1 from './pages/PublicSearch1'
 import AdminLogin from './pages/AdminLogin'
 import AdminDashboard from './pages/admin/AdminDashboard'
 import AdminUpload from './pages/admin/AdminUpload'
@@ -35,6 +36,7 @@ export default function App() {
           <Navbar user={user} />
           <Routes>
             <Route path="/" element={<PublicSearch />} />
+            <Route path="/collector" element={<PublicSearch1 />} />
             <Route path="/admin/login" element={<AdminLogin />} />
 
             <Route

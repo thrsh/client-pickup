@@ -45,11 +45,14 @@ const BRAND_TEAL_RGB = [13, 148, 136]
 /* only). Those columns are generated blank (with a light highlight)  */
 /* so staff can fill them in after the physical/bank-side steps       */
 /* happen. OR No. and AR Collected come from `checks.or_no` /         */
-/* `checks.ar_collected`. Remarks (Released report only) is derived   */
-/* from `checks.status` via `remarksLabel`.                           */
-/* "Client Name" is mapped to the payee, matching the header's        */
-/* "Client Name" definition — swap `getClientName` below if you       */
-/* actually want it to mirror the payor.                              */
+/* `checks.ar_collected`, backfilled from `check_activity_log` when   */
+/* the `checks` row itself is blank (see fetchAllChecks below).       */
+/*                                                                    */
+/* "Client Name" is the PAYOR (i.e. the company/client the check      */
+/* belongs to), not the payee. `getClientName` below is the single    */
+/* source of truth for this — every report reads Client Name through  */
+/* it, so if this mapping ever needs to change it only needs to       */
+/* change in one place.                                               */
 /*                                                                    */
 /* "Date Uploaded" is `checks.created_at` — when the check record     */
 /* was entered into this system. "Aging (Days)" is how many days the  */
@@ -75,8 +78,10 @@ const BORDER_COLOR = 'FFD1D5DB'
 
 const ALL_PAYEES_LABEL = 'All Payees'
 
+// "Client Name" = the payor. Kept as a single function so every report
+// (and the preview table) reads it from one place.
 function getClientName(row) {
-  return row.payee || ''
+  return row.payor || ''
 }
 
 function statusLabel(status) {
@@ -100,7 +105,11 @@ function arCollectedLabel(value) {
   if (value === false) return 'N'
   return ''
 }
-
+function attached2307Label(value) {
+  if (value === true) return 'Y'
+  if (value === false) return 'N'
+  return ''
+}
 // Remarks auto-fills based on pickup status — the Released report is already
 // scoped to picked_up checks, so this will read "Released" for every row,
 // but it's derived from status rather than hardcoded in case that changes.
@@ -125,6 +134,21 @@ function daysBetween(startDate, endDate) {
 function formatExcelDateLabel(date) {
   if (!date) return '—'
   return date.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
+}
+
+// Today's date as a "YYYY-MM-DD" string, suitable for a <input type="date">
+// value/max attribute. Used to cap "Released date" (and to validate it on
+// submit) so nobody can generate a Released report dated in the future —
+// a check can't have been released on a day that hasn't happened yet.
+// Built from local Y/M/D parts (not toISOString, which is UTC-based and
+// can silently roll the date back/forward near midnight for the user's
+// timezone).
+function todayDateInputValue() {
+  const now = new Date()
+  const yyyy = now.getFullYear()
+  const mm = String(now.getMonth() + 1).padStart(2, '0')
+  const dd = String(now.getDate()).padStart(2, '0')
+  return `${yyyy}-${mm}-${dd}`
 }
 
 // Shared display text for the selected-payee(s) filter, used in the preview
@@ -168,18 +192,19 @@ function formatCellDisplay(cell) {
 }
 
 const REPORT_CONFIG = {
-  released: {
+released: {
     fileTag: 'released-check-report',
     title: 'RELEASED CHECK REPORT',
     statusFilter: 'picked_up',
     showReleasedDate: true,
-    amountColIndex: 5,
+    amountColIndex: 6, // Check Amount column position (1-indexed)
     legendText: 'Highlighted cells are blank in the file — fill them in manually after export.',
     columns: [
       { header: 'NO', width: 6 },
       { header: 'Check Date', width: 14 },
       { header: 'Date Uploaded', width: 14 },
       { header: 'Payee', width: 26 },
+      { header: 'Check No.', width: 16 },
       { header: 'Check Amount', width: 16 },
       { header: 'Client Name', width: 26 },
       { header: 'Status', width: 14 },
@@ -187,6 +212,7 @@ const REPORT_CONFIG = {
       { header: 'Aging (Days)', width: 12 },
       { header: 'OR No.', width: 14 },
       { header: 'AR Collected (Y/N)', width: 16 },
+      { header: '2307 Attached (Y/N)', width: 16 },
       { header: 'Remarks', width: 24 },
     ],
     buildRow: (r, no) => [
@@ -194,6 +220,7 @@ const REPORT_CONFIG = {
       { value: r.check_date ? new Date(r.check_date) : null, numFmt: 'mm/dd/yyyy', align: 'center' },
       { value: r.created_at ? new Date(r.created_at) : null, numFmt: 'mm/dd/yyyy', align: 'center' },
       { value: r.payee || '' },
+      { value: r.check_no || '', align: 'center' },
       { value: Number(r.amount || 0), numFmt: '#,##0.00', align: 'right' },
       { value: getClientName(r) },
       { value: releasedStatusLabel(r.status), align: 'center' },
@@ -201,6 +228,7 @@ const REPORT_CONFIG = {
       { value: daysBetween(r.created_at, r.picked_up_at) ?? '', align: 'center' },
       { value: r.or_no || '', align: 'center', fill: r.or_no ? undefined : MANUAL_FILL_COLOR },
       { value: arCollectedLabel(r.ar_collected), align: 'center', fill: r.ar_collected == null ? MANUAL_FILL_COLOR : undefined },
+      { value: attached2307Label(r.attached_2307), align: 'center', fill: r.attached_2307 == null ? MANUAL_FILL_COLOR : undefined },
       { value: remarksLabel(r.status) },
     ],
   },
@@ -211,20 +239,21 @@ const REPORT_CONFIG = {
   // when each of those happened. Only ever selected via
   // effectiveReportKey() when the admin checks "Include full audit
   // trail" on the Released report.
-  released_audit: {
+ released_audit: {
     fileTag: 'released-check-report-audit-trail',
     title: 'RELEASED CHECK REPORT — FULL AUDIT TRAIL',
     statusFilter: 'picked_up',
     showReleasedDate: true,
-    amountColIndex: 7,
+    amountColIndex: 8, // Check Amount column position (1-indexed)
     legendText:
       'Highlighted cells indicate missing audit data — the step may not have happened yet, or the record predates this tracking.',
     columns: [
       { header: 'NO', width: 6 },
       { header: 'Check Date', width: 14 },
       { header: 'Date Uploaded', width: 14 },
-      { header: 'Uploaded By', width: 18 },
+      { header: 'Uploaded By', width: 20 },
       { header: 'Payee', width: 24 },
+      { header: 'Check No.', width: 16 },
       { header: 'Payor', width: 22 },
       { header: 'Check Amount', width: 16 },
       { header: 'Client Name', width: 24 },
@@ -239,6 +268,7 @@ const REPORT_CONFIG = {
       { header: 'Aging (Days)', width: 12 },
       { header: 'OR No.', width: 14 },
       { header: 'AR Collected (Y/N)', width: 16 },
+      { header: '2307 Attached (Y/N)', width: 16 },
       { header: 'Remarks', width: 22 },
     ],
     buildRow: (r, no) => [
@@ -246,11 +276,12 @@ const REPORT_CONFIG = {
       { value: r.check_date ? new Date(r.check_date) : null, numFmt: 'mm/dd/yyyy', align: 'center' },
       { value: r.created_at ? new Date(r.created_at) : null, numFmt: 'mm/dd/yyyy', align: 'center' },
       {
-        value: r.upload_batches?.uploaded_by || '',
+        value: r.uploadedByName || '',
         align: 'center',
-        fill: r.upload_batches?.uploaded_by ? undefined : MANUAL_FILL_COLOR,
+        fill: r.uploadedByName ? undefined : MANUAL_FILL_COLOR,
       },
       { value: r.payee || '' },
+      { value: r.check_no || '', align: 'center' },
       { value: r.payor || '' },
       { value: Number(r.amount || 0), numFmt: '#,##0.00', align: 'right' },
       { value: getClientName(r) },
@@ -288,13 +319,23 @@ const REPORT_CONFIG = {
         align: 'center',
         fill: r.approved_at ? undefined : MANUAL_FILL_COLOR,
       },
-      { value: r.picked_up_at ? new Date(r.picked_up_at) : null, numFmt: 'mm/dd/yyyy', align: 'center' },
+      {
+        value: r.picked_up_at ? new Date(r.picked_up_at) : null,
+        numFmt: 'mm/dd/yyyy',
+        align: 'center',
+        fill: r.picked_up_at ? undefined : MANUAL_FILL_COLOR,
+      },
       { value: daysBetween(r.created_at, r.picked_up_at) ?? '', align: 'center' },
       { value: r.or_no || '', align: 'center', fill: r.or_no ? undefined : MANUAL_FILL_COLOR },
       {
         value: arCollectedLabel(r.ar_collected),
         align: 'center',
         fill: r.ar_collected == null ? MANUAL_FILL_COLOR : undefined,
+      },
+      {
+        value: attached2307Label(r.attached_2307),
+        align: 'center',
+        fill: r.attached_2307 == null ? MANUAL_FILL_COLOR : undefined,
       },
       { value: remarksLabel(r.status) },
     ],
@@ -350,7 +391,7 @@ const REPORT_CONFIG = {
       { header: 'Status', width: 14 },
       { header: 'Date Released', width: 14 },
       { header: 'Aging (Days)', width: 12 },
-      { header: 'OR No.', width: 14 },
+      { header: 'Receipt', width: 14 },
       { header: 'AR Collected (Y/N)', width: 16 },
     ],
     buildRow: (r, no) => [
@@ -751,7 +792,7 @@ export default function AdminReports() {
       let req = supabase
         .from('checks')
         .select(
-          'id, check_no, check_date, payee, payor, amount, status, picked_up_by, picked_up_at, created_at, or_no, ar_collected, collector_name, submitted_by_name, submitted_at, approved_by_name, approved_at, reservation_id, pickup_reservations(reserved_at), upload_batches(uploaded_by)'
+          'id, check_no, check_date, payee, payor, amount, status, picked_up_by, picked_up_at, created_at, or_no, ar_collected, attached_2307, collector_name, submitted_by_name, submitted_at, approved_by_name, approved_at, reservation_id, pickup_reservations(reserved_at, collector_name), upload_batches(uploaded_by)'
         )
         .order('check_date', { ascending: true })
         .range(from, from + PAGE - 1)
@@ -770,7 +811,103 @@ export default function AdminReports() {
       from += PAGE
     }
 
-    return all
+    // upload_batches.uploaded_by is a raw auth.users id — never show a raw
+    // uuid in a report. Resolve it to a human-readable name via `profiles`
+    // in one batched lookup. NOTE: `profiles` only has `id, full_name,
+    // role, created_at` — there is no `email` column on that table, so we
+    // must not select one (Postgrest errors on unknown columns, which
+    // silently killed this whole lookup before). Falls back to blank
+    // (manual-fill highlighted) if no profile / no full_name is on file.
+    const uploaderIds = [...new Set(all.map((r) => r.upload_batches?.uploaded_by).filter(Boolean))]
+    let uploaderNameById = new Map()
+    if (uploaderIds.length > 0) {
+      const { data: profileRows, error: profileError } = await supabase
+        .from('profiles')
+        .select('id, full_name')
+        .in('id', uploaderIds)
+      if (!profileError) {
+        uploaderNameById = new Map((profileRows || []).map((p) => [p.id, p.full_name || '']))
+      }
+    }
+
+    // Backfill Submitted/Approved/Released info — AND, crucially, the
+    // OR No. / AR Collected / 2307 Attached values — from
+    // `check_activity_log` whenever the denormalized columns on `checks`
+    // itself are blank. `checks.or_no`, `ar_collected`, and
+    // `attached_2307` (along with submitted_at/approved_at/picked_up_at
+    // and the *_by_name columns) are only reliably populated for some
+    // rows — the authoritative, always-written record of "who did what,
+    // when, with what OR/AR/2307 values" is the activity log (action =
+    // 'submitted_for_approval' | 'approved' | 'released' | 'picked_up',
+    // each with its own performed_at). The OR No. / AR Collected / 2307
+    // Attached values are recorded on the log row at release time
+    // ('released' or 'picked_up' action), same as when the check was
+    // actually released. We look these up in batches (Postgrest `.in()`
+    // can choke on very large id lists) and use the log only where the
+    // checks-table value is missing, so this never overrides a value
+    // that was already correctly set on the check itself.
+    const checkIds = all.map((r) => r.id)
+    const activityByCheckId = new Map()
+    const LOG_BATCH = 200
+    for (let i = 0; i < checkIds.length; i += LOG_BATCH) {
+      const batchIds = checkIds.slice(i, i + LOG_BATCH)
+      if (batchIds.length === 0) continue
+      const { data: logRows, error: logError } = await supabase
+        .from('check_activity_log')
+        .select(
+          'check_id, action, performed_at, submitted_by_name, approved_by_name, or_no, ar_collected, attached_2307'
+        )
+        .in('check_id', batchIds)
+        .in('action', ['submitted_for_approval', 'approved', 'released', 'picked_up'])
+        .order('performed_at', { ascending: true })
+      if (logError) continue
+      for (const log of logRows || []) {
+        const entry = activityByCheckId.get(log.check_id) || {}
+        // Ascending order + Map overwrite means the latest occurrence of
+        // each action wins, in case a check was ever resubmitted/re-approved.
+        if (log.action === 'submitted_for_approval') {
+          entry.submittedAt = log.performed_at
+          entry.submittedByName = log.submitted_by_name || entry.submittedByName
+        } else if (log.action === 'approved') {
+          entry.approvedAt = log.performed_at
+          entry.approvedByName = log.approved_by_name || entry.approvedByName
+        } else if (log.action === 'released' || log.action === 'picked_up') {
+          entry.releasedAt = log.performed_at
+          // OR No. / AR Collected / 2307 Attached are recorded on the
+          // release-time log entry. Only overwrite if this log row
+          // actually carries a value, so an earlier 'picked_up' entry
+          // with data isn't clobbered by a later 'released' entry that
+          // happens to be blank.
+          if (log.or_no) entry.orNo = log.or_no
+          if (log.ar_collected != null) entry.arCollected = log.ar_collected
+          if (log.attached_2307 != null) entry.attached2307 = log.attached_2307
+        }
+        activityByCheckId.set(log.check_id, entry)
+      }
+    }
+
+    return all.map((r) => {
+      const activity = activityByCheckId.get(r.id) || {}
+      return {
+        ...r,
+        collector_name: r.collector_name || r.pickup_reservations?.collector_name || '',
+        uploadedByName: uploaderNameById.get(r.upload_batches?.uploaded_by) || '',
+        submitted_at: r.submitted_at || activity.submittedAt || null,
+        submitted_by_name: r.submitted_by_name || activity.submittedByName || '',
+        approved_at: r.approved_at || activity.approvedAt || null,
+        approved_by_name: r.approved_by_name || activity.approvedByName || '',
+        picked_up_at: r.picked_up_at || activity.releasedAt || null,
+        // Backfill OR No. / AR Collected / 2307 Attached from the
+        // activity log when the checks row itself is blank. ar_collected
+        // and attached_2307 are nullable booleans where `false` is a
+        // meaningful, valid value — so this uses an explicit `!= null`
+        // check rather than `||`, which would incorrectly treat a
+        // correctly-recorded `false` as "missing" and overwrite it.
+        or_no: r.or_no || activity.orNo || '',
+        ar_collected: r.ar_collected != null ? r.ar_collected : (activity.arCollected != null ? activity.arCollected : null),
+        attached_2307: r.attached_2307 != null ? r.attached_2307 : (activity.attached2307 != null ? activity.attached2307 : null),
+      }
+    })
   }
 
   function validateForm() {
@@ -780,8 +917,15 @@ export default function AdminReports() {
     if (!reportPayeeAll && reportPayees.length === 0) {
       return `Please select at least one payee, or choose "${ALL_PAYEES_LABEL}".`
     }
-    if (REPORT_CONFIG[effectiveReportKey(reportType, includeAuditTrail)].showReleasedDate && !releasedDate) {
-      return 'Please select a released date.'
+    if (REPORT_CONFIG[effectiveReportKey(reportType, includeAuditTrail)].showReleasedDate) {
+      if (!releasedDate) {
+        return 'Please select a released date.'
+      }
+      // A check can't have been released on a day that hasn't happened
+      // yet, so the released date can never be later than today.
+      if (releasedDate > todayDateInputValue()) {
+        return 'Released date cannot be in the future.'
+      }
     }
     if (reportDateFrom && reportDateTo && reportDateFrom > reportDateTo) {
       return 'The "from" date must be before the "to" date.'
@@ -886,7 +1030,8 @@ export default function AdminReports() {
   // outputs can't drift apart.
   function buildHeaderLines(configKey, { payeeDisplay, payor, releasedDateValue, dateFrom, dateTo }) {
     const config = REPORT_CONFIG[configKey]
-    const lines = [{ text: `Client Name: ${payeeDisplay || '—'}`, size: 11, bold: true }]
+    const lines = [{ text: `Client Name: ${payor || '—'}`, size: 11, bold: true }]
+    lines.push({ text: `Payee: ${payeeDisplay || '—'}`, size: 10 })
     lines.push({ text: `Report Date: ${formatExcelDateLabel(new Date())}`, size: 10 })
     if (dateFrom || dateTo) {
       const fromLabel = dateFrom ? formatExcelDateLabel(new Date(dateFrom)) : '—'
@@ -925,7 +1070,7 @@ export default function AdminReports() {
     addHeaderRow(sheet, r, colCount, config.title, { bold: true, size: 13, color: HEADER_FILL_COLOR })
     r++
 
-    // Remaining header lines (Client Name, Report Date, Date Range, Released Date)
+    // Remaining header lines (Client Name, Payee, Report Date, Date Range, Released Date)
     for (const line of buildHeaderLines(configKey, { payeeDisplay, payor, releasedDateValue, dateFrom, dateTo })) {
       addHeaderRow(sheet, r, colCount, line.text, { bold: line.bold, size: line.size })
       r++
@@ -1241,7 +1386,12 @@ export default function AdminReports() {
               {REPORT_CONFIG[effectiveReportKey(reportType, includeAuditTrail)].showReleasedDate && (
                 <div>
                   <label className="mb-1 block text-xs font-medium text-gray-500">Released date</label>
-                  <Input type="date" value={releasedDate} onChange={(e) => setReleasedDate(e.target.value)} />
+                  <Input
+                    type="date"
+                    value={releasedDate}
+                    max={todayDateInputValue()}
+                    onChange={(e) => setReleasedDate(e.target.value)}
+                  />
                 </div>
               )}
             </div>
@@ -1337,7 +1487,7 @@ export default function AdminReports() {
                   )}
                 </CardTitle>
                 <CardDescription>
-                  Payor: <span className="font-medium text-gray-700">{previewMeta.payor}</span>
+                  Client Name (Payor): <span className="font-medium text-gray-700">{previewMeta.payor}</span>
                   {' · '}Payee(s):{' '}
                   <span className="font-medium text-gray-700">
                     {formatPayeeDisplay(previewMeta.payeeAll, previewMeta.payees)}

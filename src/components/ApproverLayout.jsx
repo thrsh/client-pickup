@@ -15,7 +15,7 @@ const links = [
 
 export default function ApproverLayout() {
   return (
-    <div className="mx-auto flex max-w-7xl gap-8 px-4 py-8 sm:px-6 lg:px-8">
+    <div className="flex w-full gap-8 px-4 py-8 sm:px-6 lg:px-8 xl:px-10">
       {/* Desktop Sidebar */}
       <aside className="hidden w-56 shrink-0 md:block">
         <nav className="sticky top-28 flex flex-col gap-1.5">

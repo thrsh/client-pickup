@@ -21,6 +21,7 @@ import {
   Wallet,
   Layers,
   X,
+  Landmark,
 } from 'lucide-react'
 import { supabase } from '../../lib/supabaseClient'
 import { Button } from '../../components/ui/button'
@@ -36,6 +37,25 @@ const REQUIRED_FIELDS = [
   { key: 'check_date', label: 'Check Date' },
   { key: 'amount', label: 'Amount' },
 ]
+
+// Default bank list — extend/edit as needed, or swap this for a Supabase
+// lookup (e.g. a `banks` table) later without touching anything else,
+// since every consumer below reads from `bankValue`/`bankValid` only.
+const BANKS = [
+  'BDO Unibank',
+  'Bank of the Philippine Islands (BPI)',
+  'Metrobank',
+  'Land Bank of the Philippines',
+  'Philippine National Bank (PNB)',
+  'China Banking Corporation (Chinabank)',
+  'Rizal Commercial Banking Corporation (RCBC)',
+  'Security Bank',
+  'UnionBank of the Philippines',
+  'EastWest Bank',
+  'Philippine Savings Bank (PSBank)',
+]
+const OTHER_BANK_VALUE = '__other__'
+const MAX_CUSTOM_BANK_LENGTH = 100
 
 const ACCEPTED_EXTENSIONS = ['.csv', '.xlsx', '.xls']
 // Browsers report CSV/Excel MIME types inconsistently (many omit it
@@ -167,15 +187,22 @@ function downloadTemplate() {
 function downloadFlaggedRows(rows, fileNameBase) {
   if (rows.length === 0) return
   const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`
-  const header = 'Row,Payee,Payor,Check No,Check Date,Amount,Issues'
+  const header = 'Row,Bank,Payee,Payor,Check No,Check Date,Amount,Issues'
   const lines = rows.map((r) => {
     const issues = Object.entries(FLAG_LABELS)
       .filter(([key]) => r.flags[key])
       .map(([, label]) => label)
       .join('; ')
-    return [r.rowNumber, esc(r.payee), esc(r.payor), esc(r.check_no), esc(r.check_date || ''), r.amount, esc(issues)].join(
-      ',',
-    )
+    return [
+      r.rowNumber,
+      esc(r.bank),
+      esc(r.payee),
+      esc(r.payor),
+      esc(r.check_no),
+      esc(r.check_date || ''),
+      r.amount,
+      esc(issues),
+    ].join(',')
   })
   const csv = [header, ...lines].join('\n')
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
@@ -201,7 +228,14 @@ export default function AdminUpload() {
   const [parseError, setParseError] = useState('')
   const [isDragging, setIsDragging] = useState(false)
   const [importedCount, setImportedCount] = useState(null) // set once import succeeds
+  const [importedBank, setImportedBank] = useState('') // snapshot for the success screen
   const [showAllRows, setShowAllRows] = useState(false)
+
+  // Which bank this file's checks belong to. Selected up front and required
+  // before a file can even be chosen, so every row that ever enters the
+  // pipeline is guaranteed to carry a valid, non-empty bank.
+  const [selectedBank, setSelectedBank] = useState('')
+  const [customBank, setCustomBank] = useState('')
 
   // Advanced preview controls
   const [excludedRows, setExcludedRows] = useState(() => new Set()) // indices (into rawRows) excluded from import
@@ -220,14 +254,24 @@ export default function AdminUpload() {
   const hasFile = headers.length > 0
   const mappingComplete = REQUIRED_FIELDS.every(({ key }) => mapping[key])
 
+  // Resolves the dropdown + free-text "Other" combo down to a single,
+  // trimmed bank name every other piece of state can depend on.
+  const bankValue = useMemo(() => {
+    if (!selectedBank) return ''
+    if (selectedBank === OTHER_BANK_VALUE) return normalizeText(customBank)
+    return selectedBank
+  }, [selectedBank, customBank])
+  const bankValid = bankValue.length > 0
+
   // ---- Normalization + validation pipeline --------------------------------
   // Every row is normalized once here (trimmed text, parsed currency,
-  // standardized dates) and tagged with every applicable validation flag.
-  // Everything downstream — the KPI cards, the preview table, the CSV
-  // export, and the actual import — reads from this single source of truth
-  // so normalization can never drift between what's shown and what's saved.
+  // standardized dates, and the selected bank) and tagged with every
+  // applicable validation flag. Everything downstream — the KPI cards, the
+  // preview table, the CSV export, and the actual import — reads from this
+  // single source of truth so normalization can never drift between what's
+  // shown and what's saved.
   const normalizedRows = useMemo(() => {
-    if (!mappingComplete || rawRows.length === 0) return []
+    if (!mappingComplete || !bankValid || rawRows.length === 0) return []
 
     const payeeIdx = headers.indexOf(mapping.payee)
     const payorIdx = headers.indexOf(mapping.payor)
@@ -240,6 +284,7 @@ export default function AdminUpload() {
       return {
         index: i,
         rowNumber: i + 2, // +2 accounts for the header row occupying row 1
+        bank: bankValue,
         payee: normalizeText(row[payeeIdx]),
         payor: normalizeText(row[payorIdx]),
         check_no: normalizeCheckNo(row[checkNoIdx]),
@@ -273,8 +318,7 @@ export default function AdminUpload() {
       const hasIssue = Object.values(flags).some(Boolean)
       return { ...r, flags, hasIssue }
     })
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mappingComplete, rawRows, headers, mapping])
+  }, [mappingComplete, bankValid, bankValue, rawRows, headers, mapping])
 
   // Looks up mapped check numbers against the database. Debounced and
   // best-effort: if it fails or is still running, the import flow is never
@@ -395,16 +439,29 @@ export default function AdminUpload() {
     setParseError('')
     setImportProgress(0)
     setImportedCount(null)
+    setImportedBank('')
     setShowAllRows(false)
     setExcludedRows(new Set())
     setPreviewSearch('')
     setShowFlaggedOnly(false)
     setExistingCheckNos(new Set())
+    // Deliberately NOT resetting selectedBank/customBank — admins commonly
+    // upload several files from the same bank back to back, so the choice
+    // persists until they explicitly change it.
     if (inputRef.current) inputRef.current.value = ''
   }
 
   function processFile(file) {
     if (!file) return
+
+    if (!bankValid) {
+      push({
+        variant: 'error',
+        title: 'Select a bank first',
+        description: 'Choose which bank this file is coming from before uploading.',
+      })
+      return
+    }
 
     const validationError = validateFile(file)
     if (validationError) {
@@ -414,6 +471,7 @@ export default function AdminUpload() {
 
     setParseError('')
     setImportedCount(null)
+    setImportedBank('')
     setShowAllRows(false)
     setExcludedRows(new Set())
     setPreviewSearch('')
@@ -490,6 +548,14 @@ export default function AdminUpload() {
   function handleDrop(e) {
     e.preventDefault()
     setIsDragging(false)
+    if (!bankValid) {
+      push({
+        variant: 'error',
+        title: 'Select a bank first',
+        description: 'Choose which bank this file is coming from before uploading.',
+      })
+      return
+    }
     if (e.dataTransfer.files?.length > 1) {
       push({
         variant: 'error',
@@ -498,6 +564,12 @@ export default function AdminUpload() {
       })
     }
     processFile(e.dataTransfer.files?.[0])
+  }
+
+  function handleBankSelectChange(e) {
+    const value = e.target.value
+    setSelectedBank(value)
+    if (value !== OTHER_BANK_VALUE) setCustomBank('')
   }
 
   function toggleRowExcluded(index) {
@@ -524,7 +596,7 @@ export default function AdminUpload() {
   }
 
   async function handleImport() {
-    if (!mappingComplete || saving) return
+    if (!mappingComplete || !bankValid || saving) return
 
     const includedRows = enrichedRows.filter((r) => !excludedRows.has(r.index))
     if (includedRows.length === 0) {
@@ -539,10 +611,12 @@ export default function AdminUpload() {
     setSaving(true)
     setImportProgress(0)
 
-    // Rows already carry their normalized values from the pipeline above,
-    // so the saved data always matches exactly what the preview showed.
+    // Rows already carry their normalized values (including bank) from the
+    // pipeline above, so the saved data always matches exactly what the
+    // preview showed.
     const preparedRows = includedRows.map((r) => ({
       row_number: r.rowNumber,
+      bank: r.bank,
       payee: r.payee,
       payor: r.payor,
       check_no: r.check_no,
@@ -557,7 +631,12 @@ export default function AdminUpload() {
 
       const { data: batch, error: batchError } = await supabase
         .from('upload_batches')
-        .insert({ file_name: fileName, total_rows: preparedRows.length, uploaded_by: user?.id })
+        .insert({
+          file_name: fileName,
+          bank: bankValue,
+          total_rows: preparedRows.length,
+          uploaded_by: user?.id,
+        })
         .select()
         .single()
 
@@ -584,9 +663,10 @@ export default function AdminUpload() {
         title: 'Import complete',
         description:
           excludedRows.size > 0
-            ? `${toInsert.length} checks added from ${fileName} (${excludedRows.size} excluded).`
-            : `${toInsert.length} checks added from ${fileName}.`,
+            ? `${toInsert.length} ${bankValue} checks added from ${fileName} (${excludedRows.size} excluded).`
+            : `${toInsert.length} ${bankValue} checks added from ${fileName}.`,
       })
+      setImportedBank(bankValue)
       setImportedCount(toInsert.length)
     } catch (err) {
       push({
@@ -599,18 +679,20 @@ export default function AdminUpload() {
     }
   }
 
+  const currentStep = importedCount !== null ? 4 : hasFile ? 3 : bankValid ? 2 : 1
+
   return (
     <div>
       <div className="mb-6">
         <h1 className="font-display text-2xl font-semibold text-ink-900">Upload a file</h1>
         <p className="mt-1 text-sm text-ink-400">
-          Import a CSV or Excel file (up to {formatFileSize(MAX_FILE_SIZE_BYTES)}, {MAX_ROWS.toLocaleString()} rows
-          max) with Payee, Payor, Check No, Check Date, and Amount columns. Each row's position in the file is
-          stored automatically for cross-reference.
+          Select the source bank, then import a CSV or Excel file (up to {formatFileSize(MAX_FILE_SIZE_BYTES)},{' '}
+          {MAX_ROWS.toLocaleString()} rows max) with Payee, Payor, Check No, Check Date, and Amount columns. Each
+          row's position in the file is stored automatically for cross-reference.
         </p>
       </div>
 
-      <StepTracker step={importedCount !== null ? 3 : hasFile ? 2 : 1} />
+      <StepTracker step={currentStep} />
 
       <Card className="mt-4">
         <CardContent className="p-6">
@@ -618,22 +700,82 @@ export default function AdminUpload() {
             <ImportedState
               count={importedCount}
               fileName={fileName}
+              bank={importedBank}
               onUploadAnother={resetFileState}
             />
           ) : (
             <>
+              <div className="mb-6">
+                <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-ink-500">
+                  <Landmark className="h-3.5 w-3.5 text-teal-500" />
+                  Bank <span className="text-red-500">*</span>
+                </label>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Select
+                    value={selectedBank}
+                    onChange={handleBankSelectChange}
+                    disabled={saving}
+                    className={cn('max-w-xs', !bankValid && 'ring-1 ring-orange-400/60')}
+                  >
+                    <option value="">— Select bank —</option>
+                    {BANKS.map((b) => (
+                      <option key={b} value={b}>
+                        {b}
+                      </option>
+                    ))}
+                    <option value={OTHER_BANK_VALUE}>Other (type manually)</option>
+                  </Select>
+                  {selectedBank === OTHER_BANK_VALUE && (
+                    <input
+                      type="text"
+                      value={customBank}
+                      onChange={(e) => setCustomBank(e.target.value.slice(0, MAX_CUSTOM_BANK_LENGTH))}
+                      disabled={saving}
+                      placeholder="Enter bank name"
+                      maxLength={MAX_CUSTOM_BANK_LENGTH}
+                      className="w-56 rounded-md border border-ink-200 px-3 py-1.5 text-sm text-ink-800 focus:outline-none focus:ring-1 focus:ring-teal-400"
+                    />
+                  )}
+                </div>
+                {!bankValid ? (
+                  <p className="mt-1.5 flex items-center gap-1.5 text-xs font-medium text-orange-600">
+                    <AlertTriangle className="h-3.5 w-3.5" />
+                    Select which bank this file is coming from before uploading.
+                  </p>
+                ) : (
+                  hasFile && (
+                    <p className="mt-1.5 text-xs text-ink-400">
+                      All {rawRows.length.toLocaleString()} rows will be tagged as{' '}
+                      <span className="font-medium text-ink-600">{bankValue}</span>.
+                    </p>
+                  )
+                )}
+              </div>
+
               {!hasFile ? (
                 <>
                   <label
                     htmlFor="file-upload"
                     onDragOver={(e) => {
                       e.preventDefault()
-                      setIsDragging(true)
+                      if (bankValid) setIsDragging(true)
                     }}
                     onDragLeave={() => setIsDragging(false)}
                     onDrop={handleDrop}
+                    onClick={(e) => {
+                      if (!bankValid) {
+                        e.preventDefault()
+                        push({
+                          variant: 'error',
+                          title: 'Select a bank first',
+                          description: 'Choose which bank this file is coming from before uploading.',
+                        })
+                      }
+                    }}
                     className={cn(
-                      'flex cursor-pointer flex-col items-center gap-2 rounded-lg border-2 border-dashed py-12 text-center transition',
+                      'flex flex-col items-center gap-2 rounded-lg border-2 border-dashed py-12 text-center transition',
+                      !bankValid && 'cursor-not-allowed opacity-60',
+                      bankValid && 'cursor-pointer',
                       isDragging
                         ? 'border-teal-500 bg-teal-50'
                         : 'border-ink-200 hover:border-teal-400/60 hover:bg-teal-50/40'
@@ -660,6 +802,7 @@ export default function AdminUpload() {
                       type="file"
                       accept={ACCEPTED_EXTENSIONS.join(',')}
                       onChange={handleFile}
+                      disabled={!bankValid}
                       className="hidden"
                     />
                   </label>
@@ -685,7 +828,8 @@ export default function AdminUpload() {
                       <p className="truncate text-sm font-medium text-ink-800">{fileName}</p>
                       <p className="font-mono text-xs text-ink-400">
                         {formatFileSize(fileSize)} / {formatFileSize(MAX_FILE_SIZE_BYTES)} ·{' '}
-                        {rawRows.length.toLocaleString()} / {MAX_ROWS.toLocaleString()} rows
+                        {rawRows.length.toLocaleString()} / {MAX_ROWS.toLocaleString()} rows ·{' '}
+                        <span className="text-teal-700">{bankValue}</span>
                       </p>
                     </div>
                   </div>
@@ -897,6 +1041,7 @@ export default function AdminUpload() {
                         <tr>
                           <th className="px-3 py-2 font-medium">Include</th>
                           <th className="px-3 py-2 font-medium">Row</th>
+                          <th className="px-3 py-2 font-medium">Bank</th>
                           {REQUIRED_FIELDS.map(({ key, label }) => (
                             <th key={key} className="px-3 py-2 font-medium">
                               {label}
@@ -931,6 +1076,7 @@ export default function AdminUpload() {
                                 </button>
                               </td>
                               <td className="px-3 py-2 font-mono text-ink-300">{r.rowNumber}</td>
+                              <td className="px-3 py-2 text-ink-700">{r.bank}</td>
                               <td
                                 className={cn(
                                   'px-3 py-2',
@@ -1045,7 +1191,7 @@ export default function AdminUpload() {
                         })}
                         {previewRows.length === 0 && (
                           <tr>
-                            <td colSpan={7} className="px-3 py-8 text-center text-ink-300">
+                            <td colSpan={8} className="px-3 py-8 text-center text-ink-300">
                               No rows match your search or filter.
                             </td>
                           </tr>
@@ -1107,7 +1253,7 @@ export default function AdminUpload() {
 
                   <Button
                     onClick={handleImport}
-                    disabled={!mappingComplete || saving || (stats && stats.included === 0)}
+                    disabled={!mappingComplete || !bankValid || saving || (stats && stats.included === 0)}
                     className="mt-5 bg-orange-500 text-white hover:bg-orange-600 focus-visible:ring-orange-400 disabled:bg-ink-200 disabled:text-ink-400"
                   >
                     {saving ? (
@@ -1181,9 +1327,10 @@ function KpiCard({ icon: Icon, label, value, secondary, accent = 'teal' }) {
 
 function StepTracker({ step }) {
   const steps = [
-    { n: 1, label: 'Upload file' },
-    { n: 2, label: 'Map columns' },
-    { n: 3, label: 'Imported' },
+    { n: 1, label: 'Select bank' },
+    { n: 2, label: 'Upload file' },
+    { n: 3, label: 'Map columns' },
+    { n: 4, label: 'Imported' },
   ]
   const percent = ((step - 1) / (steps.length - 1)) * 100
 
@@ -1238,7 +1385,7 @@ function StepTracker({ step }) {
   )
 }
 
-function ImportedState({ count, fileName, onUploadAnother }) {
+function ImportedState({ count, fileName, bank, onUploadAnother }) {
   return (
     <div className="flex flex-col items-center py-10 text-center">
       <span className="stamp-pop flex h-16 w-16 rotate-[-8deg] items-center justify-center rounded-full border-2 border-dashed border-teal-500 bg-teal-50 text-orange-500">
@@ -1248,8 +1395,14 @@ function ImportedState({ count, fileName, onUploadAnother }) {
         {count} check{count === 1 ? '' : 's'} added to the register
       </p>
       <p className="mt-1 max-w-sm text-sm text-ink-400">
-        Imported from <span className="font-medium text-ink-600">{fileName}</span>. They're now
-        available for collectors to search and reserve.
+        Imported from <span className="font-medium text-ink-600">{fileName}</span>
+        {bank && (
+          <>
+            {' '}
+            (<span className="font-medium text-ink-600">{bank}</span>)
+          </>
+        )}
+        . They're now available for collectors to search and reserve.
       </p>
       <button
         onClick={onUploadAnother}

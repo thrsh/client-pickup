@@ -34,8 +34,6 @@ const PERIOD_OPTIONS = [
   { value: 'all', label: 'All', longLabel: 'all time', days: null },
 ]
 
-// Aging buckets for checks still awaiting pickup (available or on hold),
-// based on how long they've sat in the register. Ordered least → most stale.
 const AGING_BUCKETS = [
   { key: '0-7', label: '0–7 days', test: (d) => d <= 7, tone: 'neutral' },
   { key: '8-14', label: '8–14 days', test: (d) => d > 7 && d <= 14, tone: 'neutral' },
@@ -44,9 +42,20 @@ const AGING_BUCKETS = [
   { key: '60+', label: '60+ days', test: (d) => d > 60, tone: 'critical' },
 ]
 
+// Human-readable label used in error/debug output so a failed query is
+// traceable to exactly which fetch broke, instead of one generic message.
+const QUERY_LABELS = {
+  snapshot: 'Awaiting-pickup snapshot (checks: available/reserved)',
+  period: 'Picked-up checks for selected period',
+  prevPeriod: 'Picked-up count for prior period (for delta badge)',
+  trend: `Picked-up checks, last ${TREND_DAYS} days (trend)`,
+  reservations: 'Active reservations',
+  recent: 'Recent pickups',
+}
+
 export default function AdminDashboard() {
   const [period, setPeriod] = useState('7d')
-  const [snapshotChecks, setSnapshotChecks] = useState([]) // status in (available, reserved)
+  const [snapshotChecks, setSnapshotChecks] = useState([])
   const [periodPicked, setPeriodPicked] = useState([])
   const [previousPeriodCount, setPreviousPeriodCount] = useState(0)
   const [trendPicked, setTrendPicked] = useState([])
@@ -55,8 +64,14 @@ export default function AdminDashboard() {
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState('')
+  // Per-query errors, so a single failing query surfaces exactly which one
+  // broke instead of a single vague banner (or, worse, nothing at all if the
+  // query merely returned zero rows due to RLS rather than throwing).
+  const [queryErrors, setQueryErrors] = useState([])
   const [lastUpdated, setLastUpdated] = useState(null)
   const [now, setNow] = useState(Date.now())
+  const [sessionReady, setSessionReady] = useState(false)
+  const [noSessionWarning, setNoSessionWarning] = useState(false)
 
   const isMountedRef = useRef(true)
 
@@ -67,13 +82,38 @@ export default function AdminDashboard() {
     }
   }, [])
 
+  // IMPORTANT: on a hard refresh, supabase-js needs a moment to rehydrate
+  // the session from storage. Firing queries before that finishes means
+  // they run as an anonymous/unauthenticated request — Row Level Security
+  // then silently returns zero rows for every query (no error thrown), and
+  // the dashboard just looks "broken" with nothing to show for why. We wait
+  // for getSession() to resolve at least once before running any query.
   useEffect(() => {
+    let cancelled = false
+    supabase.auth.getSession().then(({ data, error: sessionError }) => {
+      if (cancelled) return
+      if (sessionError) {
+        console.error('[AdminDashboard] Failed to read auth session:', sessionError)
+      }
+      if (!data?.session) {
+        console.warn(
+          '[AdminDashboard] No active Supabase session found. Queries will run unauthenticated and RLS will likely return zero rows.'
+        )
+        setNoSessionWarning(true)
+      }
+      setSessionReady(true)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!sessionReady) return
     load(true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [period])
+  }, [period, sessionReady])
 
-  // Coarse tick — good enough for "Xm left" labels here without the cost
-  // of a full-page re-render every second like the pickups queue needs.
   useEffect(() => {
     const tick = setInterval(() => setNow(Date.now()), 30000)
     return () => clearInterval(tick)
@@ -84,6 +124,7 @@ export default function AdminDashboard() {
       if (showFullLoading) setLoading(true)
       else setRefreshing(true)
       setError('')
+      setQueryErrors([])
 
       const activeOption = PERIOD_OPTIONS.find((o) => o.value === period) || PERIOD_OPTIONS[1]
       const periodStartIso =
@@ -96,15 +137,11 @@ export default function AdminDashboard() {
 
       try {
         const queries = [
-          // Everything still waiting to be picked up (available + on hold) —
-          // powers the aging breakdown and the top two KPI cards.
           supabase
             .from('checks')
             .select('id, payee, check_no, amount, status, created_at, check_date')
             .in('status', ['available', 'reserved']),
 
-          // Picked up within the selected period, for the KPI and the
-          // top-collectors leaderboard.
           (() => {
             let q = supabase
               .from('checks')
@@ -114,7 +151,6 @@ export default function AdminDashboard() {
             return q
           })(),
 
-          // Picked up during the equivalent prior window, for the delta badge.
           activeOption.days != null
             ? supabase
                 .from('checks')
@@ -122,27 +158,27 @@ export default function AdminDashboard() {
                 .eq('status', 'picked_up')
                 .gte('picked_up_at', prevStartIso)
                 .lt('picked_up_at', periodStartIso)
-            : Promise.resolve({ count: 0, error: null }),
+            : Promise.resolve({ count: 0, error: null, data: [] }),
 
-          // Fixed 14-day window for the activity sparkline, independent of
-          // the period selector so the trend shape stays comparable.
           supabase
             .from('checks')
             .select('amount, picked_up_at')
             .eq('status', 'picked_up')
             .gte('picked_up_at', trendStartIso),
 
-          // Currently held reservations, for the "expiring soon" KPI and the
-          // active-reservations panel.
+          // Explicit FK hint (checks!checks_reservation_id_fkey) rather than
+          // the bare `checks(id, amount)` shorthand. If Postgres/PostgREST
+          // ever sees more than one plausible relationship between these
+          // two tables, the bare form throws "Could not embed because more
+          // than one relationship was found" and this whole query fails —
+          // naming the constraint explicitly removes that ambiguity.
           supabase
             .from('pickup_reservations')
-            .select('id, collector_name, reserved_at, expires_at, checks(id, amount)')
+            .select('id, collector_name, reserved_at, expires_at, checks!checks_reservation_id_fkey(id, amount)')
             .eq('status', 'reserved')
             .order('expires_at', { ascending: true })
             .limit(200),
 
-          // Latest completed pickups, always absolute-recent regardless of
-          // the period filter above.
           supabase
             .from('checks')
             .select('id, payee, check_no, amount, picked_up_by, picked_up_at')
@@ -151,27 +187,53 @@ export default function AdminDashboard() {
             .limit(6),
         ]
 
-        const [snapshotRes, periodRes, prevRes, trendRes, reservationsRes, recentRes] =
-          await Promise.all(queries)
+        const keys = ['snapshot', 'period', 'prevPeriod', 'trend', 'reservations', 'recent']
+        const results = await Promise.all(queries)
 
         if (!isMountedRef.current) return
 
-        const firstError =
-          snapshotRes.error || periodRes.error || prevRes.error || trendRes.error || reservationsRes.error || recentRes.error
-        if (firstError) {
-          setError(firstError.message || 'Failed to load the dashboard. Please try again.')
-          return
-        }
+        const errs = []
+        results.forEach((res, i) => {
+          if (res?.error) {
+            const label = QUERY_LABELS[keys[i]] || keys[i]
+            console.error(`[AdminDashboard] Query failed — ${label}:`, res.error)
+            errs.push(`${label}: ${res.error.message || 'unknown error'}`)
+          }
+        })
 
-        setSnapshotChecks(Array.isArray(snapshotRes.data) ? snapshotRes.data : [])
-        setPeriodPicked(Array.isArray(periodRes.data) ? periodRes.data : [])
-        setPreviousPeriodCount(prevRes.count || 0)
-        setTrendPicked(Array.isArray(trendRes.data) ? trendRes.data : [])
-        setActiveReservations(Array.isArray(reservationsRes.data) ? reservationsRes.data : [])
-        setRecent(recentRes.data || [])
+        const [snapshotRes, periodRes, prevRes, trendRes, reservationsRes, recentRes] = results
+
+        setSnapshotChecks(Array.isArray(snapshotRes?.data) ? snapshotRes.data : [])
+        setPeriodPicked(Array.isArray(periodRes?.data) ? periodRes.data : [])
+        setPreviousPeriodCount(prevRes?.count || 0)
+        setTrendPicked(Array.isArray(trendRes?.data) ? trendRes.data : [])
+        setActiveReservations(Array.isArray(reservationsRes?.data) ? reservationsRes.data : [])
+        setRecent(recentRes?.data || [])
         setLastUpdated(new Date())
+
+        if (errs.length > 0) {
+          setQueryErrors(errs)
+          setError(
+            errs.length === keys.length
+              ? 'All dashboard queries failed — likely a permissions (RLS) or connection issue. See details below.'
+              : 'Some dashboard data failed to load. See details below.'
+          )
+        } else if (
+          (snapshotRes?.data || []).length === 0 &&
+          (periodRes?.data || []).length === 0 &&
+          (reservationsRes?.data || []).length === 0 &&
+          (recentRes?.data || []).length === 0
+        ) {
+          // No errors, but every single query came back empty — this is the
+          // classic silent-RLS symptom. Flag it distinctly from "no error,
+          // just a genuinely quiet register" so it doesn't get missed.
+          console.warn(
+            '[AdminDashboard] Every query succeeded but returned zero rows. If the `checks`/`pickup_reservations` tables are not actually empty, check RLS SELECT policies for the current user role.'
+          )
+        }
       } catch (err) {
         if (!isMountedRef.current) return
+        console.error('[AdminDashboard] Unexpected error loading dashboard:', err)
         setError(err?.message || 'Failed to load the dashboard. Please try again.')
       } finally {
         if (isMountedRef.current) {
@@ -255,18 +317,38 @@ export default function AdminDashboard() {
         </div>
       </div>
 
-      {error && (
-        <div className="mb-5 flex items-center justify-between gap-3 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-          <span className="flex items-center gap-2">
-            <AlertTriangle className="h-4 w-4 shrink-0" />
-            {error}
+      {noSessionWarning && (
+        <div className="mb-5 flex items-start gap-2 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>
+            No active Supabase session was detected when this page loaded. If you're logged in and still
+            see this, your session may not have finished restoring — try refreshing. If it persists, the
+            auth cookie/token may not be reaching the Supabase client.
           </span>
-          <button
-            onClick={() => load(loading)}
-            className="rounded-md border border-red-300 px-3 py-1 text-xs font-medium text-red-700 hover:bg-red-100"
-          >
-            Retry
-          </button>
+        </div>
+      )}
+
+      {error && (
+        <div className="mb-5 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          <div className="flex items-center justify-between gap-3">
+            <span className="flex items-center gap-2">
+              <AlertTriangle className="h-4 w-4 shrink-0" />
+              {error}
+            </span>
+            <button
+              onClick={() => load(loading)}
+              className="rounded-md border border-red-300 px-3 py-1 text-xs font-medium text-red-700 hover:bg-red-100"
+            >
+              Retry
+            </button>
+          </div>
+          {queryErrors.length > 0 && (
+            <ul className="mt-2 space-y-1 border-t border-dashed border-red-200 pt-2 font-mono text-xs text-red-600">
+              {queryErrors.map((msg, i) => (
+                <li key={i}>• {msg}</li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
 

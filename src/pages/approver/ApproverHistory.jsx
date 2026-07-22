@@ -21,6 +21,45 @@
 // entry to the most recent submitted_for_approval entry for the same
 // check_id — exact, not estimated. See buildDecisionRows() below.
 //
+// COLLECTOR / SENT-BY / SENT-AT ROBUSTNESS FIX (read before touching):
+//   collector_name, or_no, ar_collected, submitted_by_name, and
+//   submitted_at are entered by the COLLECTOR/ADMIN at submission time
+//   and only ever get written durably onto:
+//     (a) the submitted_for_approval log row itself (partially — some
+//         write paths don't populate every field on the log row), and
+//     (b) the live `checks` row (checks.collector_name,
+//         checks.submitted_by_name, checks.submitted_at).
+//   (b) is NOT safe to trust for history: admin_release_reservation,
+//   approver_decide('reject'), and cancelSubmissions() (AdminChecks.jsx)
+//   all NULL those columns out the moment a check goes back to
+//   'available' — so every rejected/released decision showed a blank
+//   collector. Worse, once that check is re-reserved by a DIFFERENT
+//   collector, checks.collector_name gets overwritten with the NEW
+//   collector's name — so an old decision could silently show the wrong
+//   person, not just a blank one.
+//
+//   The one source that is genuinely immutable per-decision is
+//   pickup_reservations.collector_name, keyed off the log entry's own
+//   `reservation_id` — set once when that specific reservation was
+//   created and never rewritten afterward (ApproverHome.jsx and
+//   AdminPickups.jsx already rely on exactly this for the same reason).
+//   This page now fetches pickup_reservations in a SECOND, separate query
+//   (same "don't trust a single embed, fetch and merge client-side"
+//   pattern already used for the checks/activity join — see the
+//   HISTORY-TAB DATA NOTE in AdminPickups.jsx) and treats it as the
+//   highest-priority source for collectorName. sentAt/sentByName still
+//   prefer the matched submission log row, but now also fall back to the
+//   live checks row as a last resort (better than a blank cell) when no
+//   submission entry can be matched at all — see the DEV SAFETY NET below
+//   for why that gap can exist in the first place.
+//
+// BANK NOTE (added): check_activity_log has no `bank` column of its own —
+// it was never part of what gets logged at submit/decide time, only
+// `checks.bank` exists. So unlike collector_name there is no reservation-
+// level fallback for bank; it can only ever come from the embedded
+// `checks` row. normalizeBank() turns a blank/whitespace value into a
+// real "Unspecified" bucket for display, search, and filtering.
+//
 // Requires the same migration as ApproverHome.jsx / AdminPickups.jsx
 // (approval-workflow migration + the approver_decide fix that logs
 // action = 'approved' | 'rejected' | 'returned').
@@ -50,6 +89,7 @@ import {
   SlidersHorizontal,
   ClipboardList,
   Wallet,
+  Landmark,
 } from 'lucide-react'
 import { supabase } from '../../lib/supabaseClient'
 import { Input } from '../../components/ui/input'
@@ -95,6 +135,61 @@ const SORT_OPTIONS = [
   { value: 'collector_asc', label: 'Collector A→Z' },
 ]
 
+// Fallback label whenever a check's bank field is blank/null. Kept in
+// sync (name + semantics) with the same constant in ApproverHome.jsx so
+// an approver sees the same "Unspecified" wording in both places rather
+// than two different placeholder strings for the same data gap.
+const UNKNOWN_BANK_LABEL = 'Unspecified'
+
+// Normalizes a raw checks.bank value for display, grouping, and filtering
+// so that '', null, undefined, and whitespace-only values are all treated
+// as the same "unknown" bucket instead of creating near-duplicate filter
+// options (e.g. '' vs null showing up as separate entries).
+function normalizeBank(bank) {
+  const trimmed = typeof bank === 'string' ? bank.trim() : ''
+  return trimmed || UNKNOWN_BANK_LABEL
+}
+
+// Same deterministic small color set as ApproverHome.jsx's bank badges,
+// hashed off the bank name so a given bank always renders the same color
+// across pages without a hardcoded bank->color map to keep in sync.
+const BANK_BADGE_PALETTE = [
+  'bg-teal-100 text-teal-700',
+  'bg-blue-100 text-blue-700',
+  'bg-purple-100 text-purple-700',
+  'bg-amber-100 text-amber-700',
+  'bg-rose-100 text-rose-700',
+  'bg-indigo-100 text-indigo-700',
+  'bg-cyan-100 text-cyan-700',
+  'bg-lime-100 text-lime-700',
+]
+
+function bankBadgeClass(bank) {
+  if (bank === UNKNOWN_BANK_LABEL) return 'bg-ink-100 text-ink-500'
+  let hash = 0
+  for (let i = 0; i < bank.length; i += 1) {
+    hash = (hash * 31 + bank.charCodeAt(i)) >>> 0
+  }
+  return BANK_BADGE_PALETTE[hash % BANK_BADGE_PALETTE.length]
+}
+
+function BankBadge({ bank, className }) {
+  const label = normalizeBank(bank)
+  return (
+    <span
+      className={cn(
+        'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium',
+        bankBadgeClass(label),
+        className
+      )}
+      title={label}
+    >
+      <Landmark className="h-3 w-3 shrink-0" />
+      <span className="max-w-[100px] truncate">{label}</span>
+    </span>
+  )
+}
+
 function fmtDateTime(value) {
   if (!value) return null
   const d = new Date(value)
@@ -131,14 +226,32 @@ function initials(name) {
   return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase()
 }
 
+// Reads a value off multiple possible sources in priority order, treating
+// null/undefined as "missing" but preserving real falsy values (false, 0,
+// '') from whichever source actually has them. Use this instead of chained
+// `??` when a field can legitimately be `false` or `0` (e.g. ar_collected),
+// since `a ?? b` alone can't distinguish "explicitly false" from "missing"
+// once you start mixing types across sources.
+function firstDefined(...values) {
+  for (const v of values) {
+    if (v !== null && v !== undefined) return v
+  }
+  return null
+}
+
 // Reconstructs one row per decision (approve/return/reject), enriched
 // with the matching "sent for approval" submission for that same check.
 // Walks the log in chronological order per check_id so a check that gets
 // returned and resubmitted multiple times is matched correctly each time
 // — each decision picks up whichever submission most recently preceded it.
-function buildDecisionRows(rawLog) {
+//
+// `reservationsById` is a Map<reservationId, { collector_name }> fetched
+// separately in load() — see the ROBUSTNESS FIX note at the top of this
+// file for why this can't just be read off the embedded `checks` row.
+function buildDecisionRows(rawLog, reservationsById) {
   const lastSubmissionByCheck = new Map()
   const rows = []
+  const orphanedDecisions = [] // decisions with no matched submission — data issue, not display issue
 
   const sorted = [...rawLog].sort((a, b) => new Date(a.performed_at) - new Date(b.performed_at))
 
@@ -151,24 +264,64 @@ function buildDecisionRows(rawLog) {
 
     const submission = lastSubmissionByCheck.get(entry.check_id)
     const c = entry.checks || {}
+    const reservation = reservationsById?.get(entry.reservation_id) || null
+
+    if (!submission) {
+      orphanedDecisions.push({ checkId: entry.check_id, action: entry.action, performedAt: entry.performed_at })
+    }
 
     rows.push({
       id: entry.id,
       checkId: entry.check_id,
       reservationId: entry.reservation_id,
       decision: entry.action, // 'approved' | 'rejected' | 'returned'
-      collectorName: entry.collector_name,
+
+      // COLLECTOR NAME — pickup_reservations.collector_name is checked
+      // FIRST, ahead of the log/checks fallbacks. It's set once when this
+      // specific reservation is created and is the only source in this
+      // chain that's genuinely immutable per-decision: the live `checks`
+      // row gets nulled on release/reject, and — worse — can get
+      // overwritten with a DIFFERENT collector's name if the check is
+      // later re-reserved. entry.collector_name / submission.collector_name
+      // are kept as fallbacks only in case a future write path starts
+      // populating them; today they're effectively always null.
+      collectorName: firstDefined(
+        reservation?.collector_name,
+        entry.collector_name,
+        submission?.collector_name,
+        c.collector_name
+      ),
+      or_no: firstDefined(entry.or_no, submission?.or_no, c.or_no),
+      ar_collected: firstDefined(entry.ar_collected, submission?.ar_collected, c.ar_collected),
+
+      // Unlike collector_name, `bank` was never part of what gets logged
+      // onto either the submission or decision row in check_activity_log
+      // (see BANK NOTE at the top of this file), and there's no
+      // reservation-level bank to fall back to either — the checks row is
+      // the only real source. normalizeBank() at render/filter time turns
+      // a blank value into a real "Unspecified" bucket.
+      bank: c.bank,
+
       row_number: c.row_number,
       payee: c.payee,
       payor: c.payor,
       check_no: c.check_no,
       check_date: c.check_date,
       amount: c.amount,
-      or_no: entry.or_no,
-      ar_collected: entry.ar_collected,
       remarks: entry.remarks,
-      sentAt: submission?.performed_at ?? null,
-      sentByName: submission?.submitted_by_name ?? entry.submitted_by_name ?? null,
+
+      // SENT AT / SENT BY — normally exact, from the matched
+      // submitted_for_approval log row. When no submission entry can be
+      // matched at all (an orphaned decision — see the DEV SAFETY NET
+      // below), fall back to the live checks.submitted_at /
+      // checks.submitted_by_name as a last resort. This can be
+      // imprecise if the same check has since been resubmitted again
+      // (it would reflect that LATER submission, not this one) — but for
+      // the common case, and for any row that would otherwise render two
+      // blank columns, it's strictly better than nothing. The real fix
+      // for orphaned decisions is at the RPC layer (see below).
+      sentAt: firstDefined(submission?.performed_at, c.submitted_at),
+      sentByName: firstDefined(submission?.submitted_by_name, entry.submitted_by_name, c.submitted_by_name),
       decidedAt: entry.performed_at,
       verifiedByName: entry.approved_by_name ?? null,
     })
@@ -178,6 +331,29 @@ function buildDecisionRows(rawLog) {
     // accidentally get matched to this now-consumed submission again.
     lastSubmissionByCheck.delete(entry.check_id)
   })
+
+  // DEV SAFETY NET: a decision with no matched submission means some
+  // write path logged 'approved' | 'rejected' | 'returned' WITHOUT ever
+  // logging 'submitted_for_approval' for that check first. The
+  // checks.submitted_at/submitted_by_name fallback above keeps those rows
+  // from rendering fully blank, but "Sent at" for those rows will reflect
+  // the check's CURRENT submission record, which is only guaranteed
+  // correct if the check hasn't been resubmitted again since. No amount
+  // of read-side fallback can fully recover the exact historical value,
+  // because the data was never written. This surfaces the gap loudly in
+  // dev instead of letting it ship as silent (or subtly wrong) cells.
+  // Fix at the source: find whichever approve/return/reject code path
+  // skips the submission-log insert (e.g. a bulk-approve or admin
+  // override button) and make it always write both entries.
+  if (orphanedDecisions.length > 0 && import.meta.env?.DEV) {
+    console.warn(
+      `[ApproverHistory] ${orphanedDecisions.length} decision(s) have no matching ` +
+        `submitted_for_approval log entry — their "Sent by / Sent at" columns are now ` +
+        `filled from the live checks row as a best-effort fallback, which can be ` +
+        `imprecise if that check was resubmitted again since. Check IDs:`,
+      orphanedDecisions
+    )
+  }
 
   return rows
 }
@@ -194,6 +370,7 @@ function matchesSearch(row, term) {
     row.remarks,
     row.sentByName,
     row.verifiedByName,
+    row.bank,
   ]
     .filter(Boolean)
     .some((field) => String(field).toLowerCase().includes(needle))
@@ -226,6 +403,7 @@ export default function ApproverHistory() {
   const [decisionFilter, setDecisionFilter] = useState(() => new Set(DECISION_ACTIONS)) // all on by default
   const [collectorFilter, setCollectorFilter] = useState('')
   const [verifierFilter, setVerifierFilter] = useState('')
+  const [bankFilter, setBankFilter] = useState('')
   const [arFilter, setArFilter] = useState('any') // 'any' | 'yes' | 'no' | 'blank'
   const [sortBy, setSortBy] = useState('decided_desc')
   const [sortMenuOpen, setSortMenuOpen] = useState(false)
@@ -260,7 +438,7 @@ export default function ApproverHistory() {
         const { data, error } = await supabase
           .from('check_activity_log')
           .select(
-            'id, check_id, reservation_id, collector_name, action, or_no, ar_collected, remarks, performed_at, submitted_by_name, approved_by_name, checks(id, row_number, payee, payor, check_no, check_date, amount)'
+            'id, check_id, reservation_id, collector_name, action, or_no, ar_collected, remarks, performed_at, submitted_by_name, approved_by_name, checks(id, row_number, payee, payor, check_no, check_date, amount, collector_name, or_no, ar_collected, bank, submitted_by_name, submitted_at)'
           )
           .in('action', ['submitted_for_approval', ...DECISION_ACTIONS])
           .gte('performed_at', fromIso)
@@ -275,7 +453,38 @@ export default function ApproverHistory() {
           return
         }
 
-        setRows(buildDecisionRows(data || []))
+        const rawLog = data || []
+
+        // SECOND, SEPARATE QUERY for pickup_reservations.collector_name —
+        // deliberately not a compound embed on check_activity_log
+        // alongside `checks(...)` above. This page already relies on one
+        // embed (`checks`) working reliably; stacking a second embed onto
+        // the same query multiplies the exact same "PostgREST silently
+        // returns null for the whole relationship" risk documented in
+        // AdminPickups.jsx's HISTORY-TAB DATA NOTE, and — unlike the
+        // `checks` embed, which happens to be visibly fine today — this is
+        // precisely the field that was broken, so it gets the more
+        // defensive two-query treatment on principle. Non-fatal if it
+        // fails: rows still render, just without the reservation-level
+        // collector name fallback until the next successful refresh.
+        const reservationIds = [...new Set(rawLog.map((r) => r.reservation_id).filter(Boolean))]
+        let reservationsById = new Map()
+        if (reservationIds.length > 0) {
+          const { data: reservationsData, error: reservationsError } = await supabase
+            .from('pickup_reservations')
+            .select('id, collector_name')
+            .in('id', reservationIds)
+
+          if (!isMountedRef.current || requestId !== requestIdRef.current) return
+
+          if (reservationsError) {
+            console.error('pickup_reservations lookup for history failed:', reservationsError)
+          } else {
+            reservationsById = new Map((reservationsData || []).map((r) => [r.id, r]))
+          }
+        }
+
+        setRows(buildDecisionRows(rawLog, reservationsById))
         setLastUpdated(Date.now())
         setPage(1)
       } catch (err) {
@@ -325,6 +534,17 @@ export default function ApproverHistory() {
     () => [...new Set(rows.map((r) => r.verifiedByName).filter(Boolean))].sort(),
     [rows]
   )
+  // Derived live from the fetched window, same as collector/verifier —
+  // never hardcoded, so it can't show a bank that isn't actually present
+  // in the current date range.
+  const bankOptions = useMemo(() => {
+    const set = new Set(rows.map((r) => normalizeBank(r.bank)))
+    return [...set].sort((a, b) => {
+      if (a === UNKNOWN_BANK_LABEL) return 1
+      if (b === UNKNOWN_BANK_LABEL) return -1
+      return a.localeCompare(b)
+    })
+  }, [rows])
 
   const filteredRows = useMemo(() => {
     const term = search.trim()
@@ -332,6 +552,7 @@ export default function ApproverHistory() {
     if (term) list = list.filter((r) => matchesSearch(r, term))
     if (collectorFilter) list = list.filter((r) => r.collectorName === collectorFilter)
     if (verifierFilter) list = list.filter((r) => r.verifiedByName === verifierFilter)
+    if (bankFilter) list = list.filter((r) => normalizeBank(r.bank) === bankFilter)
     if (arFilter === 'yes') list = list.filter((r) => r.ar_collected === true)
     else if (arFilter === 'no') list = list.filter((r) => r.ar_collected === false)
     else if (arFilter === 'blank') list = list.filter((r) => r.ar_collected === null || r.ar_collected === undefined)
@@ -357,7 +578,7 @@ export default function ApproverHistory() {
     })
 
     return list
-  }, [rows, search, decisionFilter, collectorFilter, verifierFilter, arFilter, sortBy])
+  }, [rows, search, decisionFilter, collectorFilter, verifierFilter, bankFilter, arFilter, sortBy])
 
   const summary = useMemo(() => {
     const approved = filteredRows.filter((r) => r.decision === 'approved')
@@ -384,6 +605,7 @@ export default function ApproverHistory() {
     setDecisionFilter(new Set(DECISION_ACTIONS))
     setCollectorFilter('')
     setVerifierFilter('')
+    setBankFilter('')
     setArFilter('any')
     setPage(1)
   }
@@ -393,12 +615,14 @@ export default function ApproverHistory() {
     decisionFilter.size !== DECISION_ACTIONS.length ||
     !!collectorFilter ||
     !!verifierFilter ||
+    !!bankFilter ||
     arFilter !== 'any'
 
   function exportCsv() {
     const headers = [
       'Decision',
       'Collector',
+      'Bank',
       'Check no.',
       'Payee',
       'Payor',
@@ -418,6 +642,7 @@ export default function ApproverHistory() {
       csvRows.push([
         DECISION_META[r.decision]?.label || r.decision,
         r.collectorName || '',
+        normalizeBank(r.bank),
         r.check_no || '',
         r.payee || '',
         r.payor || '',
@@ -614,7 +839,7 @@ export default function ApproverHistory() {
               setSearch(e.target.value)
               setPage(1)
             }}
-            placeholder="Search collector, check #, payee, payor, OR no., remarks, names..."
+            placeholder="Search collector, bank, check #, payee, payor, OR no., remarks, names..."
             className="border-ink-200 pl-9 pr-8 text-sm focus-visible:ring-ledger-stamp"
           />
           {search && (
@@ -735,6 +960,25 @@ export default function ApproverHistory() {
             </div>
 
             <div>
+              <p className="mb-1.5 font-mono text-[11px] uppercase tracking-wide text-ink-400">Bank</p>
+              <select
+                value={bankFilter}
+                onChange={(e) => {
+                  setBankFilter(e.target.value)
+                  setPage(1)
+                }}
+                className="rounded-md border border-ink-200 px-2.5 py-1.5 text-sm text-ink-700 focus:outline-none focus:ring-1 focus:ring-ledger-stamp"
+              >
+                <option value="">All banks</option>
+                {bankOptions.map((name) => (
+                  <option key={name} value={name}>
+                    {name}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div>
               <p className="mb-1.5 font-mono text-[11px] uppercase tracking-wide text-ink-400">Verified by</p>
               <select
                 value={verifierFilter}
@@ -821,11 +1065,12 @@ export default function ApproverHistory() {
             </div>
 
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[1500px] border-collapse text-sm">
+              <table className="w-full min-w-[1620px] border-collapse text-sm">
                 <thead>
                   <tr className="border-b border-dashed border-ink-100 bg-ink-50/50 text-left font-mono text-[11px] uppercase tracking-wide text-ink-400">
                     <th className="px-4 py-3 font-medium">Decision</th>
                     <th className="px-4 py-3 font-medium">Collector</th>
+                    <th className="px-4 py-3 font-medium">Bank</th>
                     <th className="px-4 py-3 font-medium">Check no.</th>
                     <th className="px-4 py-3 font-medium">Check date</th>
                     <th className="px-4 py-3 font-medium">Payee</th>
@@ -876,6 +1121,10 @@ export default function ApproverHistory() {
                                 {r.collectorName || '—'}
                               </p>
                             </div>
+                          </td>
+
+                          <td className="px-4 py-4">
+                            <BankBadge bank={r.bank} />
                           </td>
 
                           <td className="px-4 py-4">
@@ -955,7 +1204,7 @@ export default function ApproverHistory() {
                         </tr>
                         {isExpanded && (
                           <tr>
-                            <td colSpan={15} className="bg-ink-50/40 px-4 pb-4 pt-0">
+                            <td colSpan={16} className="bg-ink-50/40 px-4 pb-4 pt-0">
                               <div className="rounded-lg border border-dashed border-ink-200 bg-white px-4 py-3">
                                 <p className="mb-1 font-mono text-[11px] uppercase tracking-wide text-ink-400">
                                   Remarks at time of {meta.label.toLowerCase()}

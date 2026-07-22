@@ -21,6 +21,8 @@ import {
   Layers,
   Wallet,
   CircleCheckBig,
+  Clock,
+  Landmark,
 } from 'lucide-react'
 import { useProfile } from '../../context/ProfileContext'
 import { supabase } from '../../lib/supabaseClient'
@@ -33,8 +35,51 @@ import { useToast } from '../../components/ui/toast'
 import { formatCurrency, formatDate, cn } from '../../lib/utils'
 
 const PAGE_SIZE_OPTIONS = [25, 50, 100]
-const SORTABLE_COLUMNS = ['payee', 'check_date', 'amount', 'uploaded_at']
+const SORTABLE_COLUMNS = ['payee', 'check_date', 'amount', 'uploaded_at', 'bank']
 const DEBOUNCE_MS = 300
+const RECEIPT_TYPES = ['PR', 'CR', 'AR', 'OR']
+
+// Every status a single check row can be in. 'reserved' and 'returned'
+// checks are NOT submissions this page can act on directly — they're
+// managed per-reservation on the Pending Pickups (AdminPickups) page — but
+// this register still needs to display them accurately instead of falling
+// through to "picked up" just because they aren't 'available' or
+// 'pending_approval'.
+
+function composeReceiptNo(entry) {
+  const type = entry?.receiptType || ''
+  const no = entry?.receiptNo?.trim() || ''
+  if (!type || !no) return ''
+  return `${type}-${no}`
+}
+function statusLabel(s) {
+  switch (s) {
+    case 'available':
+      return 'Available'
+    case 'reserved':
+      return 'Reserved'
+    case 'pending_approval':
+      return 'Pending approval'
+    case 'returned':
+      return 'Returned'
+    case 'picked_up':
+      return 'Picked up'
+    default:
+      return s || 'Unknown'
+  }
+}
+
+function formatDateTime(ts) {
+  if (!ts) return '—'
+  const d = new Date(ts)
+  if (Number.isNaN(d.getTime())) return '—'
+  return d.toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  })
+}
 
 export default function AdminChecks() {
   const { name: adminName } = useProfile()
@@ -47,9 +92,11 @@ export default function AdminChecks() {
   const [amountMax, setAmountMax] = useState('')
   const [fileFilter, setFileFilter] = useState('')
   const [collectorFilter, setCollectorFilter] = useState('')
+  const [bankFilter, setBankFilter] = useState('')
 
   const [fileOptions, setFileOptions] = useState([])
   const [collectorOptions, setCollectorOptions] = useState([])
+  const [bankOptions, setBankOptions] = useState([])
 
   const [sortKey, setSortKey] = useState('created_at')
   const [sortAsc, setSortAsc] = useState(false)
@@ -65,8 +112,15 @@ export default function AdminChecks() {
 
   // Lightweight status breakdown for the current filters (head-only counts,
   // so this stays cheap no matter how large the underlying table gets).
-  // Also powers the KPI cards at the top of the page.
-  const [stats, setStats] = useState({ available: null, pendingApproval: null, pickedUp: null })
+  // Also powers the KPI cards at the top of the page. Covers every status
+  // a check row can actually hold — not just the ones this page can act on.
+  const [stats, setStats] = useState({
+    available: null,
+    reserved: null,
+    pendingApproval: null,
+    returned: null,
+    pickedUp: null,
+  })
 
   // Submit-for-approval modal. `submitTargets` is null when the modal is
   // closed, or the array of check rows it's acting on (one row for a
@@ -78,12 +132,10 @@ export default function AdminChecks() {
   const [submitSubmitting, setSubmitSubmitting] = useState(false)
   const [submitError, setSubmitError] = useState('')
 
-  // Cancelling a pending submission (back to 'available') and undoing a
-  // finalized pickup (also back to 'available') are both simple, uniform
-  // updates, so a single row id or many share the same in-flight tracking
-  // set and the same bulk-capable function.
+  // Cancelling a pending submission (back to 'available') is a simple,
+  // uniform update, so a single row id or many share the same in-flight
+  // tracking set and the same bulk-capable function.
   const [cancelingIds, setCancelingIds] = useState(() => new Set())
-  const [undoingIds, setUndoingIds] = useState(() => new Set())
 
   const [selectedIds, setSelectedIds] = useState(() => new Set())
 
@@ -120,16 +172,22 @@ export default function AdminChecks() {
 
   async function loadFilterOptions() {
     try {
-      const [batchesRes, collectorsRes] = await Promise.all([
+      const [batchesRes, collectorsRes, banksRes] = await Promise.all([
         supabase.from('upload_batches').select('id, file_name').order('uploaded_at', { ascending: false }).limit(200),
         // Collector suggestions pool together everyone who has ever
-        // finished a pickup (picked_up_by) and everyone currently waiting
-        // on approval (submitted_by_name), so the dropdown covers both.
-       supabase
-  .from('checks')
-  .select('picked_up_by, collector_name')
-  .or('picked_up_by.not.is.null,collector_name.not.is.null')
-  .limit(1000),
+        // finished a pickup (picked_up_by) and everyone currently
+        // reserved / pending / returned against a collector_name, so the
+        // dropdown covers every stage a check can be at.
+        supabase
+          .from('checks')
+          .select('picked_up_by, collector_name')
+          .or('picked_up_by.not.is.null,collector_name.not.is.null')
+          .limit(1000),
+        // Distinct banks read straight off the checks table (the source of
+        // truth for what's actually been imported), not off a fixed list —
+        // so the filter always reflects what's really in the register, even
+        // if the upload form's bank list changes later.
+        supabase.from('checks').select('bank').not('bank', 'is', null).limit(2000),
       ])
       if (!batchesRes.error) setFileOptions(batchesRes.data || [])
       if (!collectorsRes.error) {
@@ -141,6 +199,12 @@ export default function AdminChecks() {
           ),
         ].sort()
         setCollectorOptions(distinct)
+      }
+      if (!banksRes.error) {
+        const distinctBanks = [
+          ...new Set((banksRes.data || []).map((r) => r.bank).filter(Boolean)),
+        ].sort()
+        setBankOptions(distinctBanks)
       }
     } catch {
       // Filter suggestions are a convenience only — ignore failures here.
@@ -157,11 +221,25 @@ export default function AdminChecks() {
       amountMax,
       fileFilter,
       collectorFilter,
+      bankFilter,
       sortKey,
       sortAsc,
       pageSize,
     }),
-    [query, status, dateFrom, dateTo, amountMin, amountMax, fileFilter, collectorFilter, sortKey, sortAsc, pageSize],
+    [
+      query,
+      status,
+      dateFrom,
+      dateTo,
+      amountMin,
+      amountMax,
+      fileFilter,
+      collectorFilter,
+      bankFilter,
+      sortKey,
+      sortAsc,
+      pageSize,
+    ],
   )
 
   // Any real filter change (not a page change) always jumps back to page 0,
@@ -205,18 +283,19 @@ export default function AdminChecks() {
       if (amountMin) r = r.gte('amount', Number(amountMin))
       if (amountMax) r = r.lte('amount', Number(amountMax))
       if (fileFilter) r = r.eq('upload_batch_id', fileFilter)
-      // A collector can show up as either the person who submitted a check
-      // for approval or the person it was ultimately logged as picked up
-      // by, so match either column. This is a second, independent `.or()`
-      // call — supabase-js ANDs separate `.or()` groups together, so this
-      // combines correctly with the search clause above rather than
-      // replacing it.
-   if (collectorFilter) {
-  r = r.or(`picked_up_by.eq.${collectorFilter},collector_name.eq.${collectorFilter}`)
-}
+      if (bankFilter) r = r.eq('bank', bankFilter)
+      // A collector can show up as either the person a check is currently
+      // reserved/pending/returned against, or the person it was ultimately
+      // logged as picked up by, so match either column. This is a second,
+      // independent `.or()` call — supabase-js ANDs separate `.or()` groups
+      // together, so this combines correctly with the search clause above
+      // rather than replacing it.
+      if (collectorFilter) {
+        r = r.or(`picked_up_by.eq.${collectorFilter},collector_name.eq.${collectorFilter}`)
+      }
       return r
     },
-    [query, dateFrom, dateTo, amountMin, amountMax, fileFilter, collectorFilter],
+    [query, dateFrom, dateTo, amountMin, amountMax, fileFilter, bankFilter, collectorFilter],
   )
 
   const load = useCallback(
@@ -228,9 +307,9 @@ export default function AdminChecks() {
       try {
         let req = supabase
           .from('checks')
-         .select(
-  'id, row_number, payee, payor, check_no, check_date, amount, status, picked_up_by, picked_up_at, or_no, ar_collected, remarks, collector_name, submitted_by_name, submitted_at, upload_batches(file_name, uploaded_at)',
-  { count: 'exact' },
+          .select(
+            'id, row_number, bank, payee, payor, check_no, check_date, amount, status, picked_up_by, picked_up_at, or_no, ar_collected, attached_2307, remarks, collector_name, submitted_by_name, submitted_at, return_reason, returned_at, returned_by_name, upload_batches(file_name, uploaded_at)',
+            { count: 'exact' },
           )
           .range(pageIndex * pageSize, pageIndex * pageSize + pageSize - 1)
 
@@ -270,20 +349,29 @@ export default function AdminChecks() {
     [status, sortKey, sortAsc, pageSize, applyCommonFilters],
   )
 
-  // Head-only counts (no rows fetched) so the available / pending / picked-up
-  // split stays cheap regardless of table size, and reflects every filter
-  // except status itself so the split is always meaningful. This also
-  // feeds the KPI cards at the top of the page.
+  // Head-only counts (no rows fetched) so the status split stays cheap
+  // regardless of table size, and reflects every filter except status
+  // itself so the split is always meaningful. This also feeds the KPI
+  // cards at the top of the page. Covers all five statuses a check can
+  // hold, not just the two/three this page can act on directly.
   const loadStats = useCallback(async () => {
     try {
-      const [availableRes, pendingRes, pickedUpRes] = await Promise.all([
+      const [availableRes, reservedRes, pendingRes, returnedRes, pickedUpRes] = await Promise.all([
         applyCommonFilters(supabase.from('checks').select('id', { count: 'exact', head: true })).eq(
           'status',
           'available',
         ),
         applyCommonFilters(supabase.from('checks').select('id', { count: 'exact', head: true })).eq(
           'status',
+          'reserved',
+        ),
+        applyCommonFilters(supabase.from('checks').select('id', { count: 'exact', head: true })).eq(
+          'status',
           'pending_approval',
+        ),
+        applyCommonFilters(supabase.from('checks').select('id', { count: 'exact', head: true })).eq(
+          'status',
+          'returned',
         ),
         applyCommonFilters(supabase.from('checks').select('id', { count: 'exact', head: true })).eq(
           'status',
@@ -293,11 +381,15 @@ export default function AdminChecks() {
       if (!isMountedRef.current) return
       setStats({
         available: availableRes.error ? null : availableRes.count ?? 0,
+        reserved: reservedRes.error ? null : reservedRes.count ?? 0,
         pendingApproval: pendingRes.error ? null : pendingRes.count ?? 0,
+        returned: returnedRes.error ? null : returnedRes.count ?? 0,
         pickedUp: pickedUpRes.error ? null : pickedUpRes.count ?? 0,
       })
     } catch {
-      if (isMountedRef.current) setStats({ available: null, pendingApproval: null, pickedUp: null })
+      if (isMountedRef.current) {
+        setStats({ available: null, reserved: null, pendingApproval: null, returned: null, pickedUp: null })
+      }
     }
   }, [applyCommonFilters])
 
@@ -317,6 +409,7 @@ export default function AdminChecks() {
     setAmountMax('')
     setFileFilter('')
     setCollectorFilter('')
+    setBankFilter('')
   }
 
   function resetAllFilters() {
@@ -327,14 +420,13 @@ export default function AdminChecks() {
     setSortAsc(false)
   }
 
-  const hasAdvancedFilters = !!(dateFrom || dateTo || amountMin || amountMax || fileFilter || collectorFilter)
+  const hasAdvancedFilters = !!(dateFrom || dateTo || amountMin || amountMax || fileFilter || collectorFilter || bankFilter)
   const hasAnyFilters = hasAdvancedFilters || !!query.trim() || status !== 'all'
-
-  const statusLabel = (s) => (s === 'available' ? 'Available' : s === 'pending_approval' ? 'Pending approval' : 'Picked up')
 
   const activeChips = useMemo(() => {
     const chips = []
     if (status !== 'all') chips.push({ key: 'status', label: `Status: ${statusLabel(status)}`, clear: () => setStatus('all') })
+    if (bankFilter) chips.push({ key: 'bank', label: `Bank: ${bankFilter}`, clear: () => setBankFilter('') })
     if (dateFrom || dateTo) chips.push({ key: 'dates', label: `Date: ${dateFrom || '…'} → ${dateTo || '…'}`, clear: () => { setDateFrom(''); setDateTo('') } })
     if (amountMin || amountMax) chips.push({ key: 'amount', label: `Amount: ${amountMin || '0'} - ${amountMax || '∞'}`, clear: () => { setAmountMin(''); setAmountMax('') } })
     if (fileFilter) {
@@ -344,7 +436,7 @@ export default function AdminChecks() {
     if (collectorFilter) chips.push({ key: 'collector', label: `Collector: ${collectorFilter}`, clear: () => setCollectorFilter('') })
     return chips
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status, dateFrom, dateTo, amountMin, amountMax, fileFilter, collectorFilter, fileOptions])
+  }, [status, bankFilter, dateFrom, dateTo, amountMin, amountMax, fileFilter, collectorFilter, fileOptions])
 
   // ---------------------------------------------------------------------
   // Submit for approval (available -> pending_approval)
@@ -363,11 +455,11 @@ export default function AdminChecks() {
   }
 
   // Called by the modal once the admin has entered a collector name and a
-  // complete OR no. / AR-collected / remarks entry for every included
-  // check. Re-validates everything server-side-of-the-UI before writing,
-  // since the modal's own validation only gates its button — it doesn't
-  // guarantee the data reaching this function is still valid.
-async function confirmSubmitForApproval(collectorName, entries) {
+  // complete OR no. / AR-collected / 2307-attached / remarks entry for
+  // every included check. Re-validates everything server-side-of-the-UI
+  // before writing, since the modal's own validation only gates its button
+  // — it doesn't guarantee the data reaching this function is still valid.
+  async function confirmSubmitForApproval(collectorName, entries) {
     if (!submitTargets || submitSubmitting) return
 
     const trimmedName = collectorName.trim()
@@ -385,9 +477,15 @@ async function confirmSubmitForApproval(collectorName, entries) {
     const seenOrNos = new Map()
     for (const r of included) {
       const entry = entries[r.id]
-      const orNo = entry.orNo?.trim() ?? ''
-      if (!orNo || entry.collected === null || entry.collected === undefined) {
-        setSubmitError('Enter an OR number and AR-collected status for every check being submitted.')
+      const orNo = composeReceiptNo(entry)
+      if (
+        !orNo ||
+        entry.collected === null ||
+        entry.collected === undefined ||
+        entry.attached2307 === null ||
+        entry.attached2307 === undefined
+      ) {
+        setSubmitError('Select a receipt type, enter its number, and set AR-collected and 2307 Attached status for every check being submitted.')
         return
       }
       if (entry.collected === false && !entry.remarks?.trim()) {
@@ -396,7 +494,7 @@ async function confirmSubmitForApproval(collectorName, entries) {
       }
       const key = orNo.toLowerCase()
       if (seenOrNos.has(key)) {
-        setSubmitError("Each check needs its own unique OR number — duplicates were found.")
+        setSubmitError('Each check needs its own unique receipt type + number — duplicates were found.')
         return
       }
       seenOrNos.set(key, r.id)
@@ -423,18 +521,20 @@ async function confirmSubmitForApproval(collectorName, entries) {
       // already serializes this for the jsonb param, and double-encoding
       // it makes Postgres receive a jsonb *string* instead of a jsonb
       // *array*.
-      const p_check_outcomes = included.map((r) => {
+    const p_check_outcomes = included.map((r) => {
         const entry = entries[r.id]
         return {
           check_id: r.id,
-          or_no: entry.orNo.trim(),
+          // "TYPE-number" (e.g. "OR-12345") — see composeReceiptNo() above.
+          or_no: composeReceiptNo(entry),
           ar_collected: entry.collected,
+          attached_2307: entry.attached2307,
           remarks: entry.collected === false ? entry.remarks.trim() : null,
         }
       })
 
       const { data: reservationId, error } = await supabase.rpc(
-        'admin_submit_available_checks_for_approval',
+        'admin_submit_checks_for_approval',
         {
           p_collector_name: trimmedName,
           p_admin_name: trimmedAdminName,
@@ -467,10 +567,8 @@ async function confirmSubmitForApproval(collectorName, entries) {
   }
 
   // ---------------------------------------------------------------------
-  // Cancel a pending submission (pending_approval -> available), and undo a
-  // finalized pickup (picked_up -> available). Both are uniform updates
-  // across however many ids are involved, so a single `.in('id', ids)`
-  // call covers the single-row and bulk cases alike.
+  // Cancel a pending submission (pending_approval -> available). A single
+  // `.in('id', ids)` call covers the single-row and bulk cases alike.
   // ---------------------------------------------------------------------
 
   async function cancelSubmissions(ids, label) {
@@ -483,7 +581,7 @@ async function confirmSubmitForApproval(collectorName, entries) {
     try {
       const { error } = await supabase
         .from('checks')
-       .update({ status: 'available', or_no: null, ar_collected: null, remarks: null, collector_name: null, submitted_by_name: null, submitted_at: null })
+        .update({ status: 'available', or_no: null, ar_collected: null, attached_2307: null, remarks: null, collector_name: null, submitted_by_name: null, submitted_at: null })
         .in('id', ids)
 
       if (error) {
@@ -502,42 +600,6 @@ async function confirmSubmitForApproval(collectorName, entries) {
       push({ variant: 'error', title: 'Could not cancel submission', description: err?.message || 'Please try again.' })
     } finally {
       setCancelingIds((prev) => {
-        const next = new Set(prev)
-        ids.forEach((id) => next.delete(id))
-        return next
-      })
-    }
-  }
-
-  async function undoPickups(ids, label) {
-    if (ids.length === 0) return
-    setUndoingIds((prev) => {
-      const next = new Set(prev)
-      ids.forEach((id) => next.add(id))
-      return next
-    })
-    try {
-      const { error } = await supabase
-        .from('checks')
-        .update({ status: 'available', picked_up_by: null, picked_up_at: null })
-        .in('id', ids)
-
-      if (error) {
-        push({ variant: 'error', title: 'Could not undo', description: error.message })
-        return
-      }
-      push({
-        variant: 'info',
-        title: 'Reverted to available',
-        description: label || `${ids.length} check${ids.length === 1 ? '' : 's'}`,
-      })
-      setSelectedIds(new Set())
-      load(page)
-      loadStats()
-    } catch (err) {
-      push({ variant: 'error', title: 'Could not undo', description: err?.message || 'Please try again.' })
-    } finally {
-      setUndoingIds((prev) => {
         const next = new Set(prev)
         ids.forEach((id) => next.delete(id))
         return next
@@ -568,14 +630,12 @@ async function confirmSubmitForApproval(collectorName, entries) {
 
   const selectedAvailable = rows.filter((r) => selectedIds.has(r.id) && r.status === 'available')
   const selectedPendingApproval = rows.filter((r) => selectedIds.has(r.id) && r.status === 'pending_approval')
-  const selectedPickedUp = rows.filter((r) => selectedIds.has(r.id) && r.status === 'picked_up')
   const cancelingSelected = selectedPendingApproval.some((r) => cancelingIds.has(r.id))
-  const undoingSelected = selectedPickedUp.some((r) => undoingIds.has(r.id))
 
   const totalPages = Math.max(1, Math.ceil(count / pageSize))
   const rangeStart = count === 0 ? 0 : page * pageSize + 1
   const rangeEnd = Math.min(count, page * pageSize + pageSize)
-  const cellPad = density === 'compact' ? 'px-3 py-1.5' : 'px-4 py-3'
+  const cellPad = density === 'compact' ? 'px-2 py-1' : 'px-3 py-2'
 
   return (
     <div>
@@ -583,19 +643,24 @@ async function confirmSubmitForApproval(collectorName, entries) {
         <div>
           <h1 className="font-display text-2xl font-semibold text-ink-900">Checks register</h1>
           <p className="mt-1 text-sm text-ink-400">
-            Search every uploaded check, sort any column, submit pickups for approval, and undo mistakes.
+            Search every uploaded check, sort any column, submit pickups for approval, and track every
+            status a check can move through.
           </p>
         </div>
         <div className="flex items-center gap-3 text-right">
           {!loading && !loadError && (
-            <div className="text-xs text-ink-400">
+            <div className="text-[10px] text-ink-400">
               <p className="font-mono">
                 {rangeStart}–{rangeEnd} of {count.toLocaleString()}
               </p>
-              <p className="mt-0.5 flex items-center gap-2 font-mono">
+              <p className="mt-0.5 flex flex-wrap items-center justify-end gap-x-2 gap-y-0.5 font-mono">
                 <span className="text-ledger-stamp">{stats.available ?? '—'} available</span>
                 <span className="text-ink-300">·</span>
+                <span className="text-sky-600">{stats.reserved ?? '—'} reserved</span>
+                <span className="text-ink-300">·</span>
                 <span className="text-amber-600">{stats.pendingApproval ?? '—'} pending</span>
+                <span className="text-ink-300">·</span>
+                <span className="text-orange-600">{stats.returned ?? '—'} returned</span>
                 <span className="text-ink-300">·</span>
                 <span>{stats.pickedUp ?? '—'} picked up</span>
               </p>
@@ -604,12 +669,11 @@ async function confirmSubmitForApproval(collectorName, entries) {
         </div>
       </div>
 
-      {/* KPI summary row — mirrors the dashboard's KpiCard pattern so both
-          pages feel consistent. Fed entirely by `stats` and `count`, which
-          are already fetched by loadStats()/load() above, so this adds no
+      {/* KPI summary row. Fed entirely by `stats` and `count`, which are
+          already fetched by loadStats()/load() above, so this adds no
           extra network calls. Numbers update live as filters change since
           `stats` respects every active filter except status itself. */}
-      <div className="mb-5 grid grid-cols-2 gap-3 lg:grid-cols-4">
+      <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
         <KpiCard
           icon={Layers}
           label="Matching filters"
@@ -625,11 +689,25 @@ async function confirmSubmitForApproval(collectorName, entries) {
           accent="teal"
         />
         <KpiCard
+          icon={Clock}
+          label="Reserved"
+          value={loading ? null : stats.reserved}
+          secondary="Held by a collector"
+          accent="sky"
+        />
+        <KpiCard
           icon={Hourglass}
           label="Pending approval"
           value={loading ? null : stats.pendingApproval}
           secondary="Awaiting approver review"
           accent="orange"
+        />
+        <KpiCard
+          icon={RotateCcw}
+          label="Returned"
+          value={loading ? null : stats.returned}
+          secondary="Sent back for correction"
+          accent="amber"
         />
         <KpiCard
           icon={CircleCheckBig}
@@ -663,8 +741,18 @@ async function confirmSubmitForApproval(collectorName, entries) {
         <Select value={status} onChange={(e) => setStatus(e.target.value)} className="sm:w-48">
           <option value="all">All statuses</option>
           <option value="available">Available</option>
+          <option value="reserved">Reserved</option>
           <option value="pending_approval">Pending approval</option>
+          <option value="returned">Returned</option>
           <option value="picked_up">Picked up</option>
+        </Select>
+        <Select value={bankFilter} onChange={(e) => setBankFilter(e.target.value)} className="sm:w-48">
+          <option value="">All banks</option>
+          {bankOptions.map((b) => (
+            <option key={b} value={b}>
+              {b}
+            </option>
+          ))}
         </Select>
         <Button
           variant={showAdvanced ? 'stamp' : 'outline'}
@@ -737,7 +825,7 @@ async function confirmSubmitForApproval(collectorName, entries) {
             </Select>
           </div>
           <div>
-            <label className="mb-1 block text-xs font-medium text-ink-500">Collector (submitted or picked up)</label>
+            <label className="mb-1 block text-xs font-medium text-ink-500">Collector (reserved, submitted, or picked up)</label>
             <Select value={collectorFilter} onChange={(e) => setCollectorFilter(e.target.value)}>
               <option value="">Anyone</option>
               {collectorOptions.map((c) => (
@@ -780,20 +868,6 @@ async function confirmSubmitForApproval(collectorName, entries) {
               >
                 {cancelingSelected ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RotateCcw className="h-3.5 w-3.5" />}
                 Cancel submission ({selectedPendingApproval.length})
-              </Button>
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() =>
-                  undoPickups(
-                    selectedPickedUp.map((r) => r.id),
-                    `${selectedPickedUp.length} check${selectedPickedUp.length === 1 ? '' : 's'}`,
-                  )
-                }
-                disabled={selectedPickedUp.length === 0 || undoingSelected}
-              >
-                {undoingSelected ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RotateCcw className="h-3.5 w-3.5" />}
-                Undo pickup ({selectedPickedUp.length})
               </Button>
               <button
                 onClick={() => setSelectedIds(new Set())}
@@ -855,8 +929,8 @@ async function confirmSubmitForApproval(collectorName, entries) {
       )}
 
       <div className="overflow-auto rounded-lg border border-ink-100 bg-white" style={{ maxHeight: 640 }}>
-        <table className="w-full min-w-[900px] text-left text-sm">
-          <thead className="sticky top-0 z-10 bg-ink-50 text-xs uppercase tracking-wide text-ink-400">
+        <table className="w-full min-w-[1040px] text-left text-[11px]">
+          <thead className="sticky top-0 z-10 bg-ink-50 text-[9px] uppercase tracking-wide text-ink-400">
             <tr>
               <th className={cellPad}>
                 <input
@@ -870,6 +944,7 @@ async function confirmSubmitForApproval(collectorName, entries) {
                 />
               </th>
               <th className={cn(cellPad, 'font-medium')}>File / Row</th>
+              <SortableHeader label="Bank" sortKeyName="bank" currentKey={sortKey} asc={sortAsc} onClick={toggleSort} cellPad={cellPad} />
               <SortableHeader label="Payee" sortKeyName="payee" currentKey={sortKey} asc={sortAsc} onClick={toggleSort} cellPad={cellPad} />
               <th className={cn(cellPad, 'font-medium')}>Payor</th>
               <th className={cn(cellPad, 'font-medium')}>Check No.</th>
@@ -885,7 +960,7 @@ async function confirmSubmitForApproval(collectorName, entries) {
               <SkeletonRows count={Math.min(pageSize, 10)} cellPad={cellPad} />
             ) : rows.length === 0 ? (
               <tr>
-                <td colSpan={10} className="px-4 py-14">
+                <td colSpan={11} className="px-4 py-14">
                   <div className="flex flex-col items-center text-center">
                     <span className="flex h-11 w-11 items-center justify-center rounded-full border border-dashed border-ink-200 text-ink-300">
                       <Inbox className="h-5 w-5" />
@@ -912,13 +987,16 @@ async function confirmSubmitForApproval(collectorName, entries) {
                       aria-label={`Select ${row.payee}`}
                     />
                   </td>
-                  <td className={cn(cellPad, 'font-mono text-xs text-ink-400')}>
+                  <td className={cn(cellPad, 'font-mono text-[10px] text-ink-400')}>
                     {row.upload_batches?.file_name || '—'}
                     <br />
                     Row {row.row_number}
                   </td>
-                  <td className={cn(cellPad, 'font-medium text-ink-800')}>{row.payee || '—'}</td>
-                  <td className={cn(cellPad, 'text-ink-600')}>{row.payor || '—'}</td>
+                  <td className={cn(cellPad, 'max-w-[140px]')}>
+                    <BankBadge bank={row.bank} />
+                  </td>
+                  <td className={cn(cellPad, 'max-w-[140px] truncate font-medium text-ink-800')}>{row.payee || '—'}</td>
+                  <td className={cn(cellPad, 'max-w-[140px] truncate text-ink-600')}>{row.payor || '—'}</td>
                   <td className={cn(cellPad, 'font-mono text-ink-600')}>
                     <CopyableCheckNo value={row.check_no} />
                   </td>
@@ -927,14 +1005,18 @@ async function confirmSubmitForApproval(collectorName, entries) {
                   </td>
                   <td className={cn(cellPad, 'font-mono text-ink-800')}>{formatCurrency(row.amount)}</td>
                   {/* ── Uploaded-date column ── shows when the source file was imported */}
-                  <td className={cn(cellPad, 'text-ink-500')}>
+                  <td className={cn(cellPad, 'text-[10px] text-ink-500')}>
                     {row.upload_batches?.uploaded_at ? formatDate(row.upload_batches.uploaded_at) : '—'}
                   </td>
-                  <td className={cellPad}>
+                  <td className={cn(cellPad, 'max-w-[190px]')}>
                     {row.status === 'available' ? (
                       <Badge variant="available">Available</Badge>
+                    ) : row.status === 'reserved' ? (
+                      <ReservedBadge row={row} />
                     ) : row.status === 'pending_approval' ? (
                       <PendingApprovalBadge row={row} />
+                    ) : row.status === 'returned' ? (
+                      <ReturnedBadge row={row} />
                     ) : (
                       <Badge variant="pickedup">Picked up by {row.picked_up_by || 'unknown'}</Badge>
                     )}
@@ -942,7 +1024,7 @@ async function confirmSubmitForApproval(collectorName, entries) {
                   <td className={cn(cellPad, 'text-right')}>
                     {row.status === 'available' ? (
                       <Button size="sm" variant="stamp" onClick={() => openSubmitModal([row])}>
-                        <Send className="h-3.5 w-3.5" /> Submit for approval
+                        <Send className="h-3 w-3" /> Submit for approval
                       </Button>
                     ) : row.status === 'pending_approval' ? (
                       <Button
@@ -952,26 +1034,16 @@ async function confirmSubmitForApproval(collectorName, entries) {
                         disabled={cancelingIds.has(row.id)}
                       >
                         {cancelingIds.has(row.id) ? (
-                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          <Loader2 className="h-3 w-3 animate-spin" />
                         ) : (
-                          <RotateCcw className="h-3.5 w-3.5" />
+                          <RotateCcw className="h-3 w-3" />
                         )}
                         {cancelingIds.has(row.id) ? 'Cancelling…' : 'Cancel submission'}
                       </Button>
+                    ) : row.status === 'reserved' || row.status === 'returned' ? (
+                      <span className="text-[9px] italic text-ink-300">Manage in Pending Pickups</span>
                     ) : (
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        onClick={() => undoPickups([row.id], row.payee)}
-                        disabled={undoingIds.has(row.id)}
-                      >
-                        {undoingIds.has(row.id) ? (
-                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                        ) : (
-                          <RotateCcw className="h-3.5 w-3.5" />
-                        )}
-                        {undoingIds.has(row.id) ? 'Undoing…' : 'Undo'}
-                      </Button>
+                      <span className="text-[9px] text-ink-300">Completed</span>
                     )}
                   </td>
                 </tr>
@@ -1033,14 +1105,17 @@ async function confirmSubmitForApproval(collectorName, entries) {
 // Compact stat card reused from the admin dashboard's KPI pattern, so the
 // register and the dashboard feel like one product. Color usage follows
 // the brand palette: teal (`ledger-stamp`) for healthy/actionable states,
-// light teal for the neutral aggregate total, and orange (`ledger-amber`)
-// for anything sitting in a review queue — matching the semantics already
-// used by <Badge> and <PendingApprovalBadge> elsewhere on this page.
+// light teal for the neutral aggregate total, sky for a plain in-progress
+// reservation, orange (`ledger-amber`) for anything sitting in a review
+// queue, and amber for a check an approver has sent back — matching the
+// semantics already used by the per-row badges below.
 function KpiCard({ icon: Icon, label, value, secondary, accent = 'teal', loading }) {
   const accents = {
     teal: { badge: 'bg-ledger-stamp/10 text-ledger-stampDark', ring: 'border-ledger-stamp/30' },
     lightTeal: { badge: 'bg-teal-50 text-teal-600', ring: 'border-teal-200' },
+    sky: { badge: 'bg-sky-50 text-sky-600', ring: 'border-sky-200' },
     orange: { badge: 'bg-ledger-amber/10 text-ledger-amber', ring: 'border-ledger-amber/30' },
+    amber: { badge: 'bg-amber-100 text-amber-700', ring: 'border-amber-200' },
     ink: { badge: 'bg-ink-50 text-ink-700', ring: 'border-ink-100' },
   }
   const style = accents[accent] || accents.teal
@@ -1048,7 +1123,7 @@ function KpiCard({ icon: Icon, label, value, secondary, accent = 'teal', loading
 
   return (
     <Card>
-      <CardContent className="relative overflow-hidden p-4">
+      <CardContent className="relative overflow-hidden p-3">
         <div
           className={cn(
             'pointer-events-none absolute -right-4 -top-4 h-16 w-16 rounded-full border-2 border-dashed',
@@ -1056,21 +1131,21 @@ function KpiCard({ icon: Icon, label, value, secondary, accent = 'teal', loading
           )}
           aria-hidden="true"
         />
-        <div className="relative flex items-start gap-3">
-          <div className={cn('flex h-9 w-9 shrink-0 items-center justify-center rounded-full', style.badge)}>
-            <Icon className="h-4 w-4" />
+        <div className="relative flex items-start gap-2.5">
+          <div className={cn('flex h-8 w-8 shrink-0 items-center justify-center rounded-full', style.badge)}>
+            <Icon className="h-3.5 w-3.5" />
           </div>
           <div className="min-w-0 flex-1">
             {isLoading ? (
-              <div className="h-6 w-14 animate-pulse rounded bg-ink-100" />
+              <div className="h-5 w-12 animate-pulse rounded bg-ink-100" />
             ) : (
-              <p className="truncate font-display text-lg font-semibold text-ink-900">
+              <p className="truncate font-display text-sm font-semibold text-ink-900">
                 {typeof value === 'number' ? value.toLocaleString() : value}
               </p>
             )}
-            <p className="truncate text-xs text-ink-400">{label}</p>
+            <p className="truncate text-[10px] text-ink-400">{label}</p>
             {!isLoading && secondary && (
-              <p className="mt-0.5 truncate font-mono text-xs text-ink-500">{secondary}</p>
+              <p className="mt-0.5 truncate font-mono text-[9px] text-ink-500">{secondary}</p>
             )}
           </div>
         </div>
@@ -1089,9 +1164,32 @@ function SortableHeader({ label, sortKeyName, currentKey, asc, onClick, cellPad 
         className={`flex items-center gap-1 hover:text-ink-700 ${isActive ? 'text-ledger-stamp' : ''}`}
       >
         {label}
-        <Icon className="h-3 w-3" />
+        <Icon className="h-2.5 w-2.5" />
       </button>
     </th>
+  )
+}
+
+// Small pill for the bank a check came from. Falls back to a dashed
+// "unknown" pill for any legacy rows imported before the bank column
+// existed, rather than rendering blank.
+function BankBadge({ bank }) {
+  if (!bank) {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full border border-dashed border-ink-200 px-2 py-0.5 text-[9px] font-medium text-ink-400">
+        <Landmark className="h-2.5 w-2.5" />
+        Unknown
+      </span>
+    )
+  }
+  return (
+    <span
+      className="inline-flex max-w-[130px] items-center gap-1 truncate rounded-full bg-teal-50 px-2 py-0.5 text-[9px] font-medium text-teal-700"
+      title={bank}
+    >
+      <Landmark className="h-2.5 w-2.5 shrink-0" />
+      <span className="truncate">{bank}</span>
+    </span>
   )
 }
 
@@ -1123,47 +1221,119 @@ function CopyableCheckNo({ value }) {
   )
 }
 
-// Compact badge for a check awaiting approver review. The full OR no. / AR
-// collected / remarks trail is available on hover via the title attribute
-// rather than as extra table columns, so the register stays scannable.
-function PendingApprovalBadge({ row }) {
-  const details = [
-    row.or_no ? `OR #${row.or_no}` : null,
-    row.ar_collected === null || row.ar_collected === undefined
-      ? null
-      : row.ar_collected
-      ? 'AR collected'
-      : `AR not collected${row.remarks ? ` — ${row.remarks}` : ''}`,
+// A check that's merely 'reserved' — a collector has claimed it but no
+// admin has submitted it for approval yet. Distinct from 'pending_approval'
+// (already submitted, waiting on an approver) and from 'returned' (was
+// submitted, an approver sent it back). Showing this plainly, instead of
+// letting it fall through to "picked up," is the main fix here.
+function ReservedBadge({ row }) {
+  return (
+    <span
+      className="inline-flex flex-col items-start gap-0.5"
+      title={`Reserved by ${row.collector_name || 'an unknown collector'} — not yet submitted for approval`}
+    >
+      <span className="inline-flex items-center gap-1 rounded-full bg-sky-50 px-2 py-0.5 text-[9px] font-medium text-sky-700">
+        <Clock className="h-3 w-3" />
+        Reserved
+      </span>
+      {row.collector_name && <span className="text-[9px] text-ink-400">by {row.collector_name}</span>}
+    </span>
+  )
+}
+
+// A check an approver sent back for correction. Still associated with the
+// same collector/reservation — it is NOT back in the available pool — so
+// this stays visually distinct from both 'reserved' (never submitted) and
+// 'picked_up' (approved). The return reason / who / when show on hover.
+function ReturnedBadge({ row }) {
+  const title = [
+    row.collector_name ? `Reserved by ${row.collector_name}` : null,
+    row.return_reason ? `Return reason: ${row.return_reason}` : 'No return reason given',
+    row.returned_by_name ? `Returned by ${row.returned_by_name}` : null,
+    row.returned_at ? `Returned ${formatDateTime(row.returned_at)}` : null,
   ]
     .filter(Boolean)
-    .join(' · ')
-
- const title = [
-  row.collector_name ? `Collector: ${row.collector_name}` : null,
-  row.submitted_by_name ? `Submitted by ${row.submitted_by_name}` : null,
-  details || null,
-  'Awaiting approver review',
-].filter(Boolean).join(' — ')
+    .join(' — ')
 
   return (
     <span className="inline-flex flex-col items-start gap-0.5" title={title}>
-      <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-700">
+      <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[9px] font-medium text-amber-700">
+        <RotateCcw className="h-3 w-3" />
+        Returned for correction
+      </span>
+      {row.collector_name && <span className="text-[9px] text-ink-400">reserved by {row.collector_name}</span>}
+    </span>
+  )
+}
+
+// Compact badge for a check awaiting approver review. The full OR no. / AR
+// collected / 2307 attached / remarks trail is available on hover via the
+// title attribute rather than as extra table columns, so the register
+// stays scannable.
+function PendingApprovalBadge({ row }) {
+  const hasCollected = row.ar_collected !== null && row.ar_collected !== undefined
+  const hasAttached = row.attached_2307 !== null && row.attached_2307 !== undefined
+
+  const title = [
+    row.collector_name ? `Collector: ${row.collector_name}` : null,
+    row.submitted_by_name ? `Submitted by ${row.submitted_by_name}` : null,
+    'Awaiting approver review',
+  ].filter(Boolean).join(' — ')
+
+  return (
+    <span className="inline-flex flex-col items-start gap-0.5" title={title}>
+      <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[9px] font-medium text-amber-700">
         <Hourglass className="h-3 w-3" />
         Pending approval
       </span>
-     {row.collector_name && <span className="text-[11px] text-ink-400">for {row.collector_name}</span>}
+      {row.collector_name && <span className="text-[9px] text-ink-400">for {row.collector_name}</span>}
+      {/* OR no. / AR collected / 2307 Attached rendered as visible content —
+          not just a hover tooltip — so this matches how the same three
+          fields are shown as real columns on the Pending Pickups page. */}
+      <span className="mt-0.5 flex flex-wrap items-center gap-1">
+          {row.or_no && (
+          <span className="rounded bg-ink-100 px-1.5 py-0.5 font-mono text-[9px] text-ink-600">
+            Receipt {row.or_no}
+          </span>
+        )}
+        {hasCollected && (
+          <span
+            className={cn(
+              'rounded px-1.5 py-0.5 text-[9px] font-medium',
+              row.ar_collected ? 'bg-teal-100 text-teal-700' : 'bg-orange-100 text-orange-700',
+            )}
+          >
+            AR {row.ar_collected ? 'collected' : 'not collected'}
+          </span>
+        )}
+        {hasAttached && (
+          <span
+            className={cn(
+              'rounded px-1.5 py-0.5 text-[9px] font-medium',
+              row.attached_2307 ? 'bg-teal-100 text-teal-700' : 'bg-orange-100 text-orange-700',
+            )}
+          >
+            2307 {row.attached_2307 ? 'Attached' : 'Not attached'}
+          </span>
+        )}
+      </span>
+      {row.ar_collected === false && row.remarks && (
+        <span className="max-w-[170px] truncate text-[9px] text-ink-400" title={row.remarks}>
+          {row.remarks}
+        </span>
+      )}
     </span>
   )
 }
 
 // Every check starts "included" (assumed being submitted) with an empty OR
-// number and no AR-collected answer, so the admin's default action is to
-// fill in details for everything selected — they only need to exclude rows
-// they change their mind about.
+// number and no AR-collected / 2307-attached answer, so the admin's
+// default action is to fill in details for everything selected — they
+// only need to exclude rows they change their mind about.
 function buildInitialSubmitEntries(rowsList) {
   const initial = {}
   rowsList.forEach((r) => {
-    initial[r.id] = { include: true, orNo: '', collected: null, remarks: '' }
+    initial[r.id] = { include: true, receiptType: '', receiptNo: '', collected: null, attached2307: null, remarks: '' }
   })
   return initial
 }
@@ -1226,13 +1396,21 @@ function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
         include: value,
         orNo: value ? prev[id]?.orNo || '' : '',
         collected: value ? prev[id]?.collected ?? null : null,
+        attached2307: value ? prev[id]?.attached2307 ?? null : null,
         remarks: value ? prev[id]?.remarks || '' : '',
       },
     }))
   }, [])
 
-  const updateOrNo = useCallback((id, value) => {
-    setEntries((prev) => ({ ...prev, [id]: { ...prev[id], orNo: value } }))
+// Changing the receipt type clears any previously entered number — a
+  // number typed while "OR" was selected shouldn't silently carry over as,
+  // say, a "CR" number just because the admin corrected a wrong type pick.
+  const updateReceiptType = useCallback((id, value) => {
+    setEntries((prev) => ({ ...prev, [id]: { ...prev[id], receiptType: value, receiptNo: '' } }))
+  }, [])
+
+  const updateReceiptNo = useCallback((id, value) => {
+    setEntries((prev) => ({ ...prev, [id]: { ...prev[id], receiptNo: value } }))
   }, [])
 
   const updateCollected = useCallback((id, value) => {
@@ -1242,6 +1420,10 @@ function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
     }))
   }, [])
 
+  const updateAttached2307 = useCallback((id, value) => {
+    setEntries((prev) => ({ ...prev, [id]: { ...prev[id], attached2307: value } }))
+  }, [])
+
   const updateRemarks = useCallback((id, value) => {
     setEntries((prev) => ({ ...prev, [id]: { ...prev[id], remarks: value } }))
   }, [])
@@ -1249,9 +1431,10 @@ function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
   const trimmedName = collectorName.trim()
   const nameEntered = trimmedName.length > 0
 
-  // How many included checks currently have a complete outcome, and
-  // whether any entered OR numbers collide.
-  const { completedCount, duplicateOrNos, includeCount } = useMemo(() => {
+  // How many included checks currently have a complete outcome (OR no. +
+  // AR collected + 2307 Attached, plus a reason if AR wasn't collected),
+  // and whether any entered OR numbers collide.
+ const { completedCount, duplicateOrNos, includeCount } = useMemo(() => {
     const seenCounts = {}
     let completed = 0
     let included = 0
@@ -1259,11 +1442,13 @@ function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
       const entry = entries[r.id]
       if (!entry?.include) return
       included += 1
-      const orNo = entry.orNo?.trim() ?? ''
+      const receiptNo = composeReceiptNo(entry)
       const reasonOk = entry.collected !== false || !!entry.remarks?.trim()
-      if (orNo && entry.collected !== null && entry.collected !== undefined && reasonOk) completed += 1
-      if (orNo) {
-        const key = orNo.toLowerCase()
+      const hasCollected = entry.collected !== null && entry.collected !== undefined
+      const hasAttached = entry.attached2307 !== null && entry.attached2307 !== undefined
+      if (receiptNo && hasCollected && hasAttached && reasonOk) completed += 1
+      if (receiptNo) {
+        const key = receiptNo.toLowerCase()
         seenCounts[key] = (seenCounts[key] || 0) + 1
       }
     })
@@ -1296,7 +1481,7 @@ function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
         role="dialog"
         aria-modal="true"
         aria-labelledby="submit-approval-title"
-        className="relative w-full max-w-2xl overflow-hidden rounded-xl bg-white shadow-xl"
+        className="relative w-full max-w-3xl overflow-hidden rounded-xl bg-white shadow-xl"
       >
         <div className="flex items-center justify-between border-b border-ink-100 px-5 py-4">
           <h2 id="submit-approval-title" className="text-lg font-semibold text-ink-900">
@@ -1313,17 +1498,18 @@ function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
         </div>
 
         <div className="max-h-[75vh] overflow-y-auto px-5 py-4">
-          <p className="text-sm text-ink-600">
+        <p className="text-sm text-ink-600">
             {rows.length === 1 ? (
               <>
                 Enter who is collecting <span className="font-medium text-ink-900">{rows[0].payee}</span>'s check,
-                then confirm the OR number and AR status. It goes to an approver for verification before it's marked
-                picked up.
+                then confirm the receipt type &amp; number, AR status, and 2307 Attached status. It goes to an
+                approver for verification before it's marked picked up.
               </>
             ) : (
               <>
-                Enter who is collecting these {rows.length} checks, then confirm the OR number and AR status for
-                each. They go to an approver for verification before they're marked picked up.
+                Enter who is collecting these {rows.length} checks, then confirm the receipt type &amp; number,
+                AR status, and 2307 Attached status for each. They go to an approver for verification before
+                they're marked picked up.
               </>
             )}
           </p>
@@ -1341,14 +1527,14 @@ function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
           {nameEntered && (
             <div className="mt-4">
               <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                <p className="text-xs font-medium text-ink-500">Per-check details</p>
+                <p className="text-[11px] font-medium text-ink-500">Per-check details</p>
                 <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="rounded-full bg-ledger-stamp/10 px-2 py-0.5 text-[11px] font-medium text-ledger-stamp">
+                  <span className="rounded-full bg-ledger-stamp/10 px-2 py-0.5 text-[9px] font-medium text-ledger-stamp">
                     {includeCount} to submit
                   </span>
                   <span
                     className={cn(
-                      'rounded-full px-2 py-0.5 text-[11px] font-medium',
+                      'rounded-full px-2 py-0.5 text-[9px] font-medium',
                       allComplete ? 'bg-ledger-stamp/10 text-ledger-stamp' : 'bg-orange-100 text-orange-700',
                     )}
                   >
@@ -1357,29 +1543,43 @@ function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
                 </div>
               </div>
 
-              <div className="max-h-[22rem] overflow-y-auto rounded-md border border-ink-100">
-                <table className="w-full text-xs">
+              <div className="max-h-[22rem] overflow-x-auto overflow-y-auto rounded-md border border-ink-100">
+                <table className="w-full min-w-[720px] text-[10px]">
                   <thead className="sticky top-0 bg-ink-50">
-                    <tr className="text-left uppercase tracking-wide text-ink-400">
-                      <th className="px-3 py-1.5 font-medium">Include</th>
-                      <th className="px-3 py-1.5 font-medium">Check no.</th>
-                      <th className="px-3 py-1.5 font-medium">Payee</th>
-                      <th className="px-3 py-1.5 text-right font-medium">Amount</th>
-                      <th className="px-3 py-1.5 font-medium">OR no.</th>
-                      <th className="px-3 py-1.5 font-medium">AR collected</th>
-                      <th className="px-3 py-1.5 font-medium">Remarks</th>
+                   <tr className="text-left uppercase tracking-wide text-ink-400">
+                      <th className="px-2 py-1.5 font-medium">Include</th>
+                      <th className="px-2 py-1.5 font-medium">Check no.</th>
+                      <th className="px-2 py-1.5 font-medium">Payee</th>
+                      <th className="px-2 py-1.5 text-right font-medium">Amount</th>
+                      <th className="px-2 py-1.5 font-medium">Receipt</th>
+                      <th className="px-2 py-1.5 font-medium">AR collected</th>
+                      <th className="px-2 py-1.5 font-medium">2307 Attached</th>
+                      <th className="px-2 py-1.5 font-medium">Remarks</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-ink-50">
                     {rows.map((r, idx) => {
-                      const entry = entries[r.id] || { include: true, orNo: '', collected: null, remarks: '' }
-                      const trimmedOrNo = entry.orNo?.trim() ?? ''
-                      const isDuplicate = entry.include && trimmedOrNo && duplicateOrNos.has(trimmedOrNo.toLowerCase())
+                     const entry =
+                        entries[r.id] || {
+                          include: true,
+                          receiptType: '',
+                          receiptNo: '',
+                          collected: null,
+                          attached2307: null,
+                          remarks: '',
+                        }
+                      const composedReceipt = composeReceiptNo(entry)
+                      const isDuplicate = entry.include && composedReceipt && duplicateOrNos.has(composedReceipt.toLowerCase())
                       const needsReason = entry.include && entry.collected === false
                       const missingReason = needsReason && !entry.remarks?.trim()
                       const rowIncomplete =
                         entry.include &&
-                        (!trimmedOrNo || entry.collected === null || entry.collected === undefined || missingReason)
+                        (!composedReceipt ||
+                          entry.collected === null ||
+                          entry.collected === undefined ||
+                          entry.attached2307 === null ||
+                          entry.attached2307 === undefined ||
+                          missingReason)
 
                       return (
                         <tr
@@ -1390,7 +1590,7 @@ function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
                             entry.include && !isDuplicate && rowIncomplete && 'bg-amber-50/50',
                           )}
                         >
-                          <td className="px-3 py-2">
+                          <td className="px-2 py-1.5">
                             <button
                               type="button"
                               onClick={() => updateInclude(r.id, !entry.include)}
@@ -1402,38 +1602,55 @@ function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
                               }
                               className={entry.include ? 'text-ledger-stamp' : 'text-ink-300 hover:text-ink-500'}
                             >
-                              {entry.include ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
+                              {entry.include ? <CheckSquare className="h-3.5 w-3.5" /> : <Square className="h-3.5 w-3.5" />}
                             </button>
                           </td>
-                          <td className="px-3 py-2 font-mono text-ink-700">{r.check_no || '—'}</td>
-                          <td className="max-w-[110px] truncate px-3 py-2 text-ink-900">{r.payee || '—'}</td>
-                          <td className="px-3 py-2 text-right font-mono text-ink-700">{formatCurrency(r.amount)}</td>
-                          <td className="px-2 py-1.5">
+                          <td className="px-2 py-1.5 font-mono text-ink-700">{r.check_no || '—'}</td>
+                          <td className="max-w-[100px] truncate px-2 py-1.5 text-ink-900">{r.payee || '—'}</td>
+                          <td className="px-2 py-1.5 text-right font-mono text-ink-700">{formatCurrency(r.amount)}</td>
+                      <td className="px-1.5 py-1">
                             {entry.include ? (
-                              <>
-                                <input
-                                  type="text"
-                                  inputMode="numeric"
-                                  value={entry.orNo}
-                                  onChange={(e) => updateOrNo(r.id, e.target.value)}
-                                  onBlur={(e) => updateOrNo(r.id, e.target.value.trim())}
-                                  placeholder="OR no."
-                                  maxLength={40}
-                                  aria-label={`OR number for check ${r.check_no || idx + 1}`}
-                                  className={cn(
-                                    'w-24 rounded border px-2 py-1 text-xs text-ink-800 focus:outline-none focus:ring-1 focus:ring-ledger-stamp',
-                                    isDuplicate ? 'border-red-400' : 'border-ink-200',
-                                  )}
-                                />
-                                {isDuplicate && (
-                                  <p className="mt-0.5 text-[10px] leading-tight text-red-600">Duplicate</p>
+                              <div className="flex flex-col gap-1">
+                                <select
+                                  value={entry.receiptType}
+                                  onChange={(e) => updateReceiptType(r.id, e.target.value)}
+                                  aria-label={`Receipt type for check ${r.check_no || idx + 1}`}
+                                  className="w-16 rounded border border-ink-200 px-1 py-1 text-[10px] text-ink-800 focus:outline-none focus:ring-1 focus:ring-ledger-stamp"
+                                >
+                                  <option value="">Type</option>
+                                  {RECEIPT_TYPES.map((rt) => (
+                                    <option key={rt} value={rt}>
+                                      {rt}
+                                    </option>
+                                  ))}
+                                </select>
+                                {entry.receiptType && (
+                                  <>
+                                    <input
+                                      type="text"
+                                      inputMode="numeric"
+                                      value={entry.receiptNo}
+                                      onChange={(e) => updateReceiptNo(r.id, e.target.value)}
+                                      onBlur={(e) => updateReceiptNo(r.id, e.target.value.trim())}
+                                      placeholder={`${entry.receiptType} no.`}
+                                      maxLength={40}
+                                      aria-label={`${entry.receiptType} number for check ${r.check_no || idx + 1}`}
+                                      className={cn(
+                                        'w-20 rounded border px-1.5 py-1 text-[10px] text-ink-800 focus:outline-none focus:ring-1 focus:ring-ledger-stamp',
+                                        isDuplicate ? 'border-red-400' : 'border-ink-200',
+                                      )}
+                                    />
+                                    {isDuplicate && (
+                                      <p className="mt-0.5 text-[8px] leading-tight text-red-600">Duplicate</p>
+                                    )}
+                                  </>
                                 )}
-                              </>
+                              </div>
                             ) : (
                               <span className="text-ink-300">—</span>
                             )}
                           </td>
-                          <td className="px-2 py-1.5">
+                          <td className="px-1.5 py-1">
                             {entry.include ? (
                               <div
                                 className="flex gap-1"
@@ -1445,7 +1662,7 @@ function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
                                   onClick={() => updateCollected(r.id, true)}
                                   aria-pressed={entry.collected === true}
                                   className={cn(
-                                    'rounded border px-2 py-1 text-[11px] font-medium transition',
+                                    'rounded border px-1.5 py-1 text-[9px] font-medium transition',
                                     entry.collected === true
                                       ? 'border-ledger-stamp bg-ledger-stamp text-white'
                                       : 'border-ink-200 text-ink-500 hover:bg-ink-50',
@@ -1458,7 +1675,7 @@ function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
                                   onClick={() => updateCollected(r.id, false)}
                                   aria-pressed={entry.collected === false}
                                   className={cn(
-                                    'rounded border px-2 py-1 text-[11px] font-medium transition',
+                                    'rounded border px-1.5 py-1 text-[9px] font-medium transition',
                                     entry.collected === false
                                       ? 'border-ink-700 bg-ink-700 text-white'
                                       : 'border-ink-200 text-ink-500 hover:bg-ink-50',
@@ -1471,7 +1688,45 @@ function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
                               <span className="text-ink-300">—</span>
                             )}
                           </td>
-                          <td className="px-2 py-1.5">
+                          <td className="px-1.5 py-1">
+                            {entry.include ? (
+                              <div
+                                className="flex gap-1"
+                                role="group"
+                                aria-label={`2307 Attached for check ${r.check_no || idx + 1}`}
+                              >
+                                <button
+                                  type="button"
+                                  onClick={() => updateAttached2307(r.id, true)}
+                                  aria-pressed={entry.attached2307 === true}
+                                  className={cn(
+                                    'rounded border px-1.5 py-1 text-[9px] font-medium transition',
+                                    entry.attached2307 === true
+                                      ? 'border-ledger-stamp bg-ledger-stamp text-white'
+                                      : 'border-ink-200 text-ink-500 hover:bg-ink-50',
+                                  )}
+                                >
+                                  Yes
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => updateAttached2307(r.id, false)}
+                                  aria-pressed={entry.attached2307 === false}
+                                  className={cn(
+                                    'rounded border px-1.5 py-1 text-[9px] font-medium transition',
+                                    entry.attached2307 === false
+                                      ? 'border-ink-700 bg-ink-700 text-white'
+                                      : 'border-ink-200 text-ink-500 hover:bg-ink-50',
+                                  )}
+                                >
+                                  No
+                                </button>
+                              </div>
+                            ) : (
+                              <span className="text-ink-300">—</span>
+                            )}
+                          </td>
+                          <td className="px-1.5 py-1">
                             {needsReason ? (
                               <input
                                 type="text"
@@ -1481,7 +1736,7 @@ function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
                                 maxLength={200}
                                 aria-label={`Remarks for check ${r.check_no || idx + 1}`}
                                 className={cn(
-                                  'w-40 rounded border px-2 py-1 text-xs text-ink-800 focus:outline-none focus:ring-1 focus:ring-ledger-stamp',
+                                  'w-32 rounded border px-1.5 py-1 text-[10px] text-ink-800 focus:outline-none focus:ring-1 focus:ring-ledger-stamp',
                                   missingReason ? 'border-orange-400' : 'border-ink-200',
                                 )}
                               />
@@ -1496,14 +1751,14 @@ function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
                 </table>
               </div>
 
-              {!allComplete && (
+             {!allComplete && (
                 <p className="mt-2 flex items-center gap-1.5 text-xs text-orange-600">
                   <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
                   {includeCount === 0
                     ? 'Include at least one check to submit.'
                     : hasDuplicates
-                    ? 'Each check needs its own unique OR number.'
-                    : "Every included check needs an OR number and AR-collected status (plus a reason if AR wasn't collected)."}
+                    ? 'Each check needs its own unique receipt type + number.'
+                    : "Every included check needs a receipt type & number, AR-collected status, and 2307 Attached status (plus a reason if AR wasn't collected)."}
                 </p>
               )}
             </div>
@@ -1546,9 +1801,9 @@ function SkeletonRows({ count, cellPad }) {
     <>
       {Array.from({ length: count }).map((_, i) => (
         <tr key={i}>
-          {Array.from({ length: 10 }).map((__, j) => (
+          {Array.from({ length: 11 }).map((__, j) => (
             <td key={j} className={cellPad}>
-              <div className="h-3.5 w-full max-w-[7rem] animate-pulse rounded bg-ink-100" />
+              <div className="h-3 w-full max-w-[7rem] animate-pulse rounded bg-ink-100" />
             </td>
           ))}
         </tr>
