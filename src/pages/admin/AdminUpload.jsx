@@ -18,6 +18,7 @@ import {
   Filter,
   CheckSquare,
   Square,
+  Lock,
   Wallet,
   Layers,
   X,
@@ -92,8 +93,15 @@ const FLAG_LABELS = {
   negativeAmount: 'Negative amount',
   missingDate: 'Missing or unreadable date',
   futureDate: 'Check dated in the future',
-  duplicateCheckNo: 'Duplicate check no. in this file',
-  existsInSystem: 'Check no. already in the system',
+  duplicateCheckNo: 'Duplicate check no. for this bank (in this file)',
+  existsInSystem: 'Check no. already imported for this bank',
+}
+
+// Builds the composite key duplicate detection is scoped to. A check number
+// is only a duplicate if it repeats under the SAME bank — the same number
+// from two different banks is perfectly valid and must never collide here.
+function bankCheckKey(bank, checkNo) {
+  return `${String(bank).trim().toLowerCase()}::${String(checkNo).trim().toLowerCase()}`
 }
 
 // best-effort auto-detection of column headers
@@ -242,9 +250,11 @@ export default function AdminUpload() {
   const [previewSearch, setPreviewSearch] = useState('')
   const [showFlaggedOnly, setShowFlaggedOnly] = useState(false)
 
-  // Cross-checks the mapped check numbers against what's already in the
-  // database, so re-uploading the same batch (or an overlapping one) gets
-  // caught before it creates duplicate register entries.
+  // Cross-checks the mapped (bank, check no.) pairs against what's already
+  // in the database, so re-uploading the same batch (or an overlapping one)
+  // gets caught before it creates duplicate register entries. Scoped to the
+  // currently selected bank — the same check no. under a different bank is
+  // not a duplicate.
   const [existingCheckNos, setExistingCheckNos] = useState(() => new Set())
   const [checkingDuplicates, setCheckingDuplicates] = useState(false)
 
@@ -294,10 +304,12 @@ export default function AdminUpload() {
       }
     })
 
+    // Duplicate detection is scoped to (bank, check no.) — never check no.
+    // alone — so the same number under two different banks never collides.
     const checkNoCounts = new Map()
     draft.forEach((r) => {
       if (!r.check_no) return
-      const key = r.check_no.toLowerCase()
+      const key = bankCheckKey(r.bank, r.check_no)
       checkNoCounts.set(key, (checkNoCounts.get(key) || 0) + 1)
     })
 
@@ -313,23 +325,24 @@ export default function AdminUpload() {
         negativeAmount: !r.amountInvalid && r.amount < 0,
         missingDate: !r.check_date,
         futureDate: !!r.check_date && new Date(r.check_date) > todayEnd,
-        duplicateCheckNo: !!r.check_no && checkNoCounts.get(r.check_no.toLowerCase()) > 1,
+        duplicateCheckNo: !!r.check_no && checkNoCounts.get(bankCheckKey(r.bank, r.check_no)) > 1,
       }
       const hasIssue = Object.values(flags).some(Boolean)
       return { ...r, flags, hasIssue }
     })
   }, [mappingComplete, bankValid, bankValue, rawRows, headers, mapping])
 
-  // Looks up mapped check numbers against the database. Debounced and
-  // best-effort: if it fails or is still running, the import flow is never
-  // blocked — this is an extra safety net, not a hard gate.
+  // Looks up mapped (bank, check no.) pairs against the database. Debounced
+  // and best-effort in the sense that a failed/slow lookup never blocks the
+  // UI — but any match it does find is treated as a hard duplicate (see the
+  // force-exclude effect below), not just a warning.
   useEffect(() => {
     if (normalizedRows.length === 0) {
       setExistingCheckNos(new Set())
       return
     }
     const uniqueNos = [...new Set(normalizedRows.map((r) => r.check_no).filter(Boolean))]
-    if (uniqueNos.length === 0) {
+    if (uniqueNos.length === 0 || !bankValue) {
       setExistingCheckNos(new Set())
       return
     }
@@ -341,7 +354,11 @@ export default function AdminUpload() {
         const found = new Set()
         for (let i = 0; i < uniqueNos.length; i += DUPLICATE_CHECK_CHUNK_SIZE) {
           const chunk = uniqueNos.slice(i, i + DUPLICATE_CHECK_CHUNK_SIZE)
-          const { data, error } = await supabase.from('checks').select('check_no').in('check_no', chunk)
+          const { data, error } = await supabase
+            .from('checks')
+            .select('check_no')
+            .eq('bank', bankValue) // scope to this bank only
+            .in('check_no', chunk)
           if (!error && data) {
             data.forEach((d) => d.check_no && found.add(String(d.check_no).toLowerCase()))
           }
@@ -359,18 +376,37 @@ export default function AdminUpload() {
       cancelled = true
       clearTimeout(t)
     }
-  }, [normalizedRows])
+  }, [normalizedRows, bankValue])
 
   // Merges the synchronous validation flags with the async system-duplicate
-  // check into the rows the rest of the UI actually renders from.
+  // check into the rows the rest of the UI actually renders from. `blocked`
+  // marks rows that are strictly disallowed — a duplicate (bank, check no.)
+  // pair, either within this file or already in the system — and can never
+  // be included in the import.
   const enrichedRows = useMemo(() => {
     if (normalizedRows.length === 0) return []
     return normalizedRows.map((r) => {
       const existsInSystem = !!r.check_no && existingCheckNos.has(r.check_no.toLowerCase())
       const flags = { ...r.flags, existsInSystem }
-      return { ...r, flags, hasIssue: r.hasIssue || existsInSystem }
+      const blocked = flags.duplicateCheckNo || existsInSystem
+      return { ...r, flags, hasIssue: r.hasIssue || existsInSystem, blocked }
     })
   }, [normalizedRows, existingCheckNos])
+
+  // Duplicate (bank, check no.) pairs are strictly not allowed — force them
+  // out of the included set the moment they're detected, and keep them out
+  // even if excludedRows gets reset elsewhere (e.g. "Include all").
+  useEffect(() => {
+    const blockedIndices = enrichedRows.filter((r) => r.blocked).map((r) => r.index)
+    if (blockedIndices.length === 0) return
+    setExcludedRows((prev) => {
+      const alreadyExcluded = blockedIndices.every((i) => prev.has(i))
+      if (alreadyExcluded) return prev
+      const next = new Set(prev)
+      blockedIndices.forEach((i) => next.add(i))
+      return next
+    })
+  }, [enrichedRows])
 
   const existsInSystemCount = useMemo(
     () => enrichedRows.filter((r) => r.flags.existsInSystem).length,
@@ -391,8 +427,9 @@ export default function AdminUpload() {
   }, [enrichedRows])
 
   // KPI summary — total rows, how many are actually going to be imported
-  // once exclusions are applied, how many still need review, and the
-  // dollar total of what's about to be saved.
+  // once exclusions (including forced ones) are applied, how many still
+  // need review, how many are strictly blocked, and the dollar total of
+  // what's about to be saved.
   const stats = useMemo(() => {
     if (enrichedRows.length === 0) return null
     const included = enrichedRows.filter((r) => !excludedRows.has(r.index))
@@ -405,6 +442,7 @@ export default function AdminUpload() {
       excluded: excludedRows.size,
       valid: validIncluded.length,
       flagged: flaggedIncluded.length,
+      blocked: enrichedRows.filter((r) => r.blocked).length,
       totalAmount,
       duplicateCount: issueBreakdown.duplicateCheckNo,
     }
@@ -572,11 +610,15 @@ export default function AdminUpload() {
     if (value !== OTHER_BANK_VALUE) setCustomBank('')
   }
 
-  function toggleRowExcluded(index) {
+  // Duplicate (bank, check no.) pairs are strictly disallowed and cannot be
+  // manually re-included — the checkbox for those rows is disabled in the
+  // UI, and this is the second line of defense.
+  function toggleRowExcluded(row) {
+    if (row.blocked) return
     setExcludedRows((prev) => {
       const next = new Set(prev)
-      if (next.has(index)) next.delete(index)
-      else next.add(index)
+      if (next.has(row.index)) next.delete(row.index)
+      else next.add(row.index)
       return next
     })
   }
@@ -592,18 +634,21 @@ export default function AdminUpload() {
   }
 
   function includeAllRows() {
-    setExcludedRows(new Set())
+    // Blocked rows (duplicate bank + check no.) stay excluded even on bulk include.
+    setExcludedRows(new Set(enrichedRows.filter((r) => r.blocked).map((r) => r.index)))
   }
 
   async function handleImport() {
     if (!mappingComplete || !bankValid || saving) return
 
-    const includedRows = enrichedRows.filter((r) => !excludedRows.has(r.index))
+    // Defense in depth: never send a blocked (duplicate bank + check no.)
+    // row to the database, regardless of what excludedRows currently holds.
+    const includedRows = enrichedRows.filter((r) => !excludedRows.has(r.index) && !r.blocked)
     if (includedRows.length === 0) {
       push({
         variant: 'error',
         title: 'Nothing to import',
-        description: 'Every row is excluded. Include at least one row before importing.',
+        description: 'Every row is excluded or blocked as a duplicate. Include at least one row before importing.',
       })
       return
     }
@@ -658,12 +703,13 @@ export default function AdminUpload() {
         setImportProgress(Math.round((Math.min(i + chunk.length, toInsert.length) / toInsert.length) * 100))
       }
 
+      const excludedTotal = enrichedRows.length - toInsert.length
       push({
         variant: 'success',
         title: 'Import complete',
         description:
-          excludedRows.size > 0
-            ? `${toInsert.length} ${bankValue} checks added from ${fileName} (${excludedRows.size} excluded).`
+          excludedTotal > 0
+            ? `${toInsert.length} ${bankValue} checks added from ${fileName} (${excludedTotal} excluded).`
             : `${toInsert.length} ${bankValue} checks added from ${fileName}.`,
       })
       setImportedBank(bankValue)
@@ -935,17 +981,20 @@ export default function AdminUpload() {
                     </div>
                   )}
 
-                  {mappingComplete && existsInSystemCount > 0 && (
+                  {mappingComplete && stats && stats.blocked > 0 && (
                     <div className="mt-4 flex items-start gap-2 rounded-md border border-red-200 bg-red-50 px-3.5 py-3 text-xs text-red-700">
                       <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                       <div>
                         <p className="font-medium">
-                          {existsInSystemCount} check number{existsInSystemCount === 1 ? '' : 's'} already{' '}
-                          {existsInSystemCount === 1 ? 'exists' : 'exist'} in the system
+                          {stats.blocked} row{stats.blocked === 1 ? '' : 's'} blocked — duplicate check no. for{' '}
+                          {bankValue}
                         </p>
                         <p className="mt-0.5 text-red-600/90">
-                          This may be a duplicate upload. Matching rows are highlighted red in the preview —
-                          review them or use the checkbox to exclude them before importing.
+                          {existsInSystemCount > 0
+                            ? `${existsInSystemCount} of these already ${existsInSystemCount === 1 ? 'exists' : 'exist'} in the system for this bank. `
+                            : ''}
+                          Duplicate check numbers for the same bank aren't allowed. Matching rows are highlighted
+                          red and automatically excluded — they can't be re-included.
                         </p>
                       </div>
                     </div>
@@ -967,8 +1016,9 @@ export default function AdminUpload() {
                           ))}
                       </ul>
                       <p className="mt-1.5 text-ink-400">
-                        Flagged rows are still included by default and will be imported unless you exclude them
-                        below.
+                        Rows with a duplicate check no. for this bank are locked out and can't be re-included.
+                        Other flagged rows are still included by default and will be imported unless you exclude
+                        them below.
                       </p>
                     </div>
                   )}
@@ -1019,7 +1069,7 @@ export default function AdminUpload() {
                     <button
                       type="button"
                       onClick={includeAllRows}
-                      disabled={excludedRows.size === 0}
+                      disabled={excludedRows.size === 0 || excludedRows.size === (stats?.blocked ?? 0)}
                       className="flex shrink-0 items-center gap-1 rounded-md border border-ink-200 px-2.5 py-1.5 text-xs font-medium text-ink-500 hover:bg-ink-50 disabled:opacity-40"
                     >
                       Include all
@@ -1067,12 +1117,36 @@ export default function AdminUpload() {
                               <td className="px-3 py-2">
                                 <button
                                   type="button"
-                                  onClick={() => toggleRowExcluded(r.index)}
+                                  onClick={() => toggleRowExcluded(r)}
+                                  disabled={r.blocked}
                                   aria-pressed={!isExcluded}
-                                  aria-label={isExcluded ? `Include row ${r.rowNumber}` : `Exclude row ${r.rowNumber}`}
-                                  className={isExcluded ? 'text-ink-300 hover:text-ink-500' : 'text-teal-600'}
+                                  aria-label={
+                                    r.blocked
+                                      ? `Row ${r.rowNumber} blocked — duplicate check no. for this bank`
+                                      : isExcluded
+                                      ? `Include row ${r.rowNumber}`
+                                      : `Exclude row ${r.rowNumber}`
+                                  }
+                                  title={
+                                    r.blocked
+                                      ? 'Duplicate check no. for this bank — cannot be imported'
+                                      : undefined
+                                  }
+                                  className={cn(
+                                    r.blocked
+                                      ? 'cursor-not-allowed text-red-400'
+                                      : isExcluded
+                                      ? 'text-ink-300 hover:text-ink-500'
+                                      : 'text-teal-600',
+                                  )}
                                 >
-                                  {isExcluded ? <Square className="h-4 w-4" /> : <CheckSquare className="h-4 w-4" />}
+                                  {r.blocked ? (
+                                    <Lock className="h-4 w-4" />
+                                  ) : isExcluded ? (
+                                    <Square className="h-4 w-4" />
+                                  ) : (
+                                    <CheckSquare className="h-4 w-4" />
+                                  )}
                                 </button>
                               </td>
                               <td className="px-3 py-2 font-mono text-ink-300">{r.rowNumber}</td>
@@ -1118,11 +1192,11 @@ export default function AdminUpload() {
                                 )}
                                 title={
                                   r.flags.duplicateCheckNo && r.flags.existsInSystem
-                                    ? 'Duplicate within this file, and already exists in the system'
+                                    ? 'Duplicate within this file for this bank, and already imported for this bank'
                                     : r.flags.duplicateCheckNo
-                                    ? 'Duplicate check number within this file'
+                                    ? 'Duplicate check number within this file for this bank'
                                     : r.flags.existsInSystem
-                                    ? 'This check number already exists in the system'
+                                    ? 'This check number is already imported for this bank'
                                     : undefined
                                 }
                               >
