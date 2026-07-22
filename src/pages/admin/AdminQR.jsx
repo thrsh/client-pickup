@@ -16,6 +16,8 @@ import {
   Ruler,
   ShieldCheck,
   Infinity as InfinityIcon,
+  Home,
+  Users,
 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '../../components/ui/card'
 import { Input } from '../../components/ui/input'
@@ -24,6 +26,8 @@ import { useToast } from '../../components/ui/toast'
 import { cn } from '../../lib/utils'
 
 const DEFAULT_URL = window.location.origin + '/'
+// Second quick-select destination — the collector-facing search page.
+const COLLECTOR_URL = window.location.origin + '/collector'
 const REGEN_DEBOUNCE_MS = 250
 // Rendered well above the on-screen display size so downloads and prints
 // stay crisp — 1000px is comfortably sharp up to a large-format sign.
@@ -49,6 +53,7 @@ export default function AdminQR() {
   const trimmedUrl = url.trim()
   const isValidUrl = looksLikeUrl(trimmedUrl)
   const isDefault = trimmedUrl === DEFAULT_URL
+  const isCollector = trimmedUrl === COLLECTOR_URL
   const ready = !generating && !genError && !!pngDataUrl
 
   useEffect(() => {
@@ -221,10 +226,33 @@ export default function AdminQR() {
             <CardHeader>
               <CardTitle>Destination link</CardTitle>
               <CardDescription>
-                Defaults to this site's home page. Change it if you deploy under a custom domain.
+                Pick a page to point the code at, or paste a custom URL — for example if you deploy
+                under a different domain.
               </CardDescription>
             </CardHeader>
             <CardContent className="pt-0">
+              {/* Quick-select presets. Home is the general public search page;
+                  Collector is the /collector page used at the pickup counter.
+                  Picking either just fills the URL field below — it's still a
+                  free-text input underneath, so a custom URL can be pasted in
+                  too. */}
+              <div className="mb-3 flex gap-2">
+                <Button
+                  variant={isDefault ? 'default' : 'outline'}
+                  onClick={() => setUrl(DEFAULT_URL)}
+                  className="flex-1"
+                >
+                  <Home className="h-3.5 w-3.5" /> Home
+                </Button>
+                <Button
+                  variant={isCollector ? 'default' : 'outline'}
+                  onClick={() => setUrl(COLLECTOR_URL)}
+                  className="flex-1"
+                >
+                  <Users className="h-3.5 w-3.5" /> Collector
+                </Button>
+              </div>
+
               <label className="mb-1 flex items-center gap-1.5 text-xs font-medium text-ink-500">
                 <Link2 className="h-3.5 w-3.5" /> URL encoded in the QR code
               </label>
