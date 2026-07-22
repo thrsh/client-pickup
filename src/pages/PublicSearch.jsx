@@ -661,7 +661,7 @@ function ManifestCountCard({ loading, count, bank, payee, payor }) {
           </span>
         </div>
 
-       <div className="flex flex-col items-center gap-3 mt-2 w-full">
+  <div className="flex flex-col items-center gap-3 mt-2 w-full">
   <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">Check details</p>
   <div className="w-full max-w-md grid grid-cols-3 gap-0 rounded-xl bg-slate-50 shadow-inner border border-slate-200 overflow-hidden">
     <div className="flex flex-col items-center gap-1 px-4 py-4 border-r border-slate-200">
@@ -672,19 +672,34 @@ function ManifestCountCard({ loading, count, bank, payee, payor }) {
     </div>
     <div className="flex flex-col items-center gap-1 px-4 py-4 border-r border-slate-200">
       <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-       
         Payee
       </span>
       <span className="text-sm font-semibold text-[var(--ink)] text-center break-words">{payee}</span>
     </div>
     <div className="flex flex-col items-center gap-1 px-4 py-4">
       <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-     
         Payor
       </span>
       <span className="text-sm font-semibold text-[var(--ink)] text-center break-words">{payor}</span>
     </div>
   </div>
+
+  {/* Pickup location */}
+  <div className="w-full max-w-md rounded-xl bg-[var(--brand)]/5 border border-[var(--brand-light)] px-5 py-4">
+    <div className="flex items-center justify-center gap-1.5 text-[11px] font-semibold uppercase tracking-widest text-[var(--brand-dark)] mb-2">
+      <MapPin className="h-3.5 w-3.5" />
+      Pickup location
+    </div>
+    <p className="text-sm font-semibold text-[var(--ink-dark)]">Manila Office</p>
+    <p className="mt-1 text-sm leading-relaxed text-slate-600">
+      4th Floor, Unit 407-408<br />
+      Kawayan Building 1, PARQAL<br />
+      Aseana City, D. Macapagal Ave.<br />
+      Brgy. Tambo, Parañaque City 1701<br />
+      Philippines
+    </p>
+  </div>
+
   <div className="flex items-center gap-1.5 text-xs font-medium text-slate-400">
     <Clock className="h-3.5 w-3.5" />
     Queried {new Date().toLocaleString()}

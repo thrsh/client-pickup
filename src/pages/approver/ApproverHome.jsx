@@ -35,11 +35,19 @@
 //   - All KPI figures on this page are derived live from `groups` (the
 //     current pending-approval dataset) via useMemo, recomputed on every
 //     poll/refresh and every second (for wait-time figures). Nothing here
-//     is hardcoded or sampled — if a number looks wrong, it's a data bug
-//     upstream, not a stale display.
-//   - The top KPI row always reflects the FULL pending-approval queue,
-//     regardless of active filters, so approvers always have an accurate
-//     top-level picture even while drilled into a filtered view.
+//     is hardcoded or sampled.
+//   - The top KPI row always reflects the FULL loaded pending-approval
+//     dataset, regardless of active filters, so approvers always have an
+//     accurate top-level picture even while drilled into a filtered view.
+//   - FIXED (see load() below, MAX_PENDING_ROWS): this page used to cap
+//     its fetch at an arbitrary `.limit(150)` with no way to know if the
+//     real queue was bigger. `groups` — and therefore every KPI card — was
+//     silently truncated once the pending-approval queue passed 150
+//     checks, even though the comment above claimed nothing was sampled.
+//     The fetch now asks Postgres for an exact count of matching rows
+//     alongside the (much higher) capped page of data, and the UI shows an
+//     explicit "showing X of Y" warning banner if the true count ever
+//     exceeds what was loaded, instead of quietly under-reporting totals.
 //   - The advanced filter panel filters at the individual check level
 //     (AR status, submitter, amount) and at the order/group level
 //     (collector, waiting time), then drops any group left with zero
@@ -55,8 +63,8 @@
 //     moved to `pending_approval` (admin_submit_for_approval only needs to
 //     touch the check rows, not the parent reservation row). Filtering
 //     reservations-first silently dropped those checks from this page even
-//     though ApproverDashboard.jsx — which queries `checks.status` directly
-//     — showed them fine.
+//     though ApproverDashboard.jsx — which queries `checks.status`
+//     directly — showed them fine.
 //   - The fix: query `checks` directly (same table + column the dashboard's
 //     "Awaiting your decision" KPI reads) and embed the parent reservation
 //     only for display (collector name) and for the id approver_decide
@@ -121,6 +129,18 @@ const ALLOWED_ROLES = ['approver', 'admin']
 const PENDING_WARN_MINUTES = 60
 const PENDING_CRITICAL_MINUTES = 240
 const REMARKS_MAX_LEN = 200
+
+// Safety cap on how many pending-approval check rows a single load() call
+// pulls back. This used to be a low, arbitrary `.limit(150)` that silently
+// truncated both the visible list AND every KPI derived from it (Orders,
+// Checks awaiting, Total value, Avg check amount, wait times, Collectors,
+// Banks, AR not collected) once the real queue grew past 150 rows — with
+// nothing in the UI to say so. It's now paired with an exact count from
+// Postgres (see load()) so if the true pending count ever exceeds this
+// cap, the UI says so explicitly instead of quietly under-reporting. If
+// this cap is ever hit in production, that's a signal to add real
+// pagination here rather than just raising the number again.
+const MAX_PENDING_ROWS = 1000
 
 const SORT_OPTIONS = [
   { value: 'submitted_asc', label: 'Oldest submitted first' },
@@ -296,6 +316,10 @@ export default function ApproverHome() {
   const { role, name, loading: profileLoading, error: profileError } = useProfile()
 
   const [groups, setGroups] = useState([])
+  // Exact count of ALL checks matching status = 'pending_approval' in the
+  // database, from Postgres itself (not derived from the loaded array).
+  // Used only to detect and surface truncation — see isTruncated below.
+  const [totalPendingCount, setTotalPendingCount] = useState(0)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [loadError, setLoadError] = useState('')
@@ -398,6 +422,13 @@ export default function ApproverHome() {
       // The reservation is embedded only for display (collector name) and
       // for the id approver_decide needs; it is NOT used to filter.
       //
+      // `count: 'exact'` asks Postgres for the true number of matching
+      // rows regardless of the `.limit()` below, so the UI can tell the
+      // difference between "the queue really is this small" and "we only
+      // loaded part of it." Every KPI on this page is computed from the
+      // `data` array, so if `count` ever exceeds `data.length`, the totals
+      // are a real (visible) undercount — see isTruncated further down.
+      //
       // Assumes `checks.reservation_id` is the FK to pickup_reservations.id
       // (matches the `p_reservation_id` param name on approver_decide). If
       // your schema names that column differently, buildPendingRows()
@@ -405,14 +436,15 @@ export default function ApproverHome() {
       // degrades gracefully rather than breaking. If Supabase reports an
       // ambiguous relationship when embedding, disambiguate with
       // `pickup_reservations!<fk_constraint_name>(...)`.
-      const { data, error } = await supabase
+      const { data, error, count } = await supabase
         .from('checks')
         .select(
-          'id, status, row_number, payee, payor, check_no, check_date, amount, or_no, ar_collected, attached_2307, remarks, submitted_by_name, submitted_at, reservation_id, bank, pickup_reservations(id, collector_name, status)'
+          'id, status, row_number, payee, payor, check_no, check_date, amount, or_no, ar_collected, attached_2307, remarks, submitted_by_name, submitted_at, reservation_id, bank, pickup_reservations(id, collector_name, status)',
+          { count: 'exact' }
         )
         .eq('status', 'pending_approval')
         .order('submitted_at', { ascending: true })
-        .limit(150)
+        .limit(MAX_PENDING_ROWS)
 
       if (!isMountedRef.current || requestId !== requestIdRef.current) return
 
@@ -431,6 +463,11 @@ export default function ApproverHome() {
 
       const rows = buildPendingRows(data || [])
       setGroups(groupByReservation(rows))
+      // `count` is the exact total matching rows in Postgres; fall back to
+      // the loaded row count only if the API didn't return one (shouldn't
+      // happen with `count: 'exact'`, but never trust a network response
+      // blindly).
+      setTotalPendingCount(typeof count === 'number' ? count : rows.length)
       setLastUpdated(Date.now())
       setSelectedCheckIds((prev) => {
         if (prev.size === 0) return prev
@@ -568,8 +605,10 @@ export default function ApproverHome() {
 
   // Top-of-page KPIs — deliberately computed off the FULL `groups` dataset
   // (not `visibleGroups`), so the headline numbers always describe the
-  // whole pending-approval queue even while an approver is drilled into a
-  // filtered slice of it below.
+  // whole loaded pending-approval queue even while an approver is drilled
+  // into a filtered slice of it below. Whether `groups` itself represents
+  // the WHOLE database-side queue, or only part of it, is tracked
+  // separately by isTruncated (derived below from totalPendingCount).
   const summary = useMemo(() => {
     const allItems = groups.flatMap((g) => g.items)
 
@@ -606,6 +645,13 @@ export default function ApproverHome() {
       arUnrecorded,
     }
   }, [groups, now])
+
+  // True only if Postgres reports more pending_approval checks than we
+  // actually loaded — i.e. MAX_PENDING_ROWS was hit. In that case every
+  // KPI card above is a real (partial) undercount of the true queue, and
+  // the banner below says so explicitly instead of letting the numbers
+  // look complete when they aren't.
+  const isTruncated = totalPendingCount > summary.checks
 
   function toggleExpand(reservationId) {
     setExpandedIds((prev) => {
@@ -858,6 +904,15 @@ export default function ApproverHome() {
           </button>
         </div>
       </div>
+
+      {isTruncated && (
+        <div className="mb-4 flex items-center gap-2 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
+          <AlertTriangle className="h-4 w-4 shrink-0" />
+          Showing {summary.checks} of {totalPendingCount} checks awaiting approval. The queue has
+          grown past what this page loads at once, so the totals below only reflect the checks
+          currently loaded — ask engineering to raise the load limit or add pagination.
+        </div>
+      )}
 
       {!loading && (
         <>
