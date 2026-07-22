@@ -23,6 +23,8 @@ import {
   Layers,
   X,
   Landmark,
+  Info,
+  HelpCircle,
 } from 'lucide-react'
 import { supabase } from '../../lib/supabaseClient'
 import { Button } from '../../components/ui/button'
@@ -93,15 +95,20 @@ const FLAG_LABELS = {
   negativeAmount: 'Negative amount',
   missingDate: 'Missing or unreadable date',
   futureDate: 'Check dated in the future',
-  duplicateCheckNo: 'Duplicate check no. for this bank (in this file)',
-  existsInSystem: 'Check no. already imported for this bank',
+  duplicateCheckNo: 'Duplicate check no. for this payee (in this file)',
+  existsInSystem: 'This payee already has this check no. imported for this bank',
 }
 
-// Builds the composite key duplicate detection is scoped to. A check number
-// is only a duplicate if it repeats under the SAME bank — the same number
-// from two different banks is perfectly valid and must never collide here.
-function bankCheckKey(bank, checkNo) {
-  return `${String(bank).trim().toLowerCase()}::${String(checkNo).trim().toLowerCase()}`
+// Builds the composite key duplicate detection is scoped to. A check
+// number is only a duplicate if the SAME payee reuses it under the SAME
+// bank — a different payee using that exact same check no. (even under
+// the same bank) is allowed, as long as that payee only uses it once too.
+function bankCheckPayeeKey(bank, checkNo, payee) {
+  return `${String(bank).trim().toLowerCase()}::${String(checkNo).trim().toLowerCase()}::${String(
+    payee,
+  )
+    .trim()
+    .toLowerCase()}`
 }
 
 // best-effort auto-detection of column headers
@@ -249,11 +256,13 @@ export default function AdminUpload() {
   const [excludedRows, setExcludedRows] = useState(() => new Set()) // indices (into rawRows) excluded from import
   const [previewSearch, setPreviewSearch] = useState('')
   const [showFlaggedOnly, setShowFlaggedOnly] = useState(false)
+  const [showDupHelp, setShowDupHelp] = useState(false)
 
-  // Cross-checks the mapped (bank, check no.) pairs against what's already
-  // in the database, so re-uploading the same batch (or an overlapping one)
-  // gets caught before it creates duplicate register entries. Scoped to the
-  // currently selected bank — the same check no. under a different bank is
+  // Cross-checks the mapped (bank, check no., payee) triples against what's
+  // already in the database, so re-uploading the same batch (or an
+  // overlapping one) gets caught before it creates duplicate register
+  // entries. Scoped to the currently selected bank AND payee — the same
+  // check no. reused by a different payee, or under a different bank, is
   // not a duplicate.
   const [existingCheckNos, setExistingCheckNos] = useState(() => new Set())
   const [checkingDuplicates, setCheckingDuplicates] = useState(false)
@@ -272,6 +281,7 @@ export default function AdminUpload() {
     return selectedBank
   }, [selectedBank, customBank])
   const bankValid = bankValue.length > 0
+  const needsCustomBankName = selectedBank === OTHER_BANK_VALUE && customBank.trim().length === 0
 
   // ---- Normalization + validation pipeline --------------------------------
   // Every row is normalized once here (trimmed text, parsed currency,
@@ -304,12 +314,14 @@ export default function AdminUpload() {
       }
     })
 
-    // Duplicate detection is scoped to (bank, check no.) — never check no.
-    // alone — so the same number under two different banks never collides.
+    // Duplicate detection is scoped to (bank, check no., payee) — never
+    // check no. alone, and never payee alone — so the same check no. used
+    // by a different payee (even under the same bank) never collides, but
+    // one payee reusing it twice does.
     const checkNoCounts = new Map()
     draft.forEach((r) => {
-      if (!r.check_no) return
-      const key = bankCheckKey(r.bank, r.check_no)
+      if (!r.check_no || !r.payee) return
+      const key = bankCheckPayeeKey(r.bank, r.check_no, r.payee)
       checkNoCounts.set(key, (checkNoCounts.get(key) || 0) + 1)
     })
 
@@ -325,17 +337,20 @@ export default function AdminUpload() {
         negativeAmount: !r.amountInvalid && r.amount < 0,
         missingDate: !r.check_date,
         futureDate: !!r.check_date && new Date(r.check_date) > todayEnd,
-        duplicateCheckNo: !!r.check_no && checkNoCounts.get(bankCheckKey(r.bank, r.check_no)) > 1,
+        duplicateCheckNo:
+          !!r.check_no &&
+          !!r.payee &&
+          checkNoCounts.get(bankCheckPayeeKey(r.bank, r.check_no, r.payee)) > 1,
       }
       const hasIssue = Object.values(flags).some(Boolean)
       return { ...r, flags, hasIssue }
     })
   }, [mappingComplete, bankValid, bankValue, rawRows, headers, mapping])
 
-  // Looks up mapped (bank, check no.) pairs against the database. Debounced
-  // and best-effort in the sense that a failed/slow lookup never blocks the
-  // UI — but any match it does find is treated as a hard duplicate (see the
-  // force-exclude effect below), not just a warning.
+  // Looks up mapped (bank, check no., payee) triples against the database.
+  // Debounced and best-effort in the sense that a failed/slow lookup never
+  // blocks the UI — but any match it does find is treated as a hard
+  // duplicate (see the force-exclude effect below), not just a warning.
   useEffect(() => {
     if (normalizedRows.length === 0) {
       setExistingCheckNos(new Set())
@@ -356,11 +371,19 @@ export default function AdminUpload() {
           const chunk = uniqueNos.slice(i, i + DUPLICATE_CHECK_CHUNK_SIZE)
           const { data, error } = await supabase
             .from('checks')
-            .select('check_no')
+            .select('check_no, payee')
             .eq('bank', bankValue) // scope to this bank only
             .in('check_no', chunk)
           if (!error && data) {
-            data.forEach((d) => d.check_no && found.add(String(d.check_no).toLowerCase()))
+            data.forEach((d) => {
+              if (d.check_no && d.payee) {
+                found.add(
+                  `${String(d.check_no).trim().toLowerCase()}::${String(d.payee)
+                    .trim()
+                    .toLowerCase()}`,
+                )
+              }
+            })
           }
         }
         if (!cancelled) setExistingCheckNos(found)
@@ -380,22 +403,26 @@ export default function AdminUpload() {
 
   // Merges the synchronous validation flags with the async system-duplicate
   // check into the rows the rest of the UI actually renders from. `blocked`
-  // marks rows that are strictly disallowed — a duplicate (bank, check no.)
-  // pair, either within this file or already in the system — and can never
-  // be included in the import.
+  // marks rows that are strictly disallowed — a payee reusing a check no.
+  // under the same bank, either within this file or already in the system
+  // — and can never be included in the import.
   const enrichedRows = useMemo(() => {
     if (normalizedRows.length === 0) return []
     return normalizedRows.map((r) => {
-      const existsInSystem = !!r.check_no && existingCheckNos.has(r.check_no.toLowerCase())
+      const existsInSystem =
+        !!r.check_no &&
+        !!r.payee &&
+        existingCheckNos.has(`${r.check_no.trim().toLowerCase()}::${r.payee.trim().toLowerCase()}`)
       const flags = { ...r.flags, existsInSystem }
       const blocked = flags.duplicateCheckNo || existsInSystem
       return { ...r, flags, hasIssue: r.hasIssue || existsInSystem, blocked }
     })
   }, [normalizedRows, existingCheckNos])
 
-  // Duplicate (bank, check no.) pairs are strictly not allowed — force them
-  // out of the included set the moment they're detected, and keep them out
-  // even if excludedRows gets reset elsewhere (e.g. "Include all").
+  // Duplicate (bank, check no., payee) triples are strictly not allowed —
+  // force them out of the included set the moment they're detected, and
+  // keep them out even if excludedRows gets reset elsewhere (e.g. "Include
+  // all").
   useEffect(() => {
     const blockedIndices = enrichedRows.filter((r) => r.blocked).map((r) => r.index)
     if (blockedIndices.length === 0) return
@@ -610,9 +637,9 @@ export default function AdminUpload() {
     if (value !== OTHER_BANK_VALUE) setCustomBank('')
   }
 
-  // Duplicate (bank, check no.) pairs are strictly disallowed and cannot be
-  // manually re-included — the checkbox for those rows is disabled in the
-  // UI, and this is the second line of defense.
+  // Duplicate (bank, check no., payee) triples are strictly disallowed and
+  // cannot be manually re-included — the checkbox for those rows is
+  // disabled in the UI, and this is the second line of defense.
   function toggleRowExcluded(row) {
     if (row.blocked) return
     setExcludedRows((prev) => {
@@ -634,15 +661,17 @@ export default function AdminUpload() {
   }
 
   function includeAllRows() {
-    // Blocked rows (duplicate bank + check no.) stay excluded even on bulk include.
+    // Blocked rows (duplicate bank + check no. + payee) stay excluded even
+    // on bulk include.
     setExcludedRows(new Set(enrichedRows.filter((r) => r.blocked).map((r) => r.index)))
   }
 
   async function handleImport() {
     if (!mappingComplete || !bankValid || saving) return
 
-    // Defense in depth: never send a blocked (duplicate bank + check no.)
-    // row to the database, regardless of what excludedRows currently holds.
+    // Defense in depth: never send a blocked (duplicate bank + check no. +
+    // payee) row to the database, regardless of what excludedRows
+    // currently holds.
     const includedRows = enrichedRows.filter((r) => !excludedRows.has(r.index) && !r.blocked)
     if (includedRows.length === 0) {
       push({
@@ -733,8 +762,8 @@ export default function AdminUpload() {
         <h1 className="font-display text-2xl font-semibold text-ink-900">Upload a file</h1>
         <p className="mt-1 text-sm text-ink-400">
           Select the source bank, then import a CSV or Excel file (up to {formatFileSize(MAX_FILE_SIZE_BYTES)},{' '}
-          {MAX_ROWS.toLocaleString()} rows max) with Payee, Payor, Check No, Check Date, and Amount columns. Each
-          row's position in the file is stored automatically for cross-reference.
+          {MAX_ROWS.toLocaleString()} rows max) with Payee, Payor, Check No, Check Date, and Amount columns. A payee
+          can only use a given check no. once per bank — a different payee can reuse that same number.
         </p>
       </div>
 
@@ -779,14 +808,20 @@ export default function AdminUpload() {
                       disabled={saving}
                       placeholder="Enter bank name"
                       maxLength={MAX_CUSTOM_BANK_LENGTH}
-                      className="w-56 rounded-md border border-ink-200 px-3 py-1.5 text-sm text-ink-800 focus:outline-none focus:ring-1 focus:ring-teal-400"
+                      autoFocus
+                      className={cn(
+                        'w-56 rounded-md border px-3 py-1.5 text-sm text-ink-800 focus:outline-none focus:ring-1 focus:ring-teal-400',
+                        needsCustomBankName ? 'border-orange-300' : 'border-ink-200',
+                      )}
                     />
                   )}
                 </div>
                 {!bankValid ? (
                   <p className="mt-1.5 flex items-center gap-1.5 text-xs font-medium text-orange-600">
                     <AlertTriangle className="h-3.5 w-3.5" />
-                    Select which bank this file is coming from before uploading.
+                    {needsCustomBankName
+                      ? 'Type the bank name to continue.'
+                      : 'Select which bank this file is coming from before uploading.'}
                   </p>
                 ) : (
                   hasFile && (
@@ -968,7 +1003,11 @@ export default function AdminUpload() {
                         icon={AlertTriangle}
                         label="Needs review"
                         value={stats.flagged}
-                        secondary={checkingDuplicates ? 'Checking for duplicates…' : `${stats.duplicateCount} duplicate check no.`}
+                        secondary={
+                          checkingDuplicates
+                            ? 'Checking for duplicates…'
+                            : `${stats.duplicateCount} duplicate check no.`
+                        }
                         accent="orange"
                       />
                       <KpiCard
@@ -986,15 +1025,18 @@ export default function AdminUpload() {
                       <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                       <div>
                         <p className="font-medium">
-                          {stats.blocked} row{stats.blocked === 1 ? '' : 's'} blocked — duplicate check no. for{' '}
-                          {bankValue}
+                          {stats.blocked} row{stats.blocked === 1 ? '' : 's'} blocked — same payee reused a check
+                          no. under {bankValue}
                         </p>
                         <p className="mt-0.5 text-red-600/90">
                           {existsInSystemCount > 0
-                            ? `${existsInSystemCount} of these already ${existsInSystemCount === 1 ? 'exists' : 'exist'} in the system for this bank. `
+                            ? `${existsInSystemCount} of these ${
+                                existsInSystemCount === 1 ? 'is' : 'are'
+                              } already imported for the same payee under this bank. `
                             : ''}
-                          Duplicate check numbers for the same bank aren't allowed. Matching rows are highlighted
-                          red and automatically excluded — they can't be re-included.
+                          A payee can't use the same check no. more than once under a bank. A different payee may
+                          still use that same number, as long as they use it only once too. Matching rows are
+                          highlighted red below and excluded automatically — they can't be re-included.
                         </p>
                       </div>
                     </div>
@@ -1016,9 +1058,9 @@ export default function AdminUpload() {
                           ))}
                       </ul>
                       <p className="mt-1.5 text-ink-400">
-                        Rows with a duplicate check no. for this bank are locked out and can't be re-included.
-                        Other flagged rows are still included by default and will be imported unless you exclude
-                        them below.
+                        Rows with a duplicate check no. for the same payee are locked and can't be re-included.
+                        Other flagged rows stay included by default — exclude them below if you don't want them
+                        imported.
                       </p>
                     </div>
                   )}
@@ -1048,6 +1090,7 @@ export default function AdminUpload() {
                     <button
                       type="button"
                       onClick={() => setShowFlaggedOnly((v) => !v)}
+                      aria-pressed={showFlaggedOnly}
                       className={cn(
                         'flex shrink-0 items-center gap-1 rounded-md border px-2.5 py-1.5 text-xs font-medium transition',
                         showFlaggedOnly
@@ -1085,6 +1128,24 @@ export default function AdminUpload() {
                     </button>
                   </div>
 
+                  {/* Row color legend — makes the highlighting in the table
+                      self-explanatory instead of something admins have to
+                      infer from the banner text above. */}
+                  <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-ink-400">
+                    <span className="flex items-center gap-1.5">
+                      <span className="h-2.5 w-2.5 rounded-sm bg-red-100 ring-1 ring-inset ring-red-300" />
+                      Blocked duplicate
+                    </span>
+                    <span className="flex items-center gap-1.5">
+                      <span className="h-2.5 w-2.5 rounded-sm bg-amber-100 ring-1 ring-inset ring-amber-300" />
+                      Needs review
+                    </span>
+                    <span className="flex items-center gap-1.5">
+                      <span className="h-2.5 w-2.5 rounded-sm bg-slate-100 ring-1 ring-inset ring-slate-300" />
+                      Excluded
+                    </span>
+                  </div>
+
                   <div className="mt-3 overflow-x-auto rounded-md border border-ink-100">
                     <table className="w-full text-left text-xs">
                       <thead className="bg-teal-50 text-teal-700">
@@ -1094,7 +1155,28 @@ export default function AdminUpload() {
                           <th className="px-3 py-2 font-medium">Bank</th>
                           {REQUIRED_FIELDS.map(({ key, label }) => (
                             <th key={key} className="px-3 py-2 font-medium">
-                              {label}
+                              {label === 'Check No' ? (
+                                <span className="relative inline-flex items-center gap-1">
+                                  {label}
+                                  <button
+                                    type="button"
+                                    onClick={() => setShowDupHelp((v) => !v)}
+                                    onBlur={() => setShowDupHelp(false)}
+                                    aria-label="How duplicate check numbers are handled"
+                                    className="text-teal-400 hover:text-teal-700"
+                                  >
+                                    <HelpCircle className="h-3 w-3" />
+                                  </button>
+                                  {showDupHelp && (
+                                    <span className="absolute left-0 top-5 z-10 w-56 rounded-md border border-ink-200 bg-white p-2.5 text-[11px] font-normal normal-case text-ink-600 shadow-lg">
+                                      A check no. can repeat across different payees, but the same payee can't use
+                                      it twice under the same bank.
+                                    </span>
+                                  )}
+                                </span>
+                              ) : (
+                                label
+                              )}
                             </th>
                           ))}
                         </tr>
@@ -1122,14 +1204,14 @@ export default function AdminUpload() {
                                   aria-pressed={!isExcluded}
                                   aria-label={
                                     r.blocked
-                                      ? `Row ${r.rowNumber} blocked — duplicate check no. for this bank`
+                                      ? `Row ${r.rowNumber} blocked — this payee already used this check no. for this bank`
                                       : isExcluded
                                       ? `Include row ${r.rowNumber}`
                                       : `Exclude row ${r.rowNumber}`
                                   }
                                   title={
                                     r.blocked
-                                      ? 'Duplicate check no. for this bank — cannot be imported'
+                                      ? 'This payee already used this check no. under this bank — cannot be imported'
                                       : undefined
                                   }
                                   className={cn(
@@ -1192,11 +1274,11 @@ export default function AdminUpload() {
                                 )}
                                 title={
                                   r.flags.duplicateCheckNo && r.flags.existsInSystem
-                                    ? 'Duplicate within this file for this bank, and already imported for this bank'
+                                    ? 'This payee reuses this check no. within this file, and already has it imported for this bank'
                                     : r.flags.duplicateCheckNo
-                                    ? 'Duplicate check number within this file for this bank'
+                                    ? 'This payee reuses this check no. within this file'
                                     : r.flags.existsInSystem
-                                    ? 'This check number is already imported for this bank'
+                                    ? 'This payee already has this check no. imported for this bank'
                                     : undefined
                                 }
                               >
@@ -1265,8 +1347,23 @@ export default function AdminUpload() {
                         })}
                         {previewRows.length === 0 && (
                           <tr>
-                            <td colSpan={8} className="px-3 py-8 text-center text-ink-300">
-                              No rows match your search or filter.
+                            <td colSpan={8} className="px-3 py-10 text-center text-ink-300">
+                              <div className="flex flex-col items-center gap-1.5">
+                                <Search className="h-5 w-5 text-ink-200" />
+                                <span>No rows match your search or filter.</span>
+                                {(previewSearch.trim() || showFlaggedOnly) && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setPreviewSearch('')
+                                      setShowFlaggedOnly(false)
+                                    }}
+                                    className="mt-1 text-xs font-medium text-teal-700 hover:text-teal-800"
+                                  >
+                                    Clear filters
+                                  </button>
+                                )}
+                              </div>
                             </td>
                           </tr>
                         )}
@@ -1325,24 +1422,37 @@ export default function AdminUpload() {
                     </div>
                   )}
 
-                  <Button
-                    onClick={handleImport}
-                    disabled={!mappingComplete || !bankValid || saving || (stats && stats.included === 0)}
-                    className="mt-5 bg-orange-500 text-white hover:bg-orange-600 focus-visible:ring-orange-400 disabled:bg-ink-200 disabled:text-ink-400"
-                  >
-                    {saving ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    ) : (
-                      <CheckCircle2 className="h-3.5 w-3.5" />
-                    )}
-                    {saving
-                      ? 'Importing…'
-                      : stats
-                      ? `Import ${stats.included} check${stats.included === 1 ? '' : 's'}${
-                          stats.excluded > 0 ? ` (${stats.excluded} excluded)` : ''
-                        }`
-                      : `Import ${rawRows.length} checks`}
-                  </Button>
+                  {/* Sticky action bar — keeps the import decision visible
+                      even after scrolling through a long preview table,
+                      instead of forcing a scroll back up to act. */}
+                  <div className="sticky bottom-0 -mx-6 mt-5 border-t border-ink-100 bg-white/95 px-6 py-3.5 backdrop-blur">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <p className="flex items-center gap-1.5 text-xs text-ink-400">
+                        <Info className="h-3.5 w-3.5 shrink-0" />
+                        {stats && stats.blocked > 0
+                          ? `${stats.blocked} row${stats.blocked === 1 ? '' : 's'} can't be imported due to duplicates.`
+                          : 'Review the rows above, then import when ready.'}
+                      </p>
+                      <Button
+                        onClick={handleImport}
+                        disabled={!mappingComplete || !bankValid || saving || (stats && stats.included === 0)}
+                        className="bg-orange-500 text-white hover:bg-orange-600 focus-visible:ring-orange-400 disabled:bg-ink-200 disabled:text-ink-400"
+                      >
+                        {saving ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <CheckCircle2 className="h-3.5 w-3.5" />
+                        )}
+                        {saving
+                          ? 'Importing…'
+                          : stats
+                          ? `Import ${stats.included} check${stats.included === 1 ? '' : 's'}${
+                              stats.excluded > 0 ? ` (${stats.excluded} excluded)` : ''
+                            }`
+                          : `Import ${rawRows.length} checks`}
+                      </Button>
+                    </div>
+                  </div>
                 </div>
               )}
             </>
