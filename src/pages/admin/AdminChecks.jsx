@@ -23,6 +23,9 @@ import {
   CircleCheckBig,
   Clock,
   Landmark,
+  UserRound,
+  ClipboardList,
+  ReceiptText,
 } from 'lucide-react'
 import { useProfile } from '../../context/ProfileContext'
 import { supabase } from '../../lib/supabaseClient'
@@ -1338,6 +1341,16 @@ function buildInitialSubmitEntries(rowsList) {
   return initial
 }
 
+// ---------------------------------------------------------------------------
+// Submit-for-approval modal
+//
+// Layout: a fixed header (collector name + progress), a scrollable body
+// where each check gets its own clearly separated row-card with generously
+// spaced controls, and a fixed footer with the primary action — so the
+// admin's eye always has one clear place to look, no matter how many checks
+// are in the batch.
+// ---------------------------------------------------------------------------
+
 function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
   const [collectorName, setCollectorName] = useState('')
   const [entries, setEntries] = useState(() => buildInitialSubmitEntries(rows))
@@ -1393,8 +1406,10 @@ function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
     setEntries((prev) => ({
       ...prev,
       [id]: {
+        ...prev[id],
         include: value,
-        orNo: value ? prev[id]?.orNo || '' : '',
+        receiptType: value ? prev[id]?.receiptType || '' : '',
+        receiptNo: value ? prev[id]?.receiptNo || '' : '',
         collected: value ? prev[id]?.collected ?? null : null,
         attached2307: value ? prev[id]?.attached2307 ?? null : null,
         remarks: value ? prev[id]?.remarks || '' : '',
@@ -1402,7 +1417,7 @@ function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
     }))
   }, [])
 
-// Changing the receipt type clears any previously entered number — a
+  // Changing the receipt type clears any previously entered number — a
   // number typed while "OR" was selected shouldn't silently carry over as,
   // say, a "CR" number just because the admin corrected a wrong type pick.
   const updateReceiptType = useCallback((id, value) => {
@@ -1434,7 +1449,7 @@ function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
   // How many included checks currently have a complete outcome (OR no. +
   // AR collected + 2307 Attached, plus a reason if AR wasn't collected),
   // and whether any entered OR numbers collide.
- const { completedCount, duplicateOrNos, includeCount } = useMemo(() => {
+  const { completedCount, duplicateOrNos, includeCount } = useMemo(() => {
     const seenCounts = {}
     let completed = 0
     let included = 0
@@ -1463,6 +1478,10 @@ function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
   const hasDuplicates = duplicateOrNos.size > 0
   const allComplete = includeCount > 0 && completedCount === includeCount && !hasDuplicates
   const canSubmit = nameEntered && allComplete && !submitting
+  const totalAmount = useMemo(
+    () => rows.reduce((sum, r) => (entries[r.id]?.include ? sum + (Number(r.amount) || 0) : sum), 0),
+    [rows, entries],
+  )
 
   function handleConfirm() {
     if (!canSubmit) return
@@ -1471,7 +1490,7 @@ function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
 
   return (
     <div
-      className="fixed inset-0 z-40 flex items-center justify-center bg-ink-900/40 p-4"
+      className="fixed inset-0 z-40 flex items-center justify-center bg-ink-900/50 p-4 sm:p-6"
       onMouseDown={(e) => {
         if (e.target === e.currentTarget && !submitting) onCancel()
       }}
@@ -1481,252 +1500,278 @@ function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
         role="dialog"
         aria-modal="true"
         aria-labelledby="submit-approval-title"
-        className="relative w-full max-w-3xl overflow-hidden rounded-xl bg-white shadow-xl"
+        className="relative flex h-[90vh] w-full max-w-6xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl"
       >
-        <div className="flex items-center justify-between border-b border-ink-100 px-5 py-4">
-          <h2 id="submit-approval-title" className="text-lg font-semibold text-ink-900">
-            Submit for approval
-          </h2>
+        {/* ── Header ───────────────────────────────────────────────── */}
+        <div className="flex shrink-0 items-start justify-between gap-4 border-b border-ink-100 px-7 py-5">
+          <div className="flex items-start gap-3">
+            <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-ledger-stamp/10 text-ledger-stamp">
+              <Send className="h-5 w-5" />
+            </div>
+            <div>
+              <h2 id="submit-approval-title" className="text-lg font-semibold text-ink-900">
+                Submit for approval
+              </h2>
+              <p className="mt-0.5 text-sm text-ink-400">
+                {rows.length === 1
+                  ? '1 check will be sent to an approver for review before it can be marked picked up.'
+                  : `${rows.length} checks will be sent to an approver for review before they can be marked picked up.`}
+              </p>
+            </div>
+          </div>
           <button
             onClick={onCancel}
             disabled={submitting}
-            className="text-ink-300 hover:text-ink-600 disabled:opacity-40"
+            className="shrink-0 rounded-full p-1.5 text-ink-300 hover:bg-ink-50 hover:text-ink-600 disabled:opacity-40"
             aria-label="Close"
           >
             <X className="h-5 w-5" />
           </button>
         </div>
 
-        <div className="max-h-[75vh] overflow-y-auto px-5 py-4">
-        <p className="text-sm text-ink-600">
-            {rows.length === 1 ? (
-              <>
-                Enter who is collecting <span className="font-medium text-ink-900">{rows[0].payee}</span>'s check,
-                then confirm the receipt type &amp; number, AR status, and 2307 Attached status. It goes to an
-                approver for verification before it's marked picked up.
-              </>
-            ) : (
-              <>
-                Enter who is collecting these {rows.length} checks, then confirm the receipt type &amp; number,
-                AR status, and 2307 Attached status for each. They go to an approver for verification before
-                they're marked picked up.
-              </>
-            )}
-          </p>
-
-          <div className="mt-3">
-            <label className="mb-1 block text-xs font-medium text-ink-500">Collector name</label>
-            <Input
-              ref={nameInputRef}
-              value={collectorName}
-              onChange={(e) => setCollectorName(e.target.value)}
-              placeholder="Full name of the person picking up"
-            />
+        {/* ── Body ─────────────────────────────────────────────────── */}
+        <div className="flex-1 overflow-y-auto bg-ink-50/40 px-7 py-6">
+          {/* Collector info card */}
+          <div className="rounded-xl border border-ink-100 bg-white p-5 shadow-sm">
+            <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+              <div className="flex-1">
+                <label htmlFor="collector-name-input" className="mb-1.5 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-ink-500">
+                  <UserRound className="h-3.5 w-3.5" />
+                  Collector name
+                </label>
+                <Input
+                  id="collector-name-input"
+                  ref={nameInputRef}
+                  value={collectorName}
+                  onChange={(e) => setCollectorName(e.target.value)}
+                  placeholder="Full name of the person picking up"
+                  className="text-sm"
+                />
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                <SummaryPill
+                  label="checks to submit"
+                  value={includeCount}
+                  tone="neutral"
+                />
+                <SummaryPill
+                  label="details entered"
+                  value={`${completedCount}/${includeCount || 0}`}
+                  tone={allComplete ? 'positive' : 'warning'}
+                />
+                <SummaryPill
+                  label="total amount"
+                  value={formatCurrency(totalAmount)}
+                  tone="neutral"
+                  mono
+                />
+              </div>
+            </div>
           </div>
 
+          {/* Per-check details */}
           {nameEntered && (
-            <div className="mt-4">
-              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                <p className="text-[11px] font-medium text-ink-500">Per-check details</p>
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="rounded-full bg-ledger-stamp/10 px-2 py-0.5 text-[9px] font-medium text-ledger-stamp">
-                    {includeCount} to submit
-                  </span>
-                  <span
-                    className={cn(
-                      'rounded-full px-2 py-0.5 text-[9px] font-medium',
-                      allComplete ? 'bg-ledger-stamp/10 text-ledger-stamp' : 'bg-orange-100 text-orange-700',
-                    )}
-                  >
-                    {completedCount} of {includeCount} entered
-                  </span>
-                </div>
+            <div className="mt-5">
+              <div className="mb-3 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-ink-500">
+                <ClipboardList className="h-3.5 w-3.5" />
+                Per-check details
               </div>
 
-              <div className="max-h-[22rem] overflow-x-auto overflow-y-auto rounded-md border border-ink-100">
-                <table className="w-full min-w-[720px] text-[10px]">
-                  <thead className="sticky top-0 bg-ink-50">
-                   <tr className="text-left uppercase tracking-wide text-ink-400">
-                      <th className="px-2 py-1.5 font-medium">Include</th>
-                      <th className="px-2 py-1.5 font-medium">Check no.</th>
-                      <th className="px-2 py-1.5 font-medium">Payee</th>
-                      <th className="px-2 py-1.5 text-right font-medium">Amount</th>
-                      <th className="px-2 py-1.5 font-medium">Receipt</th>
-                      <th className="px-2 py-1.5 font-medium">AR collected</th>
-                      <th className="px-2 py-1.5 font-medium">2307 Attached</th>
-                      <th className="px-2 py-1.5 font-medium">Remarks</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-ink-50">
-                    {rows.map((r, idx) => {
-                     const entry =
-                        entries[r.id] || {
-                          include: true,
-                          receiptType: '',
-                          receiptNo: '',
-                          collected: null,
-                          attached2307: null,
-                          remarks: '',
-                        }
-                      const composedReceipt = composeReceiptNo(entry)
-                      const isDuplicate = entry.include && composedReceipt && duplicateOrNos.has(composedReceipt.toLowerCase())
-                      const needsReason = entry.include && entry.collected === false
-                      const missingReason = needsReason && !entry.remarks?.trim()
-                      const rowIncomplete =
-                        entry.include &&
-                        (!composedReceipt ||
-                          entry.collected === null ||
-                          entry.collected === undefined ||
-                          entry.attached2307 === null ||
-                          entry.attached2307 === undefined ||
-                          missingReason)
+              <div className="flex flex-col gap-3">
+                {rows.map((r, idx) => {
+                  const entry =
+                    entries[r.id] || {
+                      include: true,
+                      receiptType: '',
+                      receiptNo: '',
+                      collected: null,
+                      attached2307: null,
+                      remarks: '',
+                    }
+                  const composedReceipt = composeReceiptNo(entry)
+                  const isDuplicate = entry.include && composedReceipt && duplicateOrNos.has(composedReceipt.toLowerCase())
+                  const needsReason = entry.include && entry.collected === false
+                  const missingReason = needsReason && !entry.remarks?.trim()
+                  const rowIncomplete =
+                    entry.include &&
+                    (!composedReceipt ||
+                      entry.collected === null ||
+                      entry.collected === undefined ||
+                      entry.attached2307 === null ||
+                      entry.attached2307 === undefined ||
+                      missingReason)
+                  const rowComplete = entry.include && !rowIncomplete && !isDuplicate
 
-                      return (
-                        <tr
-                          key={r.id}
-                          className={cn(
-                            !entry.include && 'bg-slate-50/70',
-                            entry.include && isDuplicate && 'bg-red-50/70',
-                            entry.include && !isDuplicate && rowIncomplete && 'bg-amber-50/50',
-                          )}
-                        >
-                          <td className="px-2 py-1.5">
-                            <button
-                              type="button"
-                              onClick={() => updateInclude(r.id, !entry.include)}
-                              aria-pressed={entry.include}
-                              aria-label={
-                                entry.include
-                                  ? `Exclude check ${r.check_no || idx + 1}`
-                                  : `Include check ${r.check_no || idx + 1}`
-                              }
-                              className={entry.include ? 'text-ledger-stamp' : 'text-ink-300 hover:text-ink-500'}
+                  return (
+                    <div
+                      key={r.id}
+                      className={cn(
+                        'rounded-xl border bg-white shadow-sm transition-colors',
+                        !entry.include && 'border-ink-100 opacity-60',
+                        entry.include && isDuplicate && 'border-red-300 ring-1 ring-red-100',
+                        entry.include && !isDuplicate && rowIncomplete && 'border-amber-200',
+                        rowComplete && 'border-ledger-stamp/40',
+                      )}
+                    >
+                      {/* Row header: check identity + include toggle + status */}
+                      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-ink-100 px-4 py-3">
+                        <div className="flex items-center gap-3">
+                          <button
+                            type="button"
+                            onClick={() => updateInclude(r.id, !entry.include)}
+                            aria-pressed={entry.include}
+                            aria-label={
+                              entry.include
+                                ? `Exclude check ${r.check_no || idx + 1}`
+                                : `Include check ${r.check_no || idx + 1}`
+                            }
+                            className={cn(
+                              'flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium transition',
+                              entry.include
+                                ? 'text-ledger-stamp hover:bg-ledger-stamp/5'
+                                : 'text-ink-300 hover:bg-ink-50 hover:text-ink-500',
+                            )}
+                          >
+                            {entry.include ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
+                            {entry.include ? 'Included' : 'Excluded'}
+                          </button>
+                          <div className="h-6 w-px bg-ink-100" />
+                          <div>
+                            <p className="text-sm font-semibold text-ink-900">{r.payee || '—'}</p>
+                            <p className="font-mono text-[11px] text-ink-400">
+                              Check {r.check_no || '—'}
+                              {r.payor ? ` · from ${r.payor}` : ''}
+                            </p>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-3">
+                          <span className="font-mono text-sm font-semibold text-ink-800">
+                            {formatCurrency(r.amount)}
+                          </span>
+                          {entry.include && (
+                            <span
+                              className={cn(
+                                'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium',
+                                isDuplicate
+                                  ? 'bg-red-100 text-red-700'
+                                  : rowComplete
+                                  ? 'bg-ledger-stamp/10 text-ledger-stamp'
+                                  : 'bg-amber-100 text-amber-700',
+                              )}
                             >
-                              {entry.include ? <CheckSquare className="h-3.5 w-3.5" /> : <Square className="h-3.5 w-3.5" />}
-                            </button>
-                          </td>
-                          <td className="px-2 py-1.5 font-mono text-ink-700">{r.check_no || '—'}</td>
-                          <td className="max-w-[100px] truncate px-2 py-1.5 text-ink-900">{r.payee || '—'}</td>
-                          <td className="px-2 py-1.5 text-right font-mono text-ink-700">{formatCurrency(r.amount)}</td>
-                      <td className="px-1.5 py-1">
-                            {entry.include ? (
-                              <div className="flex flex-col gap-1">
-                                <select
-                                  value={entry.receiptType}
-                                  onChange={(e) => updateReceiptType(r.id, e.target.value)}
-                                  aria-label={`Receipt type for check ${r.check_no || idx + 1}`}
-                                  className="w-16 rounded border border-ink-200 px-1 py-1 text-[10px] text-ink-800 focus:outline-none focus:ring-1 focus:ring-ledger-stamp"
-                                >
-                                  <option value="">Type</option>
-                                  {RECEIPT_TYPES.map((rt) => (
-                                    <option key={rt} value={rt}>
-                                      {rt}
-                                    </option>
-                                  ))}
-                                </select>
-                                {entry.receiptType && (
-                                  <>
-                                    <input
-                                      type="text"
-                                      inputMode="numeric"
-                                      value={entry.receiptNo}
-                                      onChange={(e) => updateReceiptNo(r.id, e.target.value)}
-                                      onBlur={(e) => updateReceiptNo(r.id, e.target.value.trim())}
-                                      placeholder={`${entry.receiptType} no.`}
-                                      maxLength={40}
-                                      aria-label={`${entry.receiptType} number for check ${r.check_no || idx + 1}`}
-                                      className={cn(
-                                        'w-20 rounded border px-1.5 py-1 text-[10px] text-ink-800 focus:outline-none focus:ring-1 focus:ring-ledger-stamp',
-                                        isDuplicate ? 'border-red-400' : 'border-ink-200',
-                                      )}
-                                    />
-                                    {isDuplicate && (
-                                      <p className="mt-0.5 text-[8px] leading-tight text-red-600">Duplicate</p>
-                                    )}
-                                  </>
+                              {isDuplicate ? (
+                                <>
+                                  <AlertTriangle className="h-3 w-3" /> Duplicate receipt
+                                </>
+                              ) : rowComplete ? (
+                                <>
+                                  <Check className="h-3 w-3" /> Complete
+                                </>
+                              ) : (
+                                <>
+                                  <AlertTriangle className="h-3 w-3" /> Incomplete
+                                </>
+                              )}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Row body: receipt / AR / 2307 / remarks inputs */}
+                      {entry.include && (
+                        <div className="grid grid-cols-1 gap-4 px-4 py-4 sm:grid-cols-2 lg:grid-cols-4">
+                          <div>
+                            <label className="mb-1.5 flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-ink-400">
+                              <ReceiptText className="h-3 w-3" />
+                              Receipt
+                            </label>
+                            <div className="flex gap-1.5">
+                              <select
+                                value={entry.receiptType}
+                                onChange={(e) => updateReceiptType(r.id, e.target.value)}
+                                aria-label={`Receipt type for check ${r.check_no || idx + 1}`}
+                                className="w-20 rounded-md border border-ink-200 px-2 py-2 text-xs text-ink-800 focus:outline-none focus:ring-2 focus:ring-ledger-stamp/40"
+                              >
+                                <option value="">Type</option>
+                                {RECEIPT_TYPES.map((rt) => (
+                                  <option key={rt} value={rt}>
+                                    {rt}
+                                  </option>
+                                ))}
+                              </select>
+                              <input
+                                type="text"
+                                inputMode="numeric"
+                                value={entry.receiptNo}
+                                onChange={(e) => updateReceiptNo(r.id, e.target.value)}
+                                onBlur={(e) => updateReceiptNo(r.id, e.target.value.trim())}
+                                placeholder="Number"
+                                maxLength={40}
+                                disabled={!entry.receiptType}
+                                aria-label={`Receipt number for check ${r.check_no || idx + 1}`}
+                                className={cn(
+                                  'min-w-0 flex-1 rounded-md border px-2 py-2 text-xs text-ink-800 focus:outline-none focus:ring-2 focus:ring-ledger-stamp/40 disabled:bg-ink-50 disabled:text-ink-300',
+                                  isDuplicate ? 'border-red-400' : 'border-ink-200',
                                 )}
-                              </div>
-                            ) : (
-                              <span className="text-ink-300">—</span>
+                              />
+                            </div>
+                            {isDuplicate && (
+                              <p className="mt-1 text-[10px] font-medium text-red-600">Already used above</p>
                             )}
-                          </td>
-                          <td className="px-1.5 py-1">
-                            {entry.include ? (
-                              <div
-                                className="flex gap-1"
-                                role="group"
-                                aria-label={`AR collected for check ${r.check_no || idx + 1}`}
-                              >
-                                <button
-                                  type="button"
-                                  onClick={() => updateCollected(r.id, true)}
-                                  aria-pressed={entry.collected === true}
-                                  className={cn(
-                                    'rounded border px-1.5 py-1 text-[9px] font-medium transition',
-                                    entry.collected === true
-                                      ? 'border-ledger-stamp bg-ledger-stamp text-white'
-                                      : 'border-ink-200 text-ink-500 hover:bg-ink-50',
-                                  )}
-                                >
-                                  Yes
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => updateCollected(r.id, false)}
-                                  aria-pressed={entry.collected === false}
-                                  className={cn(
-                                    'rounded border px-1.5 py-1 text-[9px] font-medium transition',
-                                    entry.collected === false
-                                      ? 'border-ink-700 bg-ink-700 text-white'
-                                      : 'border-ink-200 text-ink-500 hover:bg-ink-50',
-                                  )}
-                                >
-                                  No
-                                </button>
-                              </div>
-                            ) : (
-                              <span className="text-ink-300">—</span>
-                            )}
-                          </td>
-                          <td className="px-1.5 py-1">
-                            {entry.include ? (
-                              <div
-                                className="flex gap-1"
-                                role="group"
-                                aria-label={`2307 Attached for check ${r.check_no || idx + 1}`}
-                              >
-                                <button
-                                  type="button"
-                                  onClick={() => updateAttached2307(r.id, true)}
-                                  aria-pressed={entry.attached2307 === true}
-                                  className={cn(
-                                    'rounded border px-1.5 py-1 text-[9px] font-medium transition',
-                                    entry.attached2307 === true
-                                      ? 'border-ledger-stamp bg-ledger-stamp text-white'
-                                      : 'border-ink-200 text-ink-500 hover:bg-ink-50',
-                                  )}
-                                >
-                                  Yes
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => updateAttached2307(r.id, false)}
-                                  aria-pressed={entry.attached2307 === false}
-                                  className={cn(
-                                    'rounded border px-1.5 py-1 text-[9px] font-medium transition',
-                                    entry.attached2307 === false
-                                      ? 'border-ink-700 bg-ink-700 text-white'
-                                      : 'border-ink-200 text-ink-500 hover:bg-ink-50',
-                                  )}
-                                >
-                                  No
-                                </button>
-                              </div>
-                            ) : (
-                              <span className="text-ink-300">—</span>
-                            )}
-                          </td>
-                          <td className="px-1.5 py-1">
+                          </div>
+
+                          <div>
+                            <label className="mb-1.5 block text-[10px] font-semibold uppercase tracking-wide text-ink-400">
+                              AR collected
+                            </label>
+                            <div
+                              className="flex gap-1.5"
+                              role="group"
+                              aria-label={`AR collected for check ${r.check_no || idx + 1}`}
+                            >
+                              <YesNoButton
+                                active={entry.collected === true}
+                                onClick={() => updateCollected(r.id, true)}
+                                label="Yes"
+                                tone="positive"
+                              />
+                              <YesNoButton
+                                active={entry.collected === false}
+                                onClick={() => updateCollected(r.id, false)}
+                                label="No"
+                                tone="neutral"
+                              />
+                            </div>
+                          </div>
+
+                          <div>
+                            <label className="mb-1.5 block text-[10px] font-semibold uppercase tracking-wide text-ink-400">
+                              2307 Attached
+                            </label>
+                            <div
+                              className="flex gap-1.5"
+                              role="group"
+                              aria-label={`2307 Attached for check ${r.check_no || idx + 1}`}
+                            >
+                              <YesNoButton
+                                active={entry.attached2307 === true}
+                                onClick={() => updateAttached2307(r.id, true)}
+                                label="Yes"
+                                tone="positive"
+                              />
+                              <YesNoButton
+                                active={entry.attached2307 === false}
+                                onClick={() => updateAttached2307(r.id, false)}
+                                label="No"
+                                tone="neutral"
+                              />
+                            </div>
+                          </div>
+
+                          <div>
+                            <label className="mb-1.5 block text-[10px] font-semibold uppercase tracking-wide text-ink-400">
+                              Remarks {needsReason && <span className="text-orange-500">(required)</span>}
+                            </label>
                             {needsReason ? (
                               <input
                                 type="text"
@@ -1736,23 +1781,23 @@ function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
                                 maxLength={200}
                                 aria-label={`Remarks for check ${r.check_no || idx + 1}`}
                                 className={cn(
-                                  'w-32 rounded border px-1.5 py-1 text-[10px] text-ink-800 focus:outline-none focus:ring-1 focus:ring-ledger-stamp',
+                                  'w-full rounded-md border px-2 py-2 text-xs text-ink-800 focus:outline-none focus:ring-2 focus:ring-ledger-stamp/40',
                                   missingReason ? 'border-orange-400' : 'border-ink-200',
                                 )}
                               />
                             ) : (
-                              <span className="text-ink-300">—</span>
+                              <p className="flex h-[34px] items-center text-xs text-ink-300">Not needed</p>
                             )}
-                          </td>
-                        </tr>
-                      )
-                    })}
-                  </tbody>
-                </table>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
               </div>
 
-             {!allComplete && (
-                <p className="mt-2 flex items-center gap-1.5 text-xs text-orange-600">
+              {!allComplete && (
+                <p className="mt-3 flex items-center gap-1.5 rounded-lg bg-orange-50 px-3 py-2 text-xs text-orange-700">
                   <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
                   {includeCount === 0
                     ? 'Include at least one check to submit.'
@@ -1764,35 +1809,88 @@ function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
             </div>
           )}
 
+          {!nameEntered && (
+            <div className="mt-5 flex items-center gap-2 rounded-lg border border-dashed border-ink-200 bg-white px-4 py-3 text-xs text-ink-400">
+              <UserRound className="h-4 w-4 shrink-0" />
+              Enter the collector's name above to fill in per-check details.
+            </div>
+          )}
+
           {error && (
-            <p className="mt-3 flex items-center gap-1.5 text-sm text-red-600">
+            <p className="mt-4 flex items-center gap-1.5 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">
               <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
               {error}
             </p>
           )}
         </div>
 
-        <div className="flex items-center justify-end gap-2 border-t border-ink-100 px-5 py-4">
-          <button
-            ref={cancelButtonRef}
-            onClick={onCancel}
-            disabled={submitting}
-            className="rounded-md border border-ink-200 px-4 py-2 text-sm font-medium text-ink-600 hover:bg-ink-50 disabled:opacity-40"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={handleConfirm}
-            disabled={!canSubmit}
-            title={!canSubmit && nameEntered ? 'Every included check needs complete details before submitting' : undefined}
-            className="flex items-center gap-2 rounded-md bg-ledger-stamp px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            {submitting && <Loader2 className="h-4 w-4 animate-spin" />}
-            {submitting ? 'Submitting…' : includeCount > 1 ? `Submit ${includeCount} for approval` : 'Submit for approval'}
-          </button>
+        {/* ── Footer ───────────────────────────────────────────────── */}
+        <div className="flex shrink-0 items-center justify-between gap-3 border-t border-ink-100 bg-white px-7 py-4">
+          <p className="hidden text-xs text-ink-400 sm:block">
+            {nameEntered
+              ? `${completedCount} of ${includeCount || 0} checks ready · ${formatCurrency(totalAmount)} total`
+              : 'Collector name required to continue'}
+          </p>
+          <div className="ml-auto flex items-center gap-2">
+            <button
+              ref={cancelButtonRef}
+              onClick={onCancel}
+              disabled={submitting}
+              className="rounded-md border border-ink-200 px-4 py-2 text-sm font-medium text-ink-600 hover:bg-ink-50 disabled:opacity-40"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleConfirm}
+              disabled={!canSubmit}
+              title={!canSubmit && nameEntered ? 'Every included check needs complete details before submitting' : undefined}
+              className="flex items-center gap-2 rounded-md bg-ledger-stamp px-5 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {submitting && <Loader2 className="h-4 w-4 animate-spin" />}
+              {submitting ? 'Submitting…' : includeCount > 1 ? `Submit ${includeCount} for approval` : 'Submit for approval'}
+            </button>
+          </div>
         </div>
       </div>
     </div>
+  )
+}
+
+// Small labeled stat used in the modal's collector card, e.g.
+// "3 checks to submit" / "2/3 details entered" / "₱12,000.00 total amount".
+function SummaryPill({ label, value, tone = 'neutral', mono = false }) {
+  const tones = {
+    neutral: 'bg-ink-50 text-ink-700',
+    positive: 'bg-ledger-stamp/10 text-ledger-stamp',
+    warning: 'bg-amber-100 text-amber-700',
+  }
+  return (
+    <div className={cn('rounded-lg px-3 py-2 text-right', tones[tone] || tones.neutral)}>
+      <p className={cn('text-sm font-semibold leading-tight', mono && 'font-mono')}>{value}</p>
+      <p className="text-[9px] uppercase tracking-wide opacity-70">{label}</p>
+    </div>
+  )
+}
+
+// Shared Yes/No toggle button used for the AR-collected and 2307-Attached
+// controls in the modal, so both read identically at a glance.
+function YesNoButton({ active, onClick, label, tone }) {
+  const activeClass =
+    tone === 'positive'
+      ? 'border-ledger-stamp bg-ledger-stamp text-white'
+      : 'border-ink-700 bg-ink-700 text-white'
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={cn(
+        'flex-1 rounded-md border px-2 py-2 text-xs font-medium transition',
+        active ? activeClass : 'border-ink-200 text-ink-500 hover:bg-ink-50',
+      )}
+    >
+      {label}
+    </button>
   )
 }
 

@@ -100,6 +100,7 @@ import {
   Loader2,
   AlertTriangle,
   User,
+  UserRound,
   Hash,
   CalendarDays,
   Layers,
@@ -121,6 +122,8 @@ import {
   Timer,
   Flame,
   Landmark,
+  ClipboardList,
+  ReceiptText,
 } from 'lucide-react'
 import { supabase } from '../../lib/supabaseClient'
 import { Input } from '../../components/ui/input'
@@ -2316,6 +2319,20 @@ function buildInitialCheckEntries(checks) {
   return initial
 }
 
+// ---------------------------------------------------------------------------
+// Action modal
+//
+// Shared by five action types (submit / release / recall / bulk-release /
+// bulk-recall), so the container and header/footer chrome stay one
+// consistent shell — but the SUBMIT flow is the data-heavy one, so its body
+// is laid out to match the Submit-for-Approval modal on the Checks
+// Register page (AdminChecks.jsx): a summary strip up top, then one clearly
+// separated row-card per check instead of a dense table, so an admin
+// entering receipt/AR/2307 data for several checks at once always has a
+// clear place to look. The simpler release/recall confirmations keep a
+// compact review table, since there's nothing to edit there — just checks
+// to confirm.
+// ---------------------------------------------------------------------------
 function ActionModal({ action, checks, total, onCancel, onConfirm, loading, error, successFlash }) {
   const isSubmit = action.type === 'submit'
   const isRelease = action.type === 'release'
@@ -2334,7 +2351,7 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
 
   // Whether any check in THIS submit flow was previously returned by an
   // approver — if so we surface the reason/who/when right in the outcome
-  // table so the admin knows exactly what to fix before resubmitting.
+  // cards so the admin knows exactly what to fix before resubmitting.
   const anyReturnedInModal = isSubmit && checks.some((c) => c.checkStatus === 'returned')
 
   // Per-check state for the submit flow: whether it's included in this
@@ -2347,6 +2364,7 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
     setOrEntries((prev) => ({
       ...prev,
       [checkId]: {
+        ...prev[checkId],
         include: value,
         receiptType: value ? prev[checkId]?.receiptType || '' : '',
         receiptNo: value ? prev[checkId]?.receiptNo || '' : '',
@@ -2418,6 +2436,10 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
   const hasDuplicates = duplicateOrNos.size > 0
   const allComplete = !isSubmit || (checkCount > 0 && completedCount === checkCount && !hasDuplicates)
   const releaseCount = checkCount - includeCount
+  const submitTotalAmount = useMemo(
+    () => checks.reduce((sum, c) => (orEntries[c.checkId]?.include ? sum + (Number(c.amount) || 0) : sum), 0),
+    [checks, orEntries],
+  )
 
   // Runs once on mount: focuses the first row's receipt-type dropdown (so
   // an admin can start choosing immediately) or, if there's nothing to
@@ -2491,6 +2513,18 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
     ? 'Return selected orders'
     : 'Return reservation'
 
+  const subtitle = isSubmit
+    ? checkCount === 1
+      ? '1 check will be sent to an approver for verification before it can be marked picked up.'
+      : `${checkCount} checks will be reviewed here, then sent to an approver for verification.`
+    : isRecall
+    ? "Pulls this submission back to your Active list so you can fix a mistake before resubmitting."
+    : isBulkRecall
+    ? `Pulls ${action.reservations?.length ?? 0} submissions back to Active so corrections can be made.`
+    : isBulkRelease
+    ? `Returns ${action.reservations?.length ?? 0} orders to the available pool immediately.`
+    : 'Returns this order to the available pool immediately.'
+
   const confirmLabel = isSubmit
     ? includeCount === 0
       ? 'Release All'
@@ -2506,10 +2540,14 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
     : 'Return'
 
   const isSimpleList = isRelease || isRecall
+  // The submit flow needs real editing room; the other four flows are just
+  // a review-and-confirm list, so they stay in a smaller, non-scrolling-body
+  // dialog rather than stretching to fill the viewport for no reason.
+  const HeaderIcon = isSubmit ? Send : isRecall || isBulkRecall ? RotateCcw : Undo2
 
   return (
     <div
-      className="fixed inset-0 z-40 flex items-center justify-center bg-ink-900/40 p-4"
+      className="fixed inset-0 z-40 flex items-center justify-center bg-ink-900/50 p-4 sm:p-6"
       onMouseDown={(e) => {
         if (e.target === e.currentTarget && !loading && !successFlash) onCancel()
       }}
@@ -2519,72 +2557,63 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
         role="dialog"
         aria-modal="true"
         aria-labelledby="pickup-action-title"
-        className="relative w-full max-w-2xl overflow-hidden rounded-xl bg-white shadow-xl"
+        className={cn(
+          'relative flex w-full flex-col overflow-hidden rounded-2xl bg-white shadow-2xl',
+          isSubmit ? 'h-[90vh] max-w-6xl' : 'max-h-[85vh] max-w-2xl',
+        )}
       >
-        <div className="flex items-center justify-between border-b border-ink-100 px-5 py-4">
-          <h2 id="pickup-action-title" className="text-lg font-semibold text-ink-900">
-            {title}
-          </h2>
+        {/* ── Header ───────────────────────────────────────────────── */}
+        <div className="flex shrink-0 items-start justify-between gap-4 border-b border-ink-100 px-7 py-5">
+          <div className="flex items-start gap-3">
+            <div
+              className={cn(
+                'flex h-11 w-11 shrink-0 items-center justify-center rounded-full',
+                isSubmit
+                  ? 'bg-orange-500/10 text-orange-600'
+                  : isRecall || isBulkRecall
+                  ? 'bg-amber-500/10 text-amber-600'
+                  : 'bg-ink-100 text-ink-600',
+              )}
+            >
+              <HeaderIcon className="h-5 w-5" />
+            </div>
+            <div>
+              <h2 id="pickup-action-title" className="text-lg font-semibold text-ink-900">
+                {title}
+              </h2>
+              <p className="mt-0.5 text-sm text-ink-400">{subtitle}</p>
+            </div>
+          </div>
           <button
             onClick={onCancel}
             disabled={loading}
-            className="text-ink-300 hover:text-ink-600 disabled:opacity-40"
+            className="shrink-0 rounded-full p-1.5 text-ink-300 hover:bg-ink-50 hover:text-ink-600 disabled:opacity-40"
             aria-label="Close"
           >
             <X className="h-5 w-5" />
           </button>
         </div>
 
-        <div className="max-h-[75vh] overflow-y-auto px-5 py-4">
-          {(isBulkRelease || isBulkRecall) ? (
-            <>
-              <p className="text-sm text-ink-600">
-                {isBulkRecall ? (
-                  <>
-                    This pulls {action.reservations.length} submission
-                    {action.reservations.length === 1 ? '' : 's'} back out of the approval queue and
-                    returns {action.reservations.length === 1 ? 'it' : 'them'} to your Active list so
-                    you can fix a mistake before resubmitting. Nothing is released to the pool.
-                  </>
-                ) : (
-                  <>
-                    This returns {action.reservations.length} order
-                    {action.reservations.length === 1 ? '' : 's'} back into the available pool
-                    immediately. Use this if the collectors cancelled or won't be coming.
-                  </>
-                )}
-              </p>
-              <div className="mt-3 max-h-56 overflow-y-auto rounded-md border border-ink-100">
-                <ul className="divide-y divide-ink-50 text-sm">
-                  {action.reservations.map((r) => (
-                    <li key={r.id} className="flex items-center justify-between px-3 py-2">
-                      <span className="text-ink-800">{r.collector_name || 'Unknown collector'}</span>
-                      <span className="text-xs text-ink-400">
-                        {(r.checks || []).length} check{(r.checks || []).length === 1 ? '' : 's'}
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            </>
-          ) : (
+        {/* ── Body ─────────────────────────────────────────────────── */}
+        <div className={cn('flex-1 overflow-y-auto px-7 py-6', isSubmit && 'bg-ink-50/40')}>
+          {(isBulkRelease || isBulkRecall) && (
+            <div className="max-h-72 overflow-y-auto rounded-xl border border-ink-100">
+              <ul className="divide-y divide-ink-50 text-sm">
+                {action.reservations.map((r) => (
+                  <li key={r.id} className="flex items-center justify-between px-4 py-2.5">
+                    <span className="text-ink-800">{r.collector_name || 'Unknown collector'}</span>
+                    <span className="text-xs text-ink-400">
+                      {(r.checks || []).length} check{(r.checks || []).length === 1 ? '' : 's'}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {(isRelease || isRecall) && (
             <p className="text-sm text-ink-600">
-              {isSubmit ? (
-                <>
-                  For each check in <span className="font-medium text-ink-900">{reservation.collector_name}</span>
-                  's order, confirm whether it's actually being picked up right now. Uncheck any check
-                  the collector isn't taking today — you'll be asked why, and it goes straight back
-                  into the available pool for someone else to reserve. Checks you submit will go to
-                  an approver for verification before they're final.
-                  {anyReturnedInModal && (
-                    <>
-                      {' '}
-                      Rows highlighted below were sent back by an approver — the reason they gave is
-                      shown so you know what to fix before resubmitting.
-                    </>
-                  )}
-                </>
-              ) : isRecall ? (
+              {isRecall ? (
                 <>
                   This pulls <span className="font-medium text-ink-900">{reservation.collector_name}</span>
                   's submission of {checkCount} check{checkCount === 1 ? '' : 's'} back out of the
@@ -2601,285 +2630,284 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
             </p>
           )}
 
+          {/* ── Submit flow: collector summary strip ────────────────── */}
           {isSubmit && checkCount > 0 && (
-            <div className="mt-3">
-              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                <p className="text-xs font-medium text-ink-500">Per-check outcome</p>
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="rounded-full bg-teal-100 px-2 py-0.5 text-[11px] font-medium text-teal-700">
-                    {includeCount} to submit
-                  </span>
-                  {releaseCount > 0 && (
-                    <span className="rounded-full bg-slate-200 px-2 py-0.5 text-[11px] font-medium text-slate-600">
-                      {releaseCount} to release
-                    </span>
-                  )}
-                  <span
-                    className={cn(
-                      'rounded-full px-2 py-0.5 text-[11px] font-medium',
-                      allComplete ? 'bg-teal-100 text-teal-700' : 'bg-orange-100 text-orange-700'
-                    )}
-                  >
-                    {completedCount} of {checkCount} entered
-                  </span>
+            <div className="rounded-xl border border-ink-100 bg-white p-5 shadow-sm">
+              <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex items-center gap-2.5">
+                  <UserRound className="h-4 w-4 text-ink-400" />
+                  <div>
+                    <p className="text-sm font-semibold text-ink-900">
+                      {reservation.collector_name || 'Unknown collector'}
+                    </p>
+                    <p className="text-xs text-ink-400">
+                      Confirm what's actually being picked up right now — uncheck anything the
+                      collector isn't taking today.
+                    </p>
+                  </div>
+                </div>
+                <div className="flex shrink-0 flex-wrap items-center gap-2">
+                  <SummaryPill label="to submit" value={includeCount} tone="neutral" />
+                  {releaseCount > 0 && <SummaryPill label="to release" value={releaseCount} tone="warning" />}
+                  <SummaryPill
+                    label="details entered"
+                    value={`${completedCount}/${checkCount}`}
+                    tone={allComplete ? 'positive' : 'warning'}
+                  />
+                  <SummaryPill label="submitting amount" value={formatCurrency(submitTotalAmount)} tone="neutral" mono />
                 </div>
               </div>
-              <div className="max-h-[22rem] overflow-y-auto rounded-md border border-ink-100">
-                <table className="w-full text-xs">
-                  <thead className="sticky top-0 bg-ink-50">
-                    <tr className="text-left uppercase tracking-wide text-ink-400">
-                      <th className="px-3 py-1.5 font-medium">Pick up</th>
-                      <th className="px-3 py-1.5 font-medium">Bank</th>
-                      <th className="px-3 py-1.5 font-medium">Check no.</th>
-                      <th className="px-3 py-1.5 font-medium">Payee</th>
-                      <th className="px-3 py-1.5 text-right font-medium">Amount</th>
-                      <th className="px-3 py-1.5 font-medium">Receipt</th>
-                      <th className="px-3 py-1.5 font-medium">AR collected</th>
-                      <th className="px-3 py-1.5 font-medium">2307 Attached</th>
-                      <th className="px-3 py-1.5 font-medium">Reason</th>
-                      {anyReturnedInModal && <th className="px-3 py-1.5 font-medium">Returned note</th>}
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-ink-50">
-                    {checks.map((c, idx) => {
-                      const entry =
-                        orEntries[c.checkId] || {
-                          include: true,
-                          receiptType: '',
-                          receiptNo: '',
-                          collected: null,
-                          attached2307: null,
-                          remarks: '',
-                        }
-                      const composedReceipt = composeReceiptNo(entry)
-                      const isDuplicate = entry.include && composedReceipt && duplicateOrNos.has(composedReceipt.toLowerCase())
-                      // A free-text reason is only needed when a check is being
-                      // released outright. AR collected and 2307 Attached are
-                      // plain yes/no answers with no justification required.
-                      const needsReason = !entry.include
-                      const missingReason = needsReason && !entry.remarks?.trim()
-                      const rowIncomplete = entry.include
-                        ? !composedReceipt ||
-                          entry.collected === null ||
-                          entry.collected === undefined ||
-                          entry.attached2307 === null ||
-                          entry.attached2307 === undefined
-                        : missingReason
-                      const wasReturned = c.checkStatus === 'returned'
+            </div>
+          )}
 
-                      return (
-                        <tr
-                          key={c.checkId ?? idx}
-                          className={cn(
-                            !entry.include && 'bg-slate-50/70',
-                            entry.include && isDuplicate && 'bg-red-50/70',
-                            !isDuplicate && rowIncomplete && 'bg-amber-50/50',
-                            !rowIncomplete && !isDuplicate && wasReturned && 'bg-amber-50/30'
-                          )}
-                        >
-                          <td className="px-3 py-2">
-                            <button
-                              type="button"
-                              onClick={() => updateInclude(c.checkId, !entry.include)}
-                              aria-pressed={entry.include}
-                              aria-label={
-                                entry.include
-                                  ? `Mark check ${c.check_no || idx + 1} as not picked up`
-                                  : `Mark check ${c.check_no || idx + 1} as picked up`
-                              }
-                              className={entry.include ? 'text-teal-600' : 'text-ink-300 hover:text-ink-500'}
-                            >
-                              {entry.include ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
-                            </button>
-                          </td>
-                          <td className="px-3 py-2">
-                            <BankBadge bank={c.bank} />
-                          </td>
-                          <td className="px-3 py-2 font-mono text-ink-700">{c.check_no || '—'}</td>
-                          <td className="max-w-[110px] truncate px-3 py-2 text-ink-900">{c.payee || '—'}</td>
-                          <td className="px-3 py-2 text-right font-mono text-ink-700">
+          {/* ── Submit flow: per-check cards ─────────────────────────── */}
+          {isSubmit && checkCount > 0 && (
+            <div className="mt-5">
+              <div className="mb-3 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-ink-500">
+                <ClipboardList className="h-3.5 w-3.5" />
+                Per-check outcome
+              </div>
+
+              <div className="flex flex-col gap-3">
+                {checks.map((c, idx) => {
+                  const entry =
+                    orEntries[c.checkId] || {
+                      include: true,
+                      receiptType: '',
+                      receiptNo: '',
+                      collected: null,
+                      attached2307: null,
+                      remarks: '',
+                    }
+                  const composedReceipt = composeReceiptNo(entry)
+                  const isDuplicate = entry.include && composedReceipt && duplicateOrNos.has(composedReceipt.toLowerCase())
+                  // A free-text reason is only needed when a check is being
+                  // released outright. AR collected and 2307 Attached are
+                  // plain yes/no answers with no justification required.
+                  const needsReason = !entry.include
+                  const missingReason = needsReason && !entry.remarks?.trim()
+                  const rowIncomplete = entry.include
+                    ? !composedReceipt ||
+                      entry.collected === null ||
+                      entry.collected === undefined ||
+                      entry.attached2307 === null ||
+                      entry.attached2307 === undefined
+                    : missingReason
+                  const wasReturned = c.checkStatus === 'returned'
+                  const rowComplete = !rowIncomplete && !isDuplicate
+
+                  return (
+                    <div
+                      key={c.checkId ?? idx}
+                      className={cn(
+                        'rounded-xl border bg-white shadow-sm transition-colors',
+                        !entry.include && 'border-ink-100',
+                        entry.include && isDuplicate && 'border-red-300 ring-1 ring-red-100',
+                        entry.include && !isDuplicate && rowIncomplete && 'border-amber-200',
+                        entry.include && rowComplete && 'border-teal-300/70',
+                      )}
+                    >
+                      {/* Returned-for-correction banner, shown only on checks
+                          an approver actually sent back, so the admin sees
+                          exactly what needs fixing before resubmitting. */}
+                      {wasReturned && (
+                        <div className="flex flex-wrap items-start gap-1.5 rounded-t-xl border-b border-amber-100 bg-amber-50 px-4 py-2 text-[11px] text-amber-800">
+                          <RotateCcw className="mt-0.5 h-3 w-3 shrink-0" />
+                          <span>
+                            <span className="font-semibold">Returned:</span>{' '}
+                            {c.returnReason || 'No reason given'}
+                            <span className="text-amber-600">
+                              {' '}
+                              — {formatDateTime(c.returnedAt)}
+                              {c.returnedByName ? ` · ${c.returnedByName}` : ''}
+                            </span>
+                          </span>
+                        </div>
+                      )}
+
+                      {/* Row header: check identity + include toggle + status */}
+                      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-ink-100 px-4 py-3">
+                        <div className="flex items-center gap-3">
+                          <button
+                            type="button"
+                            onClick={() => updateInclude(c.checkId, !entry.include)}
+                            aria-pressed={entry.include}
+                            aria-label={
+                              entry.include
+                                ? `Mark check ${c.check_no || idx + 1} as not picked up`
+                                : `Mark check ${c.check_no || idx + 1} as picked up`
+                            }
+                            className={cn(
+                              'flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium transition',
+                              entry.include
+                                ? 'text-teal-600 hover:bg-teal-50'
+                                : 'text-ink-300 hover:bg-ink-50 hover:text-ink-500',
+                            )}
+                          >
+                            {entry.include ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
+                            {entry.include ? 'Picking up' : 'Not today'}
+                          </button>
+                          <div className="h-6 w-px bg-ink-100" />
+                          <BankBadge bank={c.bank} />
+                          <div>
+                            <p className="text-sm font-semibold text-ink-900">{c.payee || '—'}</p>
+                            <p className="font-mono text-[11px] text-ink-400">
+                              Check {c.check_no || '—'}
+                              {c.payor ? ` · from ${c.payor}` : ''}
+                            </p>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-3">
+                          <span className="font-mono text-sm font-semibold text-ink-800">
                             {formatCurrency(c.amount)}
-                          </td>
-                          <td className="px-2 py-1.5">
-                            {entry.include ? (
-                              <div className="flex flex-col gap-1">
-                                <select
-                                  ref={idx === 0 ? firstReceiptFieldRef : undefined}
-                                  value={entry.receiptType}
-                                  onChange={(e) => updateReceiptType(c.checkId, e.target.value)}
-                                  aria-label={`Receipt type for check ${c.check_no || idx + 1}`}
-                                  className="w-20 rounded border border-ink-200 px-1.5 py-1 text-xs text-ink-800 focus:outline-none focus:ring-1 focus:ring-teal-500"
-                                >
-                                  <option value="">Type</option>
-                                  {RECEIPT_TYPES.map((rt) => (
-                                    <option key={rt} value={rt}>
-                                      {rt}
-                                    </option>
-                                  ))}
-                                </select>
-                                {entry.receiptType && (
-                                  <>
-                                    <input
-                                      type="text"
-                                      inputMode="numeric"
-                                      value={entry.receiptNo}
-                                      onChange={(e) => updateReceiptNo(c.checkId, e.target.value)}
-                                      onBlur={(e) => updateReceiptNo(c.checkId, e.target.value.trim())}
-                                      placeholder={`${entry.receiptType} no.`}
-                                      maxLength={40}
-                                      aria-label={`${entry.receiptType} number for check ${c.check_no || idx + 1}`}
-                                      className={cn(
-                                        'w-24 rounded border px-2 py-1 text-xs text-ink-800 focus:outline-none focus:ring-1 focus:ring-teal-500',
-                                        isDuplicate ? 'border-red-400' : 'border-ink-200'
-                                      )}
-                                    />
-                                    {isDuplicate && (
-                                      <p className="text-[10px] leading-tight text-red-600">Duplicate</p>
-                                    )}
-                                  </>
-                                )}
-                              </div>
-                            ) : (
-                              <span className="text-ink-300">—</span>
-                            )}
-                          </td>
-                          <td className="px-2 py-1.5">
-                            {entry.include ? (
-                              <div
-                                className="flex gap-1"
-                                role="group"
-                                aria-label={`AR collected for check ${c.check_no || idx + 1}`}
+                          </span>
+                          {entry.include && (
+                            <span
+                              className={cn(
+                                'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium',
+                                isDuplicate
+                                  ? 'bg-red-100 text-red-700'
+                                  : rowComplete
+                                  ? 'bg-teal-100 text-teal-700'
+                                  : 'bg-amber-100 text-amber-700',
+                              )}
+                            >
+                              {isDuplicate ? (
+                                <>
+                                  <AlertTriangle className="h-3 w-3" /> Duplicate receipt
+                                </>
+                              ) : rowComplete ? (
+                                <>
+                                  <Check className="h-3 w-3" /> Complete
+                                </>
+                              ) : (
+                                <>
+                                  <AlertTriangle className="h-3 w-3" /> Incomplete
+                                </>
+                              )}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Row body: receipt / AR / 2307 / reason inputs */}
+                      {entry.include ? (
+                        <div className="grid grid-cols-1 gap-4 px-4 py-4 sm:grid-cols-2 lg:grid-cols-3">
+                          <div>
+                            <label className="mb-1.5 flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-ink-400">
+                              <ReceiptText className="h-3 w-3" />
+                              Receipt
+                            </label>
+                            <div className="flex gap-1.5">
+                              <select
+                                ref={idx === 0 ? firstReceiptFieldRef : undefined}
+                                value={entry.receiptType}
+                                onChange={(e) => updateReceiptType(c.checkId, e.target.value)}
+                                aria-label={`Receipt type for check ${c.check_no || idx + 1}`}
+                                className="w-20 rounded-md border border-ink-200 px-2 py-2 text-xs text-ink-800 focus:outline-none focus:ring-2 focus:ring-teal-500/40"
                               >
-                                <button
-                                  type="button"
-                                  onClick={() => updateCollected(c.checkId, true)}
-                                  aria-pressed={entry.collected === true}
-                                  className={cn(
-                                    'rounded border px-2 py-1 text-[11px] font-medium transition',
-                                    entry.collected === true
-                                      ? 'border-teal-600 bg-teal-600 text-white'
-                                      : 'border-ink-200 text-ink-500 hover:bg-ink-50'
-                                  )}
-                                >
-                                  Yes
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => updateCollected(c.checkId, false)}
-                                  aria-pressed={entry.collected === false}
-                                  className={cn(
-                                    'rounded border px-2 py-1 text-[11px] font-medium transition',
-                                    entry.collected === false
-                                      ? 'border-ink-700 bg-ink-700 text-white'
-                                      : 'border-ink-200 text-ink-500 hover:bg-ink-50'
-                                  )}
-                                >
-                                  No
-                                </button>
-                              </div>
-                            ) : (
-                              <span className="rounded-full bg-slate-200 px-2 py-0.5 text-[11px] font-medium text-slate-600">
-                                Releasing
-                              </span>
-                            )}
-                          </td>
-                          <td className="px-2 py-1.5">
-                            {entry.include ? (
-                              <div
-                                className="flex gap-1"
-                                role="group"
-                                aria-label={`2307 Attached for check ${c.check_no || idx + 1}`}
-                              >
-                                <button
-                                  type="button"
-                                  onClick={() => updateAttached2307(c.checkId, true)}
-                                  aria-pressed={entry.attached2307 === true}
-                                  className={cn(
-                                    'rounded border px-2 py-1 text-[11px] font-medium transition',
-                                    entry.attached2307 === true
-                                      ? 'border-teal-600 bg-teal-600 text-white'
-                                      : 'border-ink-200 text-ink-500 hover:bg-ink-50'
-                                  )}
-                                >
-                                  Yes
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => updateAttached2307(c.checkId, false)}
-                                  aria-pressed={entry.attached2307 === false}
-                                  className={cn(
-                                    'rounded border px-2 py-1 text-[11px] font-medium transition',
-                                    entry.attached2307 === false
-                                      ? 'border-ink-700 bg-ink-700 text-white'
-                                      : 'border-ink-200 text-ink-500 hover:bg-ink-50'
-                                  )}
-                                >
-                                  No
-                                </button>
-                              </div>
-                            ) : (
-                              <span className="text-ink-300">—</span>
-                            )}
-                          </td>
-                          <td className="px-2 py-1.5">
-                            {needsReason ? (
+                                <option value="">Type</option>
+                                {RECEIPT_TYPES.map((rt) => (
+                                  <option key={rt} value={rt}>
+                                    {rt}
+                                  </option>
+                                ))}
+                              </select>
                               <input
                                 type="text"
-                                value={entry.remarks}
-                                onChange={(e) => updateRemarks(c.checkId, e.target.value)}
-                                placeholder="Why isn&rsquo;t this being picked up?"
-                                maxLength={200}
-                                aria-label={`Reason for check ${c.check_no || idx + 1}`}
+                                inputMode="numeric"
+                                value={entry.receiptNo}
+                                onChange={(e) => updateReceiptNo(c.checkId, e.target.value)}
+                                onBlur={(e) => updateReceiptNo(c.checkId, e.target.value.trim())}
+                                placeholder="Number"
+                                maxLength={40}
+                                disabled={!entry.receiptType}
+                                aria-label={`Receipt number for check ${c.check_no || idx + 1}`}
                                 className={cn(
-                                  'w-40 rounded border px-2 py-1 text-xs text-ink-800 focus:outline-none focus:ring-1 focus:ring-teal-500',
-                                  missingReason ? 'border-orange-400' : 'border-ink-200'
+                                  'min-w-0 flex-1 rounded-md border px-2 py-2 text-xs text-ink-800 focus:outline-none focus:ring-2 focus:ring-teal-500/40 disabled:bg-ink-50 disabled:text-ink-300',
+                                  isDuplicate ? 'border-red-400' : 'border-ink-200',
                                 )}
                               />
-                            ) : (
-                              <span className="text-ink-300">—</span>
+                            </div>
+                            {isDuplicate && (
+                              <p className="mt-1 text-[10px] font-medium text-red-600">Already used above</p>
                             )}
-                          </td>
-                          {anyReturnedInModal && (
-                            <td className="max-w-[170px] px-3 py-1.5 align-top">
-                              {wasReturned ? (
-                                <div className="text-[11px] leading-snug text-amber-700">
-                                  <div className="flex items-center gap-1 font-medium">
-                                    <RotateCcw className="h-3 w-3 shrink-0" />
-                                    Returned
-                                  </div>
-                                  <div className="mt-0.5 text-ink-600" title={c.returnReason || undefined}>
-                                    {c.returnReason || 'No reason given'}
-                                  </div>
-                                  <div className="mt-0.5 text-ink-400">
-                                    {formatDateTime(c.returnedAt)}
-                                    {c.returnedByName ? ` · ${c.returnedByName}` : ''}
-                                  </div>
-                                </div>
-                              ) : (
-                                <span className="text-ink-300">—</span>
-                              )}
-                            </td>
-                          )}
-                        </tr>
-                      )
-                    })}
-                  </tbody>
-                  <tfoot>
-                    <tr className="border-t border-ink-100 bg-ink-50/60">
-                      <td colSpan={4} className="px-3 py-1.5 text-right font-medium text-ink-500">
-                        Total
-                      </td>
-                      <td className="px-3 py-1.5 text-right font-mono font-semibold text-ink-900">
-                        {formatCurrency(total)}
-                      </td>
-                      <td colSpan={4} />
-                      {anyReturnedInModal && <td />}
-                    </tr>
-                  </tfoot>
-                </table>
+                          </div>
+
+                          <div>
+                            <label className="mb-1.5 block text-[10px] font-semibold uppercase tracking-wide text-ink-400">
+                              AR collected
+                            </label>
+                            <div
+                              className="flex gap-1.5"
+                              role="group"
+                              aria-label={`AR collected for check ${c.check_no || idx + 1}`}
+                            >
+                              <YesNoButton
+                                active={entry.collected === true}
+                                onClick={() => updateCollected(c.checkId, true)}
+                                label="Yes"
+                                tone="positive"
+                              />
+                              <YesNoButton
+                                active={entry.collected === false}
+                                onClick={() => updateCollected(c.checkId, false)}
+                                label="No"
+                                tone="neutral"
+                              />
+                            </div>
+                          </div>
+
+                          <div>
+                            <label className="mb-1.5 block text-[10px] font-semibold uppercase tracking-wide text-ink-400">
+                              2307 Attached
+                            </label>
+                            <div
+                              className="flex gap-1.5"
+                              role="group"
+                              aria-label={`2307 Attached for check ${c.check_no || idx + 1}`}
+                            >
+                              <YesNoButton
+                                active={entry.attached2307 === true}
+                                onClick={() => updateAttached2307(c.checkId, true)}
+                                label="Yes"
+                                tone="positive"
+                              />
+                              <YesNoButton
+                                active={entry.attached2307 === false}
+                                onClick={() => updateAttached2307(c.checkId, false)}
+                                label="No"
+                                tone="neutral"
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="px-4 py-4">
+                          <label className="mb-1.5 block text-[10px] font-semibold uppercase tracking-wide text-ink-400">
+                            Reason <span className="text-orange-500">(required)</span>
+                          </label>
+                          <input
+                            type="text"
+                            value={entry.remarks}
+                            onChange={(e) => updateRemarks(c.checkId, e.target.value)}
+                            placeholder="Why isn&rsquo;t this being picked up today?"
+                            maxLength={200}
+                            aria-label={`Reason for check ${c.check_no || idx + 1}`}
+                            className={cn(
+                              'w-full max-w-md rounded-md border px-2.5 py-2 text-xs text-ink-800 focus:outline-none focus:ring-2 focus:ring-teal-500/40',
+                              missingReason ? 'border-orange-400' : 'border-ink-200',
+                            )}
+                          />
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
               </div>
+
               {!allComplete && (
-                <p className="mt-2 flex items-center gap-1.5 text-xs text-orange-600">
+                <p className="mt-3 flex items-center gap-1.5 rounded-lg bg-orange-50 px-3 py-2 text-xs text-orange-700">
                   <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
                   {hasDuplicates
                     ? 'Each check being picked up needs its own unique receipt type + number.'
@@ -2890,31 +2918,31 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
           )}
 
           {isSimpleList && checkCount > 0 && (
-            <div className="mt-3 max-h-56 overflow-y-auto rounded-md border border-ink-100">
+            <div className="mt-3 max-h-72 overflow-y-auto rounded-xl border border-ink-100">
               <table className="w-full text-xs">
                 <thead className="sticky top-0 bg-ink-50">
                   <tr className="text-left uppercase tracking-wide text-ink-400">
-                    <th className="px-3 py-1.5 font-medium">Bank</th>
-                    <th className="px-3 py-1.5 font-medium">Check no.</th>
-                    <th className="px-3 py-1.5 font-medium">Payee</th>
-                    <th className="px-3 py-1.5 font-medium">Payor</th>
-                    <th className="px-3 py-1.5 font-medium">Date</th>
-                    <th className="px-3 py-1.5 text-right font-medium">Amount</th>
+                    <th className="px-3 py-2 font-medium">Bank</th>
+                    <th className="px-3 py-2 font-medium">Check no.</th>
+                    <th className="px-3 py-2 font-medium">Payee</th>
+                    <th className="px-3 py-2 font-medium">Payor</th>
+                    <th className="px-3 py-2 font-medium">Date</th>
+                    <th className="px-3 py-2 text-right font-medium">Amount</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-ink-50">
                   {checks.map((c, idx) => (
                     <tr key={c.checkId ?? idx}>
-                      <td className="px-3 py-1.5">
+                      <td className="px-3 py-2">
                         <BankBadge bank={c.bank} />
                       </td>
-                      <td className="px-3 py-1.5 font-mono text-ink-700">{c.check_no || '—'}</td>
-                      <td className="max-w-[110px] truncate px-3 py-1.5 text-ink-900">{c.payee || '—'}</td>
-                      <td className="max-w-[110px] truncate px-3 py-1.5 text-ink-600">{c.payor || '—'}</td>
-                      <td className="px-3 py-1.5 text-ink-500">
+                      <td className="px-3 py-2 font-mono text-ink-700">{c.check_no || '—'}</td>
+                      <td className="max-w-[110px] truncate px-3 py-2 text-ink-900">{c.payee || '—'}</td>
+                      <td className="max-w-[110px] truncate px-3 py-2 text-ink-600">{c.payor || '—'}</td>
+                      <td className="px-3 py-2 text-ink-500">
                         {c.check_date ? formatDate(c.check_date) : '—'}
                       </td>
-                      <td className="px-3 py-1.5 text-right font-mono text-ink-700">
+                      <td className="px-3 py-2 text-right font-mono text-ink-700">
                         {formatCurrency(c.amount)}
                       </td>
                     </tr>
@@ -2922,10 +2950,10 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
                 </tbody>
                 <tfoot>
                   <tr className="border-t border-ink-100 bg-ink-50/60">
-                    <td colSpan={5} className="px-3 py-1.5 text-right font-medium text-ink-500">
+                    <td colSpan={5} className="px-3 py-2 text-right font-medium text-ink-500">
                       Total
                     </td>
-                    <td className="px-3 py-1.5 text-right font-mono font-semibold text-ink-900">
+                    <td className="px-3 py-2 text-right font-mono font-semibold text-ink-900">
                       {formatCurrency(total)}
                     </td>
                   </tr>
@@ -2935,7 +2963,7 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
           )}
 
           {(isRelease || isBulkRelease) && (
-            <div className="mt-3 flex items-start gap-2 rounded-md bg-orange-50 px-3 py-2 text-xs text-orange-700">
+            <div className="mt-4 flex items-start gap-2 rounded-lg bg-orange-50 px-3 py-2.5 text-xs text-orange-700">
               <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
               {isBulkRelease
                 ? 'These reservations will be marked as not picked up.'
@@ -2944,7 +2972,7 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
           )}
 
           {(isRecall || isBulkRecall) && (
-            <div className="mt-3 flex items-start gap-2 rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-700">
+            <div className="mt-4 flex items-start gap-2 rounded-lg bg-amber-50 px-3 py-2.5 text-xs text-amber-700">
               <RotateCcw className="mt-0.5 h-3.5 w-3.5 shrink-0" />
               {isBulkRecall
                 ? 'These will need to be resubmitted for approval after you make your corrections.'
@@ -2953,34 +2981,42 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
           )}
 
           {error && (
-            <p className="mt-3 flex items-center gap-1.5 text-sm text-red-600">
+            <p className="mt-4 flex items-center gap-1.5 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">
               <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
               {error}
             </p>
           )}
         </div>
 
-        <div className="flex items-center justify-end gap-2 border-t border-ink-100 px-5 py-4">
-          <button
-            ref={cancelButtonRef}
-            onClick={onCancel}
-            disabled={loading}
-            className="rounded-md border border-ink-200 px-4 py-2 text-sm font-medium text-ink-600 hover:bg-ink-50 disabled:opacity-40"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={handleConfirmClick}
-            disabled={loading || (isSubmit && !allComplete)}
-            title={isSubmit && !allComplete ? 'Every check needs a complete outcome before submitting' : undefined}
-            className={cn(
-              'flex items-center gap-2 rounded-md px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60',
-              isSubmit ? 'bg-orange-500 hover:bg-orange-600' : 'bg-ink-900 hover:bg-ink-800'
-            )}
-          >
-            {loading && <Loader2 className="h-4 w-4 animate-spin" />}
-            {confirmLabel}
-          </button>
+        {/* ── Footer ───────────────────────────────────────────────── */}
+        <div className="flex shrink-0 items-center justify-between gap-3 border-t border-ink-100 bg-white px-7 py-4">
+          <p className="hidden text-xs text-ink-400 sm:block">
+            {isSubmit
+              ? `${completedCount} of ${checkCount} checks ready · ${formatCurrency(submitTotalAmount)} submitting`
+              : null}
+          </p>
+          <div className="ml-auto flex items-center gap-2">
+            <button
+              ref={cancelButtonRef}
+              onClick={onCancel}
+              disabled={loading}
+              className="rounded-md border border-ink-200 px-4 py-2 text-sm font-medium text-ink-600 hover:bg-ink-50 disabled:opacity-40"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleConfirmClick}
+              disabled={loading || (isSubmit && !allComplete)}
+              title={isSubmit && !allComplete ? 'Every check needs a complete outcome before submitting' : undefined}
+              className={cn(
+                'flex items-center gap-2 rounded-md px-5 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60',
+                isSubmit ? 'bg-orange-500 hover:bg-orange-600' : 'bg-ink-900 hover:bg-ink-800'
+              )}
+            >
+              {loading && <Loader2 className="h-4 w-4 animate-spin" />}
+              {confirmLabel}
+            </button>
+          </div>
         </div>
 
         {/* Success overlay: shown briefly right after the RPC call
@@ -3006,6 +3042,43 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
         )}
       </div>
     </div>
+  )
+}
+
+// Small labeled stat used in the submit modal's collector summary strip —
+// matches SummaryPill in AdminChecks.jsx's SubmitApprovalModal so both
+// submit flows read identically at a glance.
+function SummaryPill({ label, value, tone = 'neutral', mono = false }) {
+  const tones = {
+    neutral: 'bg-ink-50 text-ink-700',
+    positive: 'bg-teal-100 text-teal-700',
+    warning: 'bg-amber-100 text-amber-700',
+  }
+  return (
+    <div className={cn('rounded-lg px-3 py-2 text-right', tones[tone] || tones.neutral)}>
+      <p className={cn('text-sm font-semibold leading-tight', mono && 'font-mono')}>{value}</p>
+      <p className="text-[9px] uppercase tracking-wide opacity-70">{label}</p>
+    </div>
+  )
+}
+
+// Shared Yes/No toggle button used for the AR-collected and 2307-Attached
+// controls in the submit modal — matches YesNoButton in AdminChecks.jsx.
+function YesNoButton({ active, onClick, label, tone }) {
+  const activeClass =
+    tone === 'positive' ? 'border-teal-600 bg-teal-600 text-white' : 'border-ink-700 bg-ink-700 text-white'
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={cn(
+        'flex-1 rounded-md border px-2 py-2 text-xs font-medium transition',
+        active ? activeClass : 'border-ink-200 text-ink-500 hover:bg-ink-50',
+      )}
+    >
+      {label}
+    </button>
   )
 }
 
