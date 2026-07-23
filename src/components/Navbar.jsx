@@ -1,8 +1,8 @@
 // src/components/Navbar.jsx
 //
-// Same component as before, extended so the signed-in user chip + sign-out
-// button also show inside /approver (previously only /admin), and so the
-// chip shows the person's role, not just their email.
+// Same component as before, updated for: the admin -> verifier rename
+// (role label chip covers 'verifier' and the new 'admin'), and the move to
+// a single shared /login route (was three separate per-role login paths).
 import React from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { LogOut, User } from 'lucide-react'
@@ -10,11 +10,12 @@ import { supabase } from '../lib/supabaseClient'
 import { Button } from './ui/button'
 import { useProfile } from '../context/ProfileContext'
 
-const PROTECTED_PREFIXES = ['/admin', '/approver']
-const LOGIN_PATHS = ['/admin/login', '/approver/login']
+const PROTECTED_PREFIXES = ['/verifier', '/admin', '/approver']
+const LOGIN_PATH = '/login'
 
 const ROLE_LABELS = {
   admin: 'Admin',
+  verifier: 'Verifier',
   approver: 'Approver',
   collector: 'Collector',
 }
@@ -26,11 +27,11 @@ export function Navbar({ user }) {
 
   const isProtectedArea =
     PROTECTED_PREFIXES.some((p) => location.pathname.startsWith(p)) &&
-    !LOGIN_PATHS.includes(location.pathname)
+    location.pathname !== LOGIN_PATH
 
   async function handleSignOut() {
     await supabase.auth.signOut()
-    navigate(location.pathname.startsWith('/approver') ? '/approver/login' : '/admin/login')
+    navigate(LOGIN_PATH)
   }
 
   return (

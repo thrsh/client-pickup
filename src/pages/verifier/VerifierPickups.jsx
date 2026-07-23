@@ -51,6 +51,18 @@
 //   checks to keep showing up in the Active tab as if the whole batch had
 //   been sent back for correction.
 //
+// ADMIN ACTIONS NOTE (read before touching Active / Pending Approval
+// action buttons):
+//   The Active tab is purely a holding/staging area for what a collector
+//   still has to pick up (or bring back for correction) — an admin's only
+//   action there is to review and Submit for Approval. Admins do NOT
+//   manually release/return a reservation from the Active tab; if a
+//   collector isn't coming, that's handled elsewhere (e.g. natural
+//   expiry). "Recall" — pulling a submission back out of the approval
+//   queue to fix a mistake before an approver looks at it — is a
+//   Pending Approval-only action, and always requires the admin to state
+//   a reason (kept alongside the pending record for audit purposes).
+//
 // HISTORY-TAB DATA NOTE:
 //   The History tab reads from check_activity_log rather than the live
 //   `checks` table, because a released/rejected check goes back to
@@ -77,6 +89,13 @@
 //   - admin_submit_for_approval(p_reservation_id uuid, p_check_outcomes jsonb)
 //     (clears return_reason/returned_at/returned_by[_name] on resubmit)
 //   - admin_recall_submission(p_reservation_id uuid, p_check_ids uuid[])
+//     NOTE: this file now requires an admin-entered recall reason before
+//     calling this RPC (see the Recall modal below) and passes it along
+//     as p_reason. Persisting that reason (e.g. into check_activity_log)
+//     requires extending this function accordingly — see
+//     migration_recall_reason.sql. Until that migration lands, Postgres
+//     will reject the extra named parameter; add it before shipping this
+//     change.
 //   - approver_decide(p_reservation_id uuid, p_decisions jsonb) where each
 //     decision is { check_id, decision: 'approve' | 'reject' | 'return', remarks }
 //     and a 'return' decision touches ONLY that check_id (status ->
@@ -381,7 +400,7 @@ export default function AdminPickups() {
   const [now, setNow] = useState(Date.now())
   const [lastUpdated, setLastUpdated] = useState(null)
   const [autoRefresh, setAutoRefresh] = useState(true)
-  // confirmAction.type: 'submit' | 'release' | 'bulk-release' | 'recall' | 'bulk-recall'
+  // confirmAction.type: 'submit' | 'recall' | 'bulk-recall'
   const [confirmAction, setConfirmAction] = useState(null)
   const [actioning, setActioning] = useState(false)
   const [actionError, setActionError] = useState('')
@@ -931,13 +950,6 @@ export default function AdminPickups() {
     setConfirmAction({ type, reservation })
   }
 
-  function openBulkReleaseConfirm() {
-    if (selectedReservations.length === 0) return
-    setActionError('')
-    setSuccessFlash(null)
-    setConfirmAction({ type: 'bulk-release', reservations: selectedReservations })
-  }
-
   function openBulkRecallConfirm() {
     if (selectedReservations.length === 0) return
     setActionError('')
@@ -1004,22 +1016,33 @@ export default function AdminPickups() {
     return null
   }
 
-  async function runAction(orData) {
+  // `payload` is the submit flow's per-check orData map when
+  // confirmAction.type is 'submit', or a { reason } object supplying the
+  // admin-entered recall reason when confirmAction.type is 'recall' or
+  // 'bulk-recall'. See the ADMIN ACTIONS NOTE at the top of this file —
+  // recall always requires a reason.
+  async function runAction(payload) {
     if (!confirmAction || actioning) return
     setActioning(true)
     setActionError('')
 
     try {
-      if (confirmAction.type === 'bulk-release' || confirmAction.type === 'bulk-recall') {
-        const isRecall = confirmAction.type === 'bulk-recall'
+      if (confirmAction.type === 'bulk-recall') {
+        const reason = payload?.reason?.trim()
+        if (!reason) {
+          setActionError('Enter a reason for recalling these submissions.')
+          return
+        }
+
         const results = await Promise.allSettled(
           confirmAction.reservations.map((r) =>
-            isRecall
-              ? supabase.rpc('admin_recall_submission', {
-                  p_reservation_id: r.id,
-                  p_check_ids: sortedLineItems(r, 'pending_approval').map((c) => c.checkId),
-                })
-              : supabase.rpc('admin_release_reservation', { p_reservation_id: r.id })
+            supabase.rpc('admin_recall_submission', {
+              p_reservation_id: r.id,
+              p_check_ids: sortedLineItems(r, 'pending_approval').map((c) => c.checkId),
+              // See the migration note in admin_recall_submission's header
+              // comment: persisting this reason requires extending the RPC.
+              p_reason: reason,
+            })
           )
         )
         const failed = results.filter(
@@ -1030,9 +1053,7 @@ export default function AdminPickups() {
         if (!isMountedRef.current) return
 
         if (failed > 0 && succeeded === 0) {
-          setActionError(
-            `Could not ${isRecall ? 'recall' : 'return'} the selected reservations. Please try again.`
-          )
+          setActionError('Could not recall the selected submissions. Please try again.')
           return
         }
 
@@ -1041,8 +1062,8 @@ export default function AdminPickups() {
         load(false)
         showToast(
           failed > 0
-            ? `${isRecall ? 'Recalled' : 'Returned'} ${succeeded} of ${results.length}. ${failed} failed — try again.`
-            : `${isRecall ? 'Recalled' : 'Returned'} ${succeeded} reservation${succeeded === 1 ? '' : 's'}.`,
+            ? `Recalled ${succeeded} of ${results.length}. ${failed} failed — try again.`
+            : `Recalled ${succeeded} submission${succeeded === 1 ? '' : 's'}.`,
           failed > 0 ? 'warning' : 'success'
         )
         return
@@ -1050,17 +1071,14 @@ export default function AdminPickups() {
 
       const isSubmit = confirmAction.type === 'submit'
       const isRecall = confirmAction.type === 'recall'
-      const fn = isSubmit
-        ? 'admin_submit_for_approval'
-        : isRecall
-        ? 'admin_recall_submission'
-        : 'admin_release_reservation'
+      const fn = isSubmit ? 'admin_submit_for_approval' : 'admin_recall_submission'
       const rpcParams = { p_reservation_id: confirmAction.reservation.id }
 
       let pickedCount = 0
       let releasedCount = 0
 
       if (isSubmit) {
+        const orData = payload
         // Defense in depth: the modal already disables the submit button
         // until every row has a complete outcome, but never trust the
         // client alone before writing to the database.
@@ -1104,7 +1122,15 @@ export default function AdminPickups() {
           }
         })
       } else if (isRecall) {
+        const reason = payload?.reason?.trim()
+        if (!reason) {
+          setActionError('Enter a reason for recalling this submission.')
+          return
+        }
         rpcParams.p_check_ids = confirmChecks.map((c) => c.checkId)
+        // See the migration note in admin_recall_submission's header
+        // comment: persisting this reason requires extending the RPC.
+        rpcParams.p_reason = reason
       }
 
       const { error } = await supabase.rpc(fn, rpcParams)
@@ -1143,9 +1169,7 @@ export default function AdminPickups() {
           ? releasedCount > 0
             ? `Sent ${pickedCount} of ${pickedCount + releasedCount} checks to approval for ${collectorName}; ${releasedCount} released.`
             : `Sent ${collectorName}'s pickup to approval.`
-          : isRecall
-          ? `Recalled ${collectorName}'s submission for edits.`
-          : `Returned ${collectorName}'s reservation.`
+          : `Recalled ${collectorName}'s submission for edits.`
       )
     } catch (err) {
       if (!isMountedRef.current) return
@@ -1278,7 +1302,11 @@ export default function AdminPickups() {
   const someVisibleSelected = visibleReservations.some((r) => selectedIds.has(r.id))
 
   const activeSortLabel = SORT_OPTIONS.find((o) => o.value === sortBy)?.label || 'Sort'
-  const selectable = tab === 'active' || tab === 'pending_approval'
+  // Selection + bulk actions only make sense on Pending Approval — Active
+  // has no bulk (or single) action of its own besides expanding a row and
+  // submitting it for approval. See the ADMIN ACTIONS NOTE at the top of
+  // this file.
+  const selectable = tab === 'pending_approval'
 
   return (
     <div className="pb-20 sm:pb-0">
@@ -1675,7 +1703,6 @@ export default function AdminPickups() {
                 selected={selectedIds.has(r.id)}
                 onToggleSelect={() => toggleSelect(r.id)}
                 onConfirmPickup={() => openConfirm('submit', r)}
-                onRelease={() => openConfirm('release', r)}
                 onRecall={() => openConfirm('recall', r)}
               />
             )
@@ -1696,15 +1723,6 @@ export default function AdminPickups() {
               >
                 Clear
               </button>
-              {tab === 'active' && (
-                <button
-                  onClick={openBulkReleaseConfirm}
-                  className="flex items-center gap-1.5 rounded-md border border-ink-200 px-3 py-1.5 text-xs font-medium text-ink-700 hover:bg-ink-50"
-                >
-                  <Undo2 className="h-3.5 w-3.5" />
-                  Return selected
-                </button>
-              )}
               {tab === 'pending_approval' && (
                 <button
                   onClick={openBulkRecallConfirm}
@@ -1967,7 +1985,6 @@ function ReservationRow({
   selected,
   onToggleSelect,
   onConfirmPickup,
-  onRelease,
   onRecall,
 }) {
   const checkCount = items.length
@@ -2264,13 +2281,6 @@ function ReservationRow({
           {tab === 'active' && (
             <div className="flex items-center justify-end gap-2 border-t border-ink-100 bg-white px-4 py-3">
               <button
-                onClick={onRelease}
-                className="flex items-center gap-1.5 rounded-md border border-ink-200 px-3 py-1.5 text-xs font-medium text-ink-600 hover:bg-ink-50"
-              >
-                <Undo2 className="h-3.5 w-3.5" />
-                Return
-              </button>
-              <button
                 onClick={onConfirmPickup}
                 className="flex items-center gap-1.5 rounded-md bg-orange-500 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-orange-600"
               >
@@ -2324,27 +2334,27 @@ function buildInitialCheckEntries(checks) {
 // ---------------------------------------------------------------------------
 // Action modal
 //
-// Shared by five action types (submit / release / recall / bulk-release /
-// bulk-recall), so the container and header/footer chrome stay one
-// consistent shell — but the SUBMIT flow is the data-heavy one, so its body
-// is laid out to match the Submit-for-Approval modal on the Checks
-// Register page (AdminChecks.jsx): a summary strip up top, then one clearly
+// Shared by three action types (submit / recall / bulk-recall), so the
+// container and header/footer chrome stay one consistent shell. The SUBMIT
+// flow is the data-heavy one: a summary strip up top, then one clearly
 // separated row-card per check instead of a dense table, so an admin
 // entering receipt/AR/2307 data for several checks at once always has a
-// clear place to look. The simpler release/recall confirmations keep a
-// compact review table, since there's nothing to edit there — just checks
-// to confirm.
+// clear place to look. The RECALL flows are deliberately styled the same
+// way — summary strip, per-check cards — so admins see one consistent
+// pattern across both modals, but the cards there are read-only (nothing
+// to edit, the submission is just being pulled back) and are followed by
+// a required "reason for recall" field, since a recall always needs to
+// state why before it can be confirmed.
 // ---------------------------------------------------------------------------
 function ActionModal({ action, checks, total, onCancel, onConfirm, loading, error, successFlash }) {
   const isSubmit = action.type === 'submit'
-  const isRelease = action.type === 'release'
   const isRecall = action.type === 'recall'
-  const isBulkRelease = action.type === 'bulk-release'
   const isBulkRecall = action.type === 'bulk-recall'
   const reservation = action.reservation
   const checkCount = checks.length
   const dialogRef = useRef(null)
   const cancelButtonRef = useRef(null)
+  const reasonFieldRef = useRef(null)
   // Focuses the first row's receipt-TYPE dropdown on open (see the mount
   // effect below) — the number field for that row doesn't exist until a
   // type is picked, so the dropdown is the right thing to land focus on,
@@ -2359,8 +2369,11 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
   // Per-check state for the submit flow: whether it's included in this
   // pickup, its receipt type + number and AR collected answer if so, its
   // 2307 attached answer, and a reason (required only when the check
-  // isn't included at all). Irrelevant for the release/recall flows.
+  // isn't included at all). Irrelevant for the recall flows.
   const [orEntries, setOrEntries] = useState(() => buildInitialCheckEntries(checks))
+  // Required reason for the recall flows — the admin must say why a
+  // submission is being pulled back before it can be confirmed.
+  const [reason, setReason] = useState('')
 
   const updateInclude = useCallback((checkId, value) => {
     setOrEntries((prev) => ({
@@ -2437,23 +2450,25 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
 
   const hasDuplicates = duplicateOrNos.size > 0
   const allComplete = !isSubmit || (checkCount > 0 && completedCount === checkCount && !hasDuplicates)
+  const hasReason = reason.trim().length > 0
   const releaseCount = checkCount - includeCount
   const submitTotalAmount = useMemo(
     () => checks.reduce((sum, c) => (orEntries[c.checkId]?.include ? sum + (Number(c.amount) || 0) : sum), 0),
     [checks, orEntries],
   )
 
-  // Runs once on mount: focuses the first row's receipt-type dropdown (so
-  // an admin can start choosing immediately) or, if there's nothing to
-  // interact with, the Cancel button as a safe default. Deliberately an
-  // empty dependency array — this must NOT re-run whenever
-  // `onCancel`/`loading` change, or it steals focus back away from
-  // whatever the admin is doing every time this component re-renders for
-  // an unrelated reason.
+  // Runs once on mount: focuses the first row's receipt-type dropdown for
+  // the submit flow, the reason field for the recall flows, or the
+  // Cancel button as a safe default. Deliberately an empty dependency
+  // array — this must NOT re-run whenever `onCancel`/`loading` change, or
+  // it steals focus back away from whatever the admin is doing every time
+  // this component re-renders for an unrelated reason.
   useEffect(() => {
     const previouslyFocused = document.activeElement
     if (isSubmit && firstReceiptFieldRef.current) {
       firstReceiptFieldRef.current.focus()
+    } else if ((isRecall || isBulkRecall) && reasonFieldRef.current) {
+      reasonFieldRef.current.focus()
     } else {
       cancelButtonRef.current?.focus()
     }
@@ -2502,30 +2517,23 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
 
   function handleConfirmClick() {
     if (isSubmit && !allComplete) return
-    onConfirm(isSubmit ? orEntries : undefined)
+    if ((isRecall || isBulkRecall) && !hasReason) return
+    onConfirm(isSubmit ? orEntries : isRecall || isBulkRecall ? { reason: reason.trim() } : undefined)
   }
 
   const title = isSubmit
     ? 'Submit pickup for approval'
-    : isRecall
-    ? 'Recall submission'
     : isBulkRecall
     ? 'Recall selected submissions'
-    : isBulkRelease
-    ? 'Return selected orders'
-    : 'Return reservation'
+    : 'Recall submission'
 
   const subtitle = isSubmit
     ? checkCount === 1
       ? '1 check will be sent to an approver for verification before it can be marked picked up.'
       : `${checkCount} checks will be reviewed here, then sent to an approver for verification.`
-    : isRecall
-    ? "Pulls this submission back to your Active list so you can fix a mistake before resubmitting."
     : isBulkRecall
     ? `Pulls ${action.reservations?.length ?? 0} submissions back to Active so corrections can be made.`
-    : isBulkRelease
-    ? `Returns ${action.reservations?.length ?? 0} orders to the available pool immediately.`
-    : 'Returns this order to the available pool immediately.'
+    : "Pulls this submission back to your Active list so you can fix a mistake before resubmitting."
 
   const confirmLabel = isSubmit
     ? includeCount === 0
@@ -2533,19 +2541,11 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
       : includeCount === checkCount
       ? 'Submit for Approval'
       : 'Submit Partial for Approval'
-    : isRecall
-    ? 'Recall for Edits'
     : isBulkRecall
     ? `Recall ${action.reservations.length}`
-    : isBulkRelease
-    ? `Return ${action.reservations.length}`
-    : 'Return'
+    : 'Recall for Edits'
 
-  const isSimpleList = isRelease || isRecall
-  // The submit flow needs real editing room; the other four flows are just
-  // a review-and-confirm list, so they stay in a smaller, non-scrolling-body
-  // dialog rather than stretching to fill the viewport for no reason.
-  const HeaderIcon = isSubmit ? Send : isRecall || isBulkRecall ? RotateCcw : Undo2
+  const HeaderIcon = isSubmit ? Send : RotateCcw
 
   return (
     <div
@@ -2561,7 +2561,7 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
         aria-labelledby="pickup-action-title"
        className={cn(
   'relative flex w-full flex-col overflow-hidden rounded-2xl bg-white shadow-2xl',
-  isSubmit ? 'max-h-[65vh] max-w-6xl' : 'max-h-[65vh] max-w-2xl',
+  isSubmit ? 'max-h-[65vh] max-w-6xl' : 'max-h-[75vh] max-w-3xl',
 )}
       >
         {/* ── Header ───────────────────────────────────────────────── */}
@@ -2570,11 +2570,7 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
             <div
               className={cn(
                 'flex h-11 w-11 shrink-0 items-center justify-center rounded-full',
-                isSubmit
-                  ? 'bg-orange-500/10 text-orange-600'
-                  : isRecall || isBulkRecall
-                  ? 'bg-amber-500/10 text-amber-600'
-                  : 'bg-ink-100 text-ink-600',
+                isSubmit ? 'bg-orange-500/10 text-orange-600' : 'bg-amber-500/10 text-amber-600',
               )}
             >
               <HeaderIcon className="h-5 w-5" />
@@ -2597,9 +2593,9 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
         </div>
 
         {/* ── Body ─────────────────────────────────────────────────── */}
-        <div className={cn('flex-1 overflow-y-auto px-7 py-6', isSubmit && 'bg-ink-50/40')}>
-          {(isBulkRelease || isBulkRecall) && (
-            <div className="max-h-72 overflow-y-auto rounded-xl border border-ink-100">
+        <div className={cn('flex-1 overflow-y-auto px-7 py-6', (isSubmit || isRecall || isBulkRecall) && 'bg-ink-50/40')}>
+          {isBulkRecall && (
+            <div className="max-h-56 overflow-y-auto rounded-xl border border-ink-100">
               <ul className="divide-y divide-ink-50 text-sm">
                 {action.reservations.map((r) => (
                   <li key={r.id} className="flex items-center justify-between px-4 py-2.5">
@@ -2613,22 +2609,12 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
             </div>
           )}
 
-          {(isRelease || isRecall) && (
+          {isRecall && (
             <p className="text-sm text-ink-600">
-              {isRecall ? (
-                <>
-                  This pulls <span className="font-medium text-ink-900">{reservation.collector_name}</span>
-                  's submission of {checkCount} check{checkCount === 1 ? '' : 's'} back out of the
-                  approval queue so you can fix a mistake — a wrong OR number, for example — before
-                  resubmitting. It goes back to your Active list; nothing is released to the pool.
-                </>
-              ) : (
-                <>
-                  This returns this order of {checkCount} check{checkCount === 1 ? '' : 's'} held for{' '}
-                  <span className="font-medium text-ink-900">{reservation.collector_name}</span> back into the
-                  available pool immediately. Use this if the collector cancelled or won't be coming.
-                </>
-              )}
+              This pulls <span className="font-medium text-ink-900">{reservation.collector_name}</span>
+              's submission of {checkCount} check{checkCount === 1 ? '' : 's'} back out of the approval
+              queue so you can fix a mistake — a wrong OR number, for example — before resubmitting. It
+              goes back to your Active list; nothing is released to the pool.
             </p>
           )}
 
@@ -2657,6 +2643,27 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
                     tone={allComplete ? 'positive' : 'warning'}
                   />
                   <SummaryPill label="submitting amount" value={formatCurrency(submitTotalAmount)} tone="neutral" mono />
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ── Recall flow: read-only summary strip ─────────────────── */}
+          {isRecall && checkCount > 0 && (
+            <div className="mt-4 rounded-xl border border-ink-100 bg-white p-5 shadow-sm">
+              <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex items-center gap-2.5">
+                  <UserRound className="h-4 w-4 text-ink-400" />
+                  <div>
+                    <p className="text-sm font-semibold text-ink-900">
+                      {reservation.collector_name || 'Unknown collector'}
+                    </p>
+                    <p className="text-xs text-ink-400">Every check in this submission will move back to Active.</p>
+                  </div>
+                </div>
+                <div className="flex shrink-0 flex-wrap items-center gap-2">
+                  <SummaryPill label="checks" value={checkCount} tone="neutral" />
+                  <SummaryPill label="total value" value={formatCurrency(total)} tone="neutral" mono />
                 </div>
               </div>
             </div>
@@ -2919,61 +2926,63 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
             </div>
           )}
 
-          {isSimpleList && checkCount > 0 && (
-            <div className="mt-3 max-h-72 overflow-y-auto rounded-xl border border-ink-100">
-              <table className="w-full text-xs">
-                <thead className="sticky top-0 bg-ink-50">
-                  <tr className="text-left uppercase tracking-wide text-ink-400">
-                    <th className="px-3 py-2 font-medium">Bank</th>
-                    <th className="px-3 py-2 font-medium">Check no.</th>
-                    <th className="px-3 py-2 font-medium">Payee</th>
-                    <th className="px-3 py-2 font-medium">Payor</th>
-                    <th className="px-3 py-2 font-medium">Date</th>
-                    <th className="px-3 py-2 text-right font-medium">Amount</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-ink-50">
-                  {checks.map((c, idx) => (
-                    <tr key={c.checkId ?? idx}>
-                      <td className="px-3 py-2">
-                        <BankBadge bank={c.bank} />
-                      </td>
-                      <td className="px-3 py-2 font-mono text-ink-700">{c.check_no || '—'}</td>
-                   <td className="max-w-[130px] truncate px-3 py-2 text-ink-900" title={c.payee || undefined}>
-  {c.payee || '—'}
-</td>
-<td className="max-w-[130px] truncate px-3 py-2 text-ink-600" title={c.payor || undefined}>
-  {c.payor || '—'}
-</td>
-                      <td className="px-3 py-2 text-ink-500">
-                        {c.check_date ? formatDate(c.check_date) : '—'}
-                      </td>
-                      <td className="px-3 py-2 text-right font-mono text-ink-700">
-                        {formatCurrency(c.amount)}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-                <tfoot>
-                  <tr className="border-t border-ink-100 bg-ink-50/60">
-                    <td colSpan={5} className="px-3 py-2 text-right font-medium text-ink-500">
-                      Total
-                    </td>
-                    <td className="px-3 py-2 text-right font-mono font-semibold text-ink-900">
-                      {formatCurrency(total)}
-                    </td>
-                  </tr>
-                </tfoot>
-              </table>
+          {/* ── Recall flow: read-only per-check cards ───────────────── */}
+          {isRecall && checkCount > 0 && (
+            <div className="mt-4">
+              <div className="mb-3 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-ink-500">
+                <ClipboardList className="h-3.5 w-3.5" />
+                Checks in this submission
+              </div>
+              <div className="flex flex-col gap-2">
+                {checks.map((c, idx) => (
+                  <div
+                    key={c.checkId ?? idx}
+                    className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-ink-100 bg-white px-4 py-3 shadow-sm"
+                  >
+                    <div className="flex items-center gap-3">
+                      <BankBadge bank={c.bank} />
+                      <div>
+                        <p className="text-sm font-semibold text-ink-900">{c.payee || '—'}</p>
+                        <p className="font-mono text-[11px] text-ink-400">
+                          Check {c.check_no || '—'}
+                          {c.payor ? ` · from ${c.payor}` : ''}
+                        </p>
+                      </div>
+                    </div>
+                    <span className="font-mono text-sm font-semibold text-ink-800">
+                      {formatCurrency(c.amount)}
+                    </span>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
 
-          {(isRelease || isBulkRelease) && (
-            <div className="mt-4 flex items-start gap-2 rounded-lg bg-orange-50 px-3 py-2.5 text-xs text-orange-700">
-              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-              {isBulkRelease
-                ? 'These reservations will be marked as not picked up.'
-                : "This collector's reservation will be marked as not picked up."}
+          {/* ── Recall flows: required reason ────────────────────────── */}
+          {(isRecall || isBulkRecall) && (
+            <div className="mt-4">
+              <label className="mb-1.5 block text-[11px] font-semibold uppercase tracking-wide text-ink-500">
+                Reason for recall <span className="text-orange-500">(required)</span>
+              </label>
+              <textarea
+                ref={reasonFieldRef}
+                value={reason}
+                onChange={(e) => setReason(e.target.value)}
+                placeholder="What needs to be corrected before resubmitting?"
+                maxLength={300}
+                rows={3}
+                aria-label="Reason for recall"
+                className={cn(
+                  'w-full rounded-md border bg-white px-3 py-2 text-sm text-ink-800 focus:outline-none focus:ring-2 focus:ring-teal-500/40',
+                  !hasReason ? 'border-amber-300' : 'border-ink-200',
+                )}
+              />
+              {!hasReason && (
+                <p className="mt-1.5 flex items-center gap-1.5 text-xs text-amber-700">
+                  <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                  A reason is required before this can be recalled.
+                </p>
+              )}
             </div>
           )}
 
@@ -3012,8 +3021,14 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
             </button>
             <button
               onClick={handleConfirmClick}
-              disabled={loading || (isSubmit && !allComplete)}
-              title={isSubmit && !allComplete ? 'Every check needs a complete outcome before submitting' : undefined}
+              disabled={loading || (isSubmit && !allComplete) || ((isRecall || isBulkRecall) && !hasReason)}
+              title={
+                isSubmit && !allComplete
+                  ? 'Every check needs a complete outcome before submitting'
+                  : (isRecall || isBulkRecall) && !hasReason
+                  ? 'Enter a reason before recalling'
+                  : undefined
+              }
               className={cn(
                 'flex items-center gap-2 rounded-md px-5 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60',
                 isSubmit ? 'bg-orange-500 hover:bg-orange-600' : 'bg-ink-900 hover:bg-ink-800'
@@ -3051,9 +3066,10 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
   )
 }
 
-// Small labeled stat used in the submit modal's collector summary strip —
-// matches SummaryPill in AdminChecks.jsx's SubmitApprovalModal so both
-// submit flows read identically at a glance.
+// Small labeled stat used in the submit and recall modals' collector
+// summary strips — matches SummaryPill in AdminChecks.jsx's
+// SubmitApprovalModal so all submit/recall flows read identically at a
+// glance.
 function SummaryPill({ label, value, tone = 'neutral', mono = false }) {
   const tones = {
     neutral: 'bg-ink-50 text-ink-700',

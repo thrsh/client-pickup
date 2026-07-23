@@ -65,7 +65,11 @@ const BRAND_TEAL_RGB = [13, 148, 136]
 /* was entered into this system. "Aging (Days)" is how many days the  */
 /* check has been (or was) in our hands: for still-unreleased checks  */
 /* that's created_at -> today; for released checks it's the elapsed   */
-/* time between created_at and picked_up_at.                          */
+/* time between created_at and picked_up_at. The one exception is the */
+/* Stale Unreleased report below, whose "Aging (Days)" is measured    */
+/* from the CHECK DATE instead — that report exists specifically to   */
+/* flag checks going stale relative to when they were written, not    */
+/* when they happened to be entered into this system.                */
 /*                                                                    */
 /* `buildRow` is the single source of truth for row content — it's    */
 /* used to build the .xlsx workbook, the PDF, AND to render the       */
@@ -85,6 +89,11 @@ const BORDER_COLOR = 'FFD1D5DB'
 
 const ALL_PAYEES_LABEL = 'All Payees'
 const ALL_BANKS_LABEL = 'All Banks'
+
+// Default aging threshold for the Stale Unreleased Checks report — a
+// check is flagged "stale" once its check date is this many months in
+// the past. Admins can adjust it per-run in the form.
+const STALE_DEFAULT_MONTHS = 6
 
 // "Client Name" = the payor. Kept as a single function so every report
 // (and the preview table) reads it from one place.
@@ -153,6 +162,20 @@ function formatExcelDateLabel(date) {
 // timezone).
 function todayDateInputValue() {
   const now = new Date()
+  const yyyy = now.getFullYear()
+  const mm = String(now.getMonth() + 1).padStart(2, '0')
+  const dd = String(now.getDate()).padStart(2, '0')
+  return `${yyyy}-${mm}-${dd}`
+}
+
+// "YYYY-MM-DD" string for the date exactly `months` calendar months
+// before today. Used as the check_date cutoff for the Stale Unreleased
+// report — a check qualifies as stale when its check_date falls on or
+// before this cutoff. Built from local Y/M/D parts for the same reason
+// as todayDateInputValue above (avoid UTC-boundary drift).
+function monthsAgoDateInputValue(months) {
+  const now = new Date()
+  now.setMonth(now.getMonth() - months)
   const yyyy = now.getFullYear()
   const mm = String(now.getMonth() + 1).padStart(2, '0')
   const dd = String(now.getDate()).padStart(2, '0')
@@ -387,6 +410,50 @@ const REPORT_CONFIG = {
     ],
   },
 
+  // Purpose-built for the "which banks do we need to transmit stale
+  // checks back to" workflow: still-unreleased (status = 'available')
+  // checks, optionally narrowed to only those whose CHECK DATE (not
+  // upload date) is 6+ months old — see the `staleOnly` /
+  // `staleThresholdMonths` form controls and monthsAgoDateInputValue().
+  // "Transmittal To" has no backing column (no such field exists on
+  // `checks`), so it's always rendered blank/manual-fill, same pattern
+  // as the OR/AR report's Releasing Unit columns.
+  stale_unreleased: {
+    fileTag: 'stale-unreleased-check-report',
+    title: 'STALE UNRELEASED CHECK REPORT',
+    statusFilter: 'available',
+    showReleasedDate: false,
+    amountColIndex: 6,
+    legendText:
+      '"Transmittal To" is not tracked by this system and is always blank — fill it in manually. Aging is measured from the check date, not the upload date.',
+    columns: [
+      { header: 'No', width: 6 },
+      { header: 'Bank', width: 20 },
+      { header: 'Payee Name', width: 26 },
+      { header: 'Check No.', width: 16 },
+      { header: 'Check Date', width: 14 },
+      { header: 'Check Amount', width: 16 },
+      { header: 'Client Name', width: 26 },
+      { header: 'Date Uploaded', width: 14 },
+      { header: 'Aging (Days)', width: 12 },
+      { header: 'Transmittal To', width: 20 },
+    ],
+    buildRow: (r, no) => [
+      { value: no, align: 'center' },
+      { value: r.bank || '', align: 'center' },
+      { value: r.payee || '' },
+      { value: r.check_no || '', align: 'center' },
+      { value: r.check_date ? new Date(r.check_date) : null, numFmt: 'mm/dd/yyyy', align: 'center' },
+      { value: Number(r.amount || 0), numFmt: '#,##0.00', align: 'right' },
+      { value: getClientName(r) },
+      { value: r.created_at ? new Date(r.created_at) : null, numFmt: 'mm/dd/yyyy', align: 'center' },
+      // Aging here is intentionally from check_date, not created_at — see
+      // the NOTE ON ASSUMPTIONS block above.
+      { value: daysBetween(r.check_date, null) ?? '', align: 'center' },
+      { value: '', align: 'center', fill: MANUAL_FILL_COLOR },
+    ],
+  },
+
   or_ar: {
     fileTag: 'or-ar-report',
     title: 'OR / AR REPORT',
@@ -436,6 +503,7 @@ const REPORT_CONFIG = {
 const REPORT_TYPE_LABELS = {
   released: 'Released check report',
   unreleased: 'Unreleased check report',
+  stale_unreleased: 'Stale unreleased checks report',
   or_ar: 'OR / AR report',
 }
 
@@ -748,6 +816,11 @@ export default function AdminReports() {
   // time reportType changes away from 'released' (see the Select's
   // onChange below) so it can never silently apply to another report.
   const [includeAuditTrail, setIncludeAuditTrail] = useState(false)
+  // Only meaningful when reportType === 'stale_unreleased'. `staleOnly`
+  // toggles the check_date aging filter on/off; `staleThresholdMonths`
+  // is how many months old a check date has to be to count as stale.
+  const [staleOnly, setStaleOnly] = useState(true)
+  const [staleThresholdMonths, setStaleThresholdMonths] = useState(STALE_DEFAULT_MONTHS)
   const [reportPayees, setReportPayees] = useState([])
   const [reportPayeeAll, setReportPayeeAll] = useState(false)
   // Bank filter — defaults to "All Banks" so it's an opt-in narrowing
@@ -824,8 +897,11 @@ export default function AdminReports() {
   // reservation/batch fields) are always selected — they're harmless
   // no-ops for report types whose buildRow doesn't reference them, and it
   // means toggling "Include full audit trail" before clicking Preview
-  // needs no separate fetch path.
-  async function fetchAllChecks({ payees, payeeAll, payor, banks, bankAll, statusFilter, dateFrom, dateTo }) {
+  // needs no separate fetch path. `staleBeforeDate`, when provided, is
+  // pushed down into the query as a check_date upper bound (rows whose
+  // check_date is on or before that cutoff) so aging filtering happens in
+  // the database rather than after fetching every unreleased check.
+  async function fetchAllChecks({ payees, payeeAll, payor, banks, bankAll, statusFilter, dateFrom, dateTo, staleBeforeDate }) {
     const PAGE = 1000
     let from = 0
     let all = []
@@ -840,11 +916,12 @@ export default function AdminReports() {
         .range(from, from + PAGE - 1)
 
       if (!payeeAll && payees.length > 0) req = req.in('payee', payees)
-      if (payor.trim()) req = req.ilike('payor', `%${payor.trim()}%`)
+      if (payor && payor.trim()) req = req.ilike('payor', `%${payor.trim()}%`)
       if (!bankAll && banks.length > 0) req = req.in('bank', banks)
       if (statusFilter) req = req.eq('status', statusFilter)
       if (dateFrom) req = req.gte('check_date', dateFrom)
       if (dateTo) req = req.lte('check_date', dateTo)
+      if (staleBeforeDate) req = req.lte('check_date', staleBeforeDate)
 
       const { data, error } = await req
       if (error) throw error
@@ -954,7 +1031,12 @@ export default function AdminReports() {
   }
 
   function validateForm() {
-    if (!reportPayor.trim()) {
+    const configKey = effectiveReportKey(reportType, includeAuditTrail)
+    // Payor narrows a report to one client. The Stale Unreleased report
+    // is a bank-wide operational view (which banks need transmittal
+    // action next), so it's the one report where payor is optional
+    // rather than required.
+    if (configKey !== 'stale_unreleased' && !reportPayor.trim()) {
       return 'Please enter a payor.'
     }
     if (!reportPayeeAll && reportPayees.length === 0) {
@@ -963,7 +1045,7 @@ export default function AdminReports() {
     if (!reportBankAll && reportBanks.length === 0) {
       return `Please select at least one bank, or choose "${ALL_BANKS_LABEL}".`
     }
-    if (REPORT_CONFIG[effectiveReportKey(reportType, includeAuditTrail)].showReleasedDate) {
+    if (REPORT_CONFIG[configKey].showReleasedDate) {
       if (!releasedDate) {
         return 'Please select a released date.'
       }
@@ -975,6 +1057,9 @@ export default function AdminReports() {
     }
     if (reportDateFrom && reportDateTo && reportDateFrom > reportDateTo) {
       return 'The "from" date must be before the "to" date.'
+    }
+    if (configKey === 'stale_unreleased' && staleOnly && (!staleThresholdMonths || staleThresholdMonths < 1)) {
+      return 'Aging threshold must be at least 1 month.'
     }
     return ''
   }
@@ -991,6 +1076,8 @@ export default function AdminReports() {
     try {
       const configKey = effectiveReportKey(reportType, includeAuditTrail)
       const config = REPORT_CONFIG[configKey]
+      const staleBeforeDate =
+        configKey === 'stale_unreleased' && staleOnly ? monthsAgoDateInputValue(staleThresholdMonths) : null
       const rows = await fetchAllChecks({
         payees: reportPayees,
         payeeAll: reportPayeeAll,
@@ -1000,6 +1087,7 @@ export default function AdminReports() {
         statusFilter: config.statusFilter,
         dateFrom: reportDateFrom,
         dateTo: reportDateTo,
+        staleBeforeDate,
       })
 
       if (rows.length === 0) {
@@ -1020,6 +1108,9 @@ export default function AdminReports() {
         releasedDate,
         dateFrom: reportDateFrom,
         dateTo: reportDateTo,
+        staleOnly: configKey === 'stale_unreleased' ? staleOnly : false,
+        staleThresholdMonths,
+        staleBeforeDate,
       })
       setSearchTerm('')
       setPage(1)
@@ -1047,6 +1138,7 @@ export default function AdminReports() {
         statusFilter: config.statusFilter,
         dateFrom: previewMeta.dateFrom,
         dateTo: previewMeta.dateTo,
+        staleBeforeDate: previewMeta.staleBeforeDate,
       })
       setRawRows(rows)
       setPage(1)
@@ -1098,7 +1190,12 @@ export default function AdminReports() {
     return lines
   }
 
-  async function buildWorkbook(configKey, rows, { payeeDisplay, bankDisplay, payor, releasedDateValue, dateFrom, dateTo }) {
+  // Builds the Excel workbook. `bankBreakdown` (array of { bank, count,
+  // totalAmount }) is only used for the Stale Unreleased report, where it
+  // renders as an extra summary block between the header and the column
+  // headers — a quick "how many checks / how much money per bank" view
+  // an admin can use to decide what to transmit where.
+  async function buildWorkbook(configKey, rows, { payeeDisplay, bankDisplay, payor, releasedDateValue, dateFrom, dateTo }, bankBreakdown = []) {
     const config = REPORT_CONFIG[configKey]
     const colCount = config.columns.length
 
@@ -1127,6 +1224,25 @@ export default function AdminReports() {
     for (const line of buildHeaderLines(configKey, { payeeDisplay, bankDisplay, payor, releasedDateValue, dateFrom, dateTo })) {
       addHeaderRow(sheet, r, colCount, line.text, { bold: line.bold, size: line.size })
       r++
+    }
+
+    // Bank breakdown block (Stale Unreleased report only) — one line per
+    // bank present in the result set, so a printed/exported copy still
+    // carries the transmittal summary even without the in-app view.
+    if (configKey === 'stale_unreleased' && bankBreakdown.length > 0) {
+      r++
+      addHeaderRow(sheet, r, colCount, 'BANK BREAKDOWN (FOR TRANSMITTAL)', { bold: true, size: 10, color: HEADER_FILL_COLOR })
+      r++
+      for (const b of bankBreakdown) {
+        addHeaderRow(
+          sheet,
+          r,
+          colCount,
+          `${b.bank}: ${b.count} check${b.count === 1 ? '' : 's'} — ${formatCurrency(b.totalAmount)}`,
+          { size: 9 }
+        )
+        r++
+      }
     }
 
     // Blank spacer row
@@ -1192,8 +1308,9 @@ export default function AdminReports() {
   // Builds a professional, landscape PDF report using the exact same
   // header lines and row data as the Excel workbook (via buildHeaderLines
   // and config.buildRow), so all three surfaces — preview table, Excel,
-  // PDF — always show identical numbers.
-  function buildPdfDocument(configKey, rows, { payeeDisplay, bankDisplay, payor, releasedDateValue, dateFrom, dateTo }) {
+  // PDF — always show identical numbers. `bankBreakdown` mirrors the
+  // Excel summary block described above, for the Stale Unreleased report.
+  function buildPdfDocument(configKey, rows, { payeeDisplay, bankDisplay, payor, releasedDateValue, dateFrom, dateTo }, bankBreakdown = []) {
     const config = REPORT_CONFIG[configKey]
     const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' })
     const margin = 32
@@ -1216,6 +1333,23 @@ export default function AdminReports() {
       doc.text(line.text, margin, y)
       if (line.bold) doc.setFont('helvetica', 'normal')
       y += 14
+    }
+
+    if (configKey === 'stale_unreleased' && bankBreakdown.length > 0) {
+      y += 6
+      doc.setFont('helvetica', 'bold')
+      doc.setFontSize(9)
+      doc.setTextColor(...BRAND_TEAL_RGB)
+      doc.text('BANK BREAKDOWN (FOR TRANSMITTAL)', margin, y)
+      y += 13
+      doc.setFont('helvetica', 'normal')
+      doc.setFontSize(9)
+      doc.setTextColor(60, 60, 60)
+      for (const b of bankBreakdown) {
+        doc.text(`${b.bank}: ${b.count} check${b.count === 1 ? '' : 's'} — ${formatCurrency(b.totalAmount)}`, margin, y)
+        y += 12
+      }
+      y += 2
     }
 
     const head = [config.columns.map((c) => c.header)]
@@ -1280,7 +1414,7 @@ export default function AdminReports() {
 
   function reportFilename(config) {
     const stamp = new Date().toISOString().slice(0, 10)
-    const safePayor = previewMeta.payor.replace(/[^a-z0-9]+/gi, '_')
+    const safePayor = (previewMeta.payor || 'all-clients').replace(/[^a-z0-9]+/gi, '_')
     const payeeTag = multiSelectFileTag(previewMeta.payeeAll, previewMeta.payees, 'all-payees')
     const bankTag = multiSelectFileTag(previewMeta.bankAll, previewMeta.banks, 'all-banks')
     return `${config.fileTag}-${safePayor}-${payeeTag}-${bankTag}-${stamp}`
@@ -1291,7 +1425,12 @@ export default function AdminReports() {
     setDownloading(true)
     try {
       const config = REPORT_CONFIG[previewMeta.configKey]
-      const workbook = await buildWorkbook(previewMeta.configKey, rawRows, reportMetaArgs())
+      const workbook = await buildWorkbook(
+        previewMeta.configKey,
+        rawRows,
+        reportMetaArgs(),
+        previewMeta.configKey === 'stale_unreleased' ? bankBreakdown : []
+      )
 
       const buffer = await workbook.xlsx.writeBuffer()
       const blob = new Blob([buffer], {
@@ -1321,7 +1460,12 @@ export default function AdminReports() {
     if (!previewMeta || rawRows.length === 0) return
     setPdfState((s) => ({ ...s, generating: true }))
     try {
-      const doc = buildPdfDocument(previewMeta.configKey, rawRows, reportMetaArgs())
+      const doc = buildPdfDocument(
+        previewMeta.configKey,
+        rawRows,
+        reportMetaArgs(),
+        previewMeta.configKey === 'stale_unreleased' ? bankBreakdown : []
+      )
       const blobUrl = doc.output('bloburl')
       setPdfState((s) => {
         if (s.url) URL.revokeObjectURL(s.url)
@@ -1345,7 +1489,12 @@ export default function AdminReports() {
     setDownloadingPdf(true)
     try {
       const config = REPORT_CONFIG[previewMeta.configKey]
-      const doc = buildPdfDocument(previewMeta.configKey, rawRows, reportMetaArgs())
+      const doc = buildPdfDocument(
+        previewMeta.configKey,
+        rawRows,
+        reportMetaArgs(),
+        previewMeta.configKey === 'stale_unreleased' ? bankBreakdown : []
+      )
       doc.save(`${reportFilename(config)}.pdf`)
     } catch (err) {
       push?.({ variant: 'error', title: 'PDF download failed', description: err?.message || 'Please try again.' })
@@ -1377,6 +1526,22 @@ export default function AdminReports() {
   // a quick sanity check in the summary strip (e.g. confirming a
   // multi-bank upload didn't accidentally include the wrong bank).
   const banksInResults = useMemo(() => [...new Set(rawRows.map((r) => r.bank).filter(Boolean))].sort(), [rawRows])
+
+  // Per-bank subtotal (count + total amount) of the current result set,
+  // sorted by total amount descending. Surfaced on the Stale Unreleased
+  // report so an admin can see, at a glance, how many checks — and how
+  // much money — need to be transmitted back to each issuing bank.
+  const bankBreakdown = useMemo(() => {
+    const map = new Map()
+    for (const row of rawRows) {
+      const bank = row.bank || 'Unspecified'
+      const entry = map.get(bank) || { bank, count: 0, totalAmount: 0 }
+      entry.count += 1
+      entry.totalAmount += Number(row.amount || 0)
+      map.set(bank, entry)
+    }
+    return [...map.values()].sort((a, b) => b.totalAmount - a.totalAmount)
+  }, [rawRows])
 
   const totalPages = Math.max(1, Math.ceil(filteredRows.length / pageSize))
   const currentPage = Math.min(page, totalPages)
@@ -1420,10 +1585,10 @@ export default function AdminReports() {
                   value={reportType}
                   onChange={(e) => {
                     setReportType(e.target.value)
-                    // The toggle only ever applies to the Released report —
-                    // reset it whenever the report type changes away from
-                    // 'released' so it can't silently carry over and apply
-                    // to a different report type later.
+                    // The audit-trail toggle only ever applies to the
+                    // Released report — reset it whenever the report type
+                    // changes away from 'released' so it can't silently
+                    // carry over and apply to a different report type.
                     if (e.target.value !== 'released') setIncludeAuditTrail(false)
                   }}
                 >
@@ -1465,6 +1630,50 @@ export default function AdminReports() {
                   </span>
                 </span>
               </label>
+            )}
+
+            {/* Aging filter — only ever shown for the Stale Unreleased
+                report. Defaults to on (6 months) since that's this
+                report's whole purpose; unchecking it just shows every
+                currently unreleased check for the selected bank(s),
+                same underlying data as the plain Unreleased report but
+                with the Transmittal To column and bank breakdown. */}
+            {reportType === 'stale_unreleased' && (
+              <div className="space-y-2 rounded-md border border-gray-200 bg-gray-50/60 px-3 py-2.5">
+                <label className="flex cursor-pointer items-start gap-2 text-sm text-gray-700">
+                  <input
+                    type="checkbox"
+                    checked={staleOnly}
+                    onChange={(e) => setStaleOnly(e.target.checked)}
+                    className="mt-0.5 h-4 w-4 accent-teal-600"
+                  />
+                  <span>
+                    <span className="font-medium">Only show checks aged {staleThresholdMonths}+ months (from check date)</span>
+                    <span className="block text-xs text-gray-500">
+                      Uncheck to see every currently unreleased check for the selected bank(s), regardless of age.
+                    </span>
+                  </span>
+                </label>
+                {staleOnly && (
+                  <div className="flex items-center gap-2 pl-6">
+                    <label className="text-xs font-medium text-gray-500" htmlFor="stale-threshold-months">
+                      Threshold (months)
+                    </label>
+                    <Input
+                      id="stale-threshold-months"
+                      type="number"
+                      min={1}
+                      max={60}
+                      value={staleThresholdMonths}
+                      onChange={(e) => {
+                        const next = Number(e.target.value)
+                        setStaleThresholdMonths(Number.isFinite(next) ? Math.max(1, Math.min(60, next)) : STALE_DEFAULT_MONTHS)
+                      }}
+                      className="h-8 w-20"
+                    />
+                  </div>
+                )}
+              </div>
             )}
 
             <div className="grid gap-4 sm:grid-cols-2">
@@ -1512,12 +1721,12 @@ export default function AdminReports() {
               />
 
               <NameCombobox
-                label="Payor"
+                label={reportType === 'stale_unreleased' ? 'Payor (optional)' : 'Payor'}
                 value={reportPayor}
                 onChange={setReportPayor}
                 onSelectOption={setReportPayor}
                 options={payorOptions}
-                placeholder="Enter payor"
+                placeholder={reportType === 'stale_unreleased' ? 'Leave blank to include all clients' : 'Enter payor'}
               />
             </div>
 
@@ -1554,9 +1763,15 @@ export default function AdminReports() {
                       Full audit trail
                     </span>
                   )}
+                  {previewMeta.staleOnly && (
+                    <span className="rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-700">
+                      Aged {previewMeta.staleThresholdMonths}+ months
+                    </span>
+                  )}
                 </CardTitle>
                 <CardDescription>
-                  Client Name (Payor): <span className="font-medium text-gray-700">{previewMeta.payor}</span>
+                  Client Name (Payor):{' '}
+                  <span className="font-medium text-gray-700">{previewMeta.payor || 'All clients'}</span>
                   {' · '}Bank(s):{' '}
                   <span className="font-medium text-gray-700">
                     {formatMultiSelectDisplay(previewMeta.bankAll, previewMeta.banks, ALL_BANKS_LABEL)}
@@ -1597,6 +1812,31 @@ export default function AdminReports() {
                 value={searchTerm ? `${filteredRows.length.toLocaleString()} of ${rawRows.length.toLocaleString()}` : 'All shown'}
               />
             </div>
+
+            {/* Bank breakdown — Stale Unreleased report only. Gives admins
+                a per-bank count/total so they know exactly what needs to
+                be transmitted to which bank. */}
+            {previewMeta.configKey === 'stale_unreleased' && bankBreakdown.length > 0 && (
+              <div className="rounded-lg border border-amber-100 bg-amber-50/40 p-3">
+                <div className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-amber-800">
+                  <AlertTriangle className="h-3.5 w-3.5" />
+                  Breakdown by bank — use this to route transmittals
+                </div>
+                <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                  {bankBreakdown.map((b) => (
+                    <div
+                      key={b.bank}
+                      className="flex items-center justify-between rounded-md border border-amber-100 bg-white px-3 py-2 text-sm"
+                    >
+                      <span className="font-medium text-gray-700">{b.bank}</span>
+                      <span className="text-gray-500">
+                        {b.count} check{b.count === 1 ? '' : 's'} · {formatCurrency(b.totalAmount)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* Toolbar */}
             <div className="flex flex-wrap items-center gap-2">

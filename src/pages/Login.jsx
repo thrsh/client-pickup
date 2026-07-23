@@ -1,3 +1,10 @@
+// src/pages/Login.jsx
+//
+// Single shared login page for every role, mounted once at /login (see
+// App.jsx). Same form for admin, verifier, and approver accounts — after
+// auth, where they're SENT is decided entirely by their actual
+// profiles.role, read from the database, never by anything in the URL or
+// form. RequireRole still gates every protected route on the real role.
 import React, { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
@@ -19,42 +26,88 @@ import { cn } from '../lib/utils'
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const OTP_LENGTH = 6
-const RESEND_COOLDOWN_SECONDS = 60
-const OTP_STORAGE_KEY_PREFIX = 'csba_otp_last_sent:'
+const BASE_RESEND_COOLDOWN_SECONDS = 60
+const MAX_RESEND_COOLDOWN_SECONDS = 300
+const MAX_RESENDS_BEFORE_SOFT_LOCK = 6
+const RESEND_STATE_RESET_MS = 30 * 60 * 1000 // resend-count backoff resets after 30 min of inactivity
 
-// The cooldown is derived from a stored timestamp rather than a simple
-// decrementing counter. This means:
-// - A page refresh or component remount mid-cooldown still shows the
-//   correct remaining time instead of resetting to 0.
-// - A backgrounded tab (where setInterval gets throttled) still reports
-//   the correct remaining time once it fires, since it's computed from
-//   real elapsed time, not from how many ticks fired.
-function getOtpCooldownRemaining(email) {
-  if (typeof window === 'undefined' || !email) return 0
+const OTP_STATE_STORAGE_KEY_PREFIX = 'csba_verifier_otp_state:'
+
+// ---------------------------------------------------------------------------
+// Resend state: { lastSentAt: number, count: number }
+// Stored per-email so the exponential backoff and soft-lock survive page
+// refreshes, remounts, and throttled background tabs (computed from real
+// elapsed time, never from a ticking counter).
+// ---------------------------------------------------------------------------
+function normalizeEmail(email) {
+  return (email || '').trim().toLowerCase()
+}
+
+function getOtpResendState(email) {
+  if (typeof window === 'undefined' || !email) return { lastSentAt: 0, count: 0 }
   try {
-    const raw = window.localStorage.getItem(OTP_STORAGE_KEY_PREFIX + email.trim().toLowerCase())
-    if (!raw) return 0
-    const sentAt = parseInt(raw, 10)
-    if (Number.isNaN(sentAt)) return 0
-    const elapsedSeconds = Math.floor((Date.now() - sentAt) / 1000)
-    return Math.max(0, RESEND_COOLDOWN_SECONDS - elapsedSeconds)
+    const raw = window.localStorage.getItem(OTP_STATE_STORAGE_KEY_PREFIX + normalizeEmail(email))
+    if (!raw) return { lastSentAt: 0, count: 0 }
+    const parsed = JSON.parse(raw)
+    if (typeof parsed.lastSentAt !== 'number') return { lastSentAt: 0, count: 0 }
+    // Backoff resets after a long enough gap — an old lockout shouldn't
+    // haunt someone who legitimately comes back the next day.
+    if (Date.now() - parsed.lastSentAt > RESEND_STATE_RESET_MS) {
+      return { lastSentAt: 0, count: 0 }
+    }
+    return { lastSentAt: parsed.lastSentAt, count: parsed.count || 0 }
   } catch {
-    // localStorage unavailable (private browsing, storage disabled, etc.)
-    // — cooldown falls back to in-memory state only, still enforced within the session.
-    return 0
+    return { lastSentAt: 0, count: 0 }
   }
 }
 
 function markOtpSent(email) {
   if (typeof window === 'undefined' || !email) return
+  const prev = getOtpResendState(email)
+  const next = { lastSentAt: Date.now(), count: prev.count + 1 }
   try {
     window.localStorage.setItem(
-      OTP_STORAGE_KEY_PREFIX + email.trim().toLowerCase(),
-      String(Date.now())
+      OTP_STATE_STORAGE_KEY_PREFIX + normalizeEmail(email),
+      JSON.stringify(next)
     )
   } catch {
     // Ignore — falls back to in-memory cooldown for this session.
   }
+  return next
+}
+
+function clearOtpResendState(email) {
+  if (typeof window === 'undefined' || !email) return
+  try {
+    window.localStorage.removeItem(OTP_STATE_STORAGE_KEY_PREFIX + normalizeEmail(email))
+  } catch {
+    // ignore
+  }
+}
+
+// Doubles the wait after every resend (60s, 120s, 240s, ...) capped at 5 min,
+// instead of a flat 60s. Slows down anyone trying to hammer the OTP endpoint
+// while still being tolerable for a genuine user who fat-fingered an inbox check.
+function cooldownForCount(count) {
+  if (count <= 0) return 0
+  const seconds = BASE_RESEND_COOLDOWN_SECONDS * Math.pow(2, count - 1)
+  return Math.min(seconds, MAX_RESEND_COOLDOWN_SECONDS)
+}
+
+function getOtpCooldownRemaining(email) {
+  const { lastSentAt, count } = getOtpResendState(email)
+  if (!lastSentAt) return 0
+  const elapsedSeconds = Math.floor((Date.now() - lastSentAt) / 1000)
+  return Math.max(0, cooldownForCount(count) - elapsedSeconds)
+}
+
+// Single shared login for every role — same form for admin, verifier, and
+// approver accounts. Which role signs in determines where they land after
+// auth (see the redirect logic below); it does not affect what's shown here.
+const PORTAL_LABEL = {
+  title: 'Portal Login',
+  description: 'Sign in to your account.',
+  placeholder: 'you@csba.ph',
 }
 
 function validateEmail(value) {
@@ -68,7 +121,7 @@ function validatePassword(value) {
   return ''
 }
 
-// Translate raw Supabase auth errors into copy a non-technical admin can act on,
+// Translate raw Supabase auth errors into copy a non-technical verifier can act on,
 // without confirming whether a given email exists in the system.
 function friendlyAuthError(message) {
   if (!message) return 'Something went wrong. Please try again.'
@@ -91,7 +144,44 @@ function friendlyAuthError(message) {
   return message
 }
 
-export default function AdminLogin() {
+// ---------------------------------------------------------------------------
+// Optional server-side lockout hooks.
+//
+// These call Postgres RPCs (`check_login_lockout` / `record_login_attempt`)
+// if you've deployed them (see lockout_functions.sql). If the functions
+// don't exist yet, both fail open silently — the login flow behaves exactly
+// as it does today. This is what makes the lockout "seamless": nothing
+// breaks before you add the SQL, and you get real brute-force protection
+// the moment you do.
+// ---------------------------------------------------------------------------
+async function checkServerLockout(email, stage) {
+  try {
+    const { data, error } = await supabase.rpc('check_login_lockout', {
+      p_email: normalizeEmail(email),
+      p_stage: stage,
+    })
+    if (error || !data) return { locked: false }
+    return data
+  } catch {
+    return { locked: false }
+  }
+}
+
+async function recordServerAttempt(email, stage, success) {
+  try {
+    await supabase.rpc('record_login_attempt', {
+      p_email: normalizeEmail(email),
+      p_stage: stage,
+      p_success: success,
+    })
+  } catch {
+    // Non-critical — ignore if the function isn't deployed.
+  }
+}
+
+export default function Login() {
+  const portal = PORTAL_LABEL
+
   // 'signin' | 'otp' | 'forgot-form' | 'forgot-sent'
   const [mode, setMode] = useState('signin')
   const [email, setEmail] = useState('')
@@ -103,11 +193,13 @@ export default function AdminLogin() {
   const [loading, setLoading] = useState(false)
   const [failedAttempts, setFailedAttempts] = useState(0)
   const [logoError, setLogoError] = useState(false)
+  const [checkingExistingSession, setCheckingExistingSession] = useState(true)
 
   // OTP-specific state
   const [otp, setOtp] = useState('')
   const [otpError, setOtpError] = useState('')
   const [resendCooldown, setResendCooldown] = useState(0)
+  const [resendsExhausted, setResendsExhausted] = useState(false)
   const [otpFailedAttempts, setOtpFailedAttempts] = useState(0)
   const otpInputRef = useRef(null)
 
@@ -116,11 +208,47 @@ export default function AdminLogin() {
   // `loading` state alone isn't enough for this because setState is async —
   // this ref updates synchronously, so the very next call sees it immediately.
   const otpSendingRef = useRef(false)
+  const otpAutoSubmitRef = useRef(false)
 
   const navigate = useNavigate()
 
   const isSecureConnection =
     typeof window !== 'undefined' && window.location.protocol === 'https:'
+
+  // If someone already has a live session and lands on this page (e.g. a
+  // stale bookmark, or clicking back after signing in), send them straight
+  // to their area instead of re-prompting for credentials.
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      const { data } = await supabase.auth.getSession()
+      if (cancelled) return
+      if (!data?.session) {
+        setCheckingExistingSession(false)
+        return
+      }
+      const { data: userData } = await supabase.auth.getUser()
+      if (cancelled) return
+      const uid = userData?.user?.id
+      if (!uid) {
+        setCheckingExistingSession(false)
+        return
+      }
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('role')
+        .eq('id', uid)
+        .maybeSingle()
+      if (cancelled) return
+      if (profile?.role === 'approver') navigate('/approver', { replace: true })
+      else if (profile?.role === 'admin') navigate('/admin', { replace: true })
+      else navigate('/verifier', { replace: true })
+    })()
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // Countdown for resend button — recomputed each tick from the stored
   // timestamp rather than decremented, so it stays correct across refreshes,
@@ -153,6 +281,7 @@ export default function AdminLogin() {
     setOtpError('')
     setOtp('')
     setPassword('')
+    setResendsExhausted(false)
     setFieldErrors({ email: '', password: '' })
   }
 
@@ -161,7 +290,8 @@ export default function AdminLogin() {
       email: targetEmail,
       options: {
         // Never let the OTP endpoint silently create a new account.
-        // Only existing admin users should ever reach this screen.
+        // Only existing users (admin, verifier, or approver) should ever
+        // reach this screen.
         shouldCreateUser: false,
       },
     })
@@ -179,11 +309,25 @@ export default function AdminLogin() {
     setFieldErrors({ email: emailErr, password: passwordErr })
     if (emailErr || passwordErr) return
 
+    const trimmedEmail = normalizeEmail(email)
     setError('')
     setLoading(true)
 
+    // Fails open if no server-side lockout function has been deployed —
+    // see checkServerLockout above.
+    const lockout = await checkServerLockout(trimmedEmail, 'password')
+    if (lockout?.locked) {
+      setLoading(false)
+      setError(
+        lockout.retryAfterMinutes
+          ? `Too many failed attempts. Try again in ${lockout.retryAfterMinutes} minute(s).`
+          : 'Too many failed attempts. Please try again later.'
+      )
+      return
+    }
+
     const { error: signInError } = await supabase.auth.signInWithPassword({
-      email: email.trim(),
+      email: trimmedEmail,
       password,
     })
 
@@ -191,18 +335,22 @@ export default function AdminLogin() {
       setLoading(false)
       setError(friendlyAuthError(signInError.message))
       setFailedAttempts((n) => n + 1)
+      recordServerAttempt(trimmedEmail, 'password', false)
       return
     }
 
+    recordServerAttempt(trimmedEmail, 'password', true)
+
     // Password confirmed correct — but don't trust this session until OTP passes.
     await supabase.auth.signOut()
+    setPassword('')
 
     if (otpSendingRef.current) {
       setLoading(false)
       return
     }
     otpSendingRef.current = true
-    const otpSendError = await sendOtp(email.trim())
+    const otpSendError = await sendOtp(trimmedEmail)
     otpSendingRef.current = false
     setLoading(false)
 
@@ -214,63 +362,109 @@ export default function AdminLogin() {
     setOtp('')
     setOtpError('')
     setOtpFailedAttempts(0)
-    markOtpSent(email.trim())
-    setResendCooldown(RESEND_COOLDOWN_SECONDS)
+    setResendsExhausted(false)
+    const state = markOtpSent(trimmedEmail)
+    setResendCooldown(cooldownForCount(state?.count || 1))
     setMode('otp')
   }
 
   // Step 2: verify the 6-digit code. This is what actually establishes the session.
-async function handleOtpSubmit(e) {
-  e.preventDefault()
+  async function submitOtp(code) {
+    if (!/^\d{6}$/.test(code)) {
+      setOtpError('Enter the 6-digit code.')
+      return
+    }
 
-  if (!/^\d{6}$/.test(otp)) {
-    setOtpError('Enter the 6-digit code.')
-    return
-  }
+    const trimmedEmail = normalizeEmail(email)
+    setOtpError('')
+    setLoading(true)
 
-  setOtpError('')
-  setLoading(true)
+    const lockout = await checkServerLockout(trimmedEmail, 'otp')
+    if (lockout?.locked) {
+      setLoading(false)
+      setOtp('')
+      setOtpError(
+        lockout.retryAfterMinutes
+          ? `Too many failed codes. Try again in ${lockout.retryAfterMinutes} minute(s).`
+          : 'Too many failed codes. Please try again later.'
+      )
+      return
+    }
 
-  const { error: verifyError } = await supabase.auth.verifyOtp({
-    email: email.trim(),
-    token: otp,
-    type: 'email',
-  })
+    const { error: verifyError } = await supabase.auth.verifyOtp({
+      email: trimmedEmail,
+      token: code,
+      type: 'email',
+    })
 
-  if (verifyError) {
+    if (verifyError) {
+      setLoading(false)
+      setOtpFailedAttempts((n) => n + 1)
+      setOtp('')
+      setOtpError(friendlyAuthError(verifyError.message))
+      recordServerAttempt(trimmedEmail, 'otp', false)
+      return
+    }
+
+    recordServerAttempt(trimmedEmail, 'otp', true)
+    clearOtpResendState(trimmedEmail)
+
+    const { data: { user } } = await supabase.auth.getUser()
+    const { data: profile, error: profileError } = await supabase
+      .from('profiles')
+      .select('role')
+      .eq('id', user.id)
+      .single()
+
     setLoading(false)
-    setOtpFailedAttempts((n) => n + 1)
-    setOtp('')
-    setOtpError(friendlyAuthError(verifyError.message))
-    return
+
+    if (profileError) {
+      // No profile row yet — fall back to verifier rather than blocking login.
+      navigate('/verifier')
+      return
+    }
+
+    if (profile.role === 'approver') navigate('/approver')
+    else if (profile.role === 'admin') navigate('/admin')
+    else navigate('/verifier')
   }
 
-  const { data: { user } } = await supabase.auth.getUser()
-  const { data: profile, error: profileError } = await supabase
-    .from('profiles')
-    .select('role')
-    .eq('id', user.id)
-    .single()
-
-  setLoading(false)
-
-  if (profileError) {
-    // No profile row yet — fall back to admin rather than blocking login.
-    navigate('/admin')
-    return
+  function handleOtpSubmit(e) {
+    e.preventDefault()
+    submitOtp(otp)
   }
 
-  navigate(profile.role === 'approver' ? '/approver' : '/admin')
-}
+  // Handles both typing and pasting a 6-digit code. When the field reaches
+  // full length, auto-submits instead of making the user hit Enter —
+  // otpAutoSubmitRef prevents a double-fire if onChange runs twice in the
+  // same tick (React 18 batching + a paste event can do this).
+  function handleOtpChange(e) {
+    const digitsOnly = e.target.value.replace(/\D/g, '').slice(0, OTP_LENGTH)
+    setOtp(digitsOnly)
+    setOtpError('')
+    if (digitsOnly.length === OTP_LENGTH && !otpAutoSubmitRef.current) {
+      otpAutoSubmitRef.current = true
+      submitOtp(digitsOnly).finally(() => {
+        otpAutoSubmitRef.current = false
+      })
+    }
+  }
 
   async function handleResendOtp() {
-    const trimmedEmail = email.trim()
+    const trimmedEmail = normalizeEmail(email)
 
     // Re-check against the real timestamp, not just the `resendCooldown`
     // state — state can lag a tick behind, the timestamp can't.
     const remaining = getOtpCooldownRemaining(trimmedEmail)
     if (remaining > 0) {
       setResendCooldown(remaining)
+      return
+    }
+
+    const { count } = getOtpResendState(trimmedEmail)
+    if (count >= MAX_RESENDS_BEFORE_SOFT_LOCK) {
+      setResendsExhausted(true)
+      setOtpError('Too many code requests. Please go back and sign in again in a few minutes.')
       return
     }
 
@@ -287,8 +481,8 @@ async function handleOtpSubmit(e) {
     // Reserve the cooldown window immediately, before the network call
     // resolves. This closes the gap where two rapid resend clicks could
     // both slip through while the first request is still in flight.
-    markOtpSent(trimmedEmail)
-    setResendCooldown(RESEND_COOLDOWN_SECONDS)
+    const reserved = markOtpSent(trimmedEmail)
+    setResendCooldown(cooldownForCount(reserved?.count || 1))
 
     const otpSendError = await sendOtp(trimmedEmail)
 
@@ -306,13 +500,7 @@ async function handleOtpSubmit(e) {
       const m = (otpSendError.message || '').toLowerCase()
       const isLocalFailure = m.includes('network') || m.includes('fetch')
       if (isLocalFailure) {
-        if (typeof window !== 'undefined') {
-          try {
-            window.localStorage.removeItem(OTP_STORAGE_KEY_PREFIX + trimmedEmail.toLowerCase())
-          } catch {
-            // ignore
-          }
-        }
+        clearOtpResendState(trimmedEmail)
         setResendCooldown(0)
       }
       return
@@ -330,9 +518,13 @@ async function handleOtpSubmit(e) {
 
     setError('')
     setLoading(true)
-    const { error: resetError } = await supabase.auth.resetPasswordForEmail(email.trim(), {
-      redirectTo: `${window.location.origin}/admin/reset-password`,
-    })
+    const { error: resetError } = await supabase.auth.resetPasswordForEmail(
+      normalizeEmail(email),
+      // Shared across all three portals — you'll need a /reset-password
+      // route/page wired up (not part of what I've seen of your app so
+      // far) since it's no longer scoped under /verifier.
+      { redirectTo: `${window.location.origin}/reset-password` }
+    )
     setLoading(false)
 
     if (resetError) {
@@ -342,9 +534,17 @@ async function handleOtpSubmit(e) {
     setMode('forgot-sent')
   }
 
+  if (checkingExistingSession) {
+    return (
+      <div className="flex min-h-[80vh] items-center justify-center">
+        <div className="h-6 w-6 animate-spin rounded-full border-2 border-teal-600 border-t-transparent" />
+      </div>
+    )
+  }
+
   return (
     <div className="relative flex min-h-[80vh] items-center justify-center overflow-hidden bg-gray-50/50 px-4 py-12 sm:px-6 lg:px-8">
-      {/* Soft ambient brand color, kept subtle so the page still reads as a secure admin tool */}
+      {/* Soft ambient brand color, kept subtle so the page still reads as a secure tool */}
       <div className="pointer-events-none absolute -top-24 -left-24 h-72 w-72 rounded-full bg-teal-200/30 blur-3xl" />
       <div className="pointer-events-none absolute -bottom-24 -right-24 h-72 w-72 rounded-full bg-orange-200/25 blur-3xl" />
 
@@ -370,22 +570,22 @@ async function handleOtpSubmit(e) {
 
           <div className="space-y-1">
             <CardTitle className="text-2xl font-bold tracking-tight text-teal-800">
-              {mode === 'signin' && 'Admin Portal'}
+              {mode === 'signin' && portal.title}
               {mode === 'otp' && 'Enter verification code'}
               {mode === 'forgot-form' && 'Reset your password'}
               {mode === 'forgot-sent' && 'Check your email'}
             </CardTitle>
             <CardDescription className="text-sm text-gray-500">
-              {mode === 'signin' && 'Manage check uploads, pickups, and disbursements.'}
+              {mode === 'signin' && portal.description}
               {mode === 'otp' && (
                 <>
                   We sent a 6-digit code to{' '}
-                  <span className="font-medium text-gray-700">{email.trim()}</span>. It expires
-                  in 5 minutes.
+                  <span className="font-medium text-gray-700">{normalizeEmail(email)}</span>. It
+                  expires in 5 minutes.
                 </>
               )}
               {mode === 'forgot-form' &&
-                'Enter your admin email and we\u2019ll send you a link to reset your password.'}
+                'Enter your verifier email and we\u2019ll send you a link to reset your password.'}
               {mode === 'forgot-sent' &&
                 'If an account exists for that address, a reset link is on its way. It can take a few minutes to arrive.'}
             </CardDescription>
@@ -410,7 +610,7 @@ async function handleOtpSubmit(e) {
                     setFieldErrors((f) => ({ ...f, email: '' }))
                   }}
                   onBlur={() => setFieldErrors((f) => ({ ...f, email: validateEmail(email) }))}
-                  placeholder="admin@csba.ph"
+                  placeholder={portal.placeholder}
                   aria-invalid={!!fieldErrors.email}
                   aria-describedby={fieldErrors.email ? 'email-error' : undefined}
                   className={cn(
@@ -518,6 +718,7 @@ async function handleOtpSubmit(e) {
               <Button
                 type="submit"
                 disabled={loading}
+                aria-busy={loading}
                 className="mt-2 w-full bg-teal-600 text-white shadow-sm transition-colors hover:bg-teal-700 focus-visible:ring-teal-500 disabled:opacity-60"
               >
                 {loading ? 'Signing in\u2026' : 'Sign in'}
@@ -540,10 +741,8 @@ async function handleOtpSubmit(e) {
                   autoComplete="one-time-code"
                   maxLength={OTP_LENGTH}
                   value={otp}
-                  onChange={(e) => {
-                    setOtp(e.target.value.replace(/\D/g, '').slice(0, OTP_LENGTH))
-                    setOtpError('')
-                  }}
+                  onChange={handleOtpChange}
+                  disabled={loading || resendsExhausted}
                   placeholder="123456"
                   aria-invalid={!!otpError}
                   aria-describedby={otpError ? 'otp-error' : undefined}
@@ -572,7 +771,8 @@ async function handleOtpSubmit(e) {
 
               <Button
                 type="submit"
-                disabled={loading || otp.length !== OTP_LENGTH}
+                disabled={loading || otp.length !== OTP_LENGTH || resendsExhausted}
+                aria-busy={loading}
                 className="w-full bg-teal-600 text-white shadow-sm transition-colors hover:bg-teal-700 focus-visible:ring-teal-500 disabled:opacity-60"
               >
                 <KeyRound className="mr-2 h-4 w-4" />
@@ -582,10 +782,14 @@ async function handleOtpSubmit(e) {
               <button
                 type="button"
                 onClick={handleResendOtp}
-                disabled={resendCooldown > 0 || loading || otpSendingRef.current}
+                disabled={resendCooldown > 0 || loading || otpSendingRef.current || resendsExhausted}
                 className="text-center text-sm font-medium text-teal-600 hover:text-teal-700 disabled:cursor-not-allowed disabled:text-gray-400"
               >
-                {resendCooldown > 0 ? `Resend code in ${resendCooldown}s` : 'Resend code'}
+                {resendsExhausted
+                  ? 'Too many requests \u2014 sign in again shortly'
+                  : resendCooldown > 0
+                  ? `Resend code in ${resendCooldown}s`
+                  : 'Resend code'}
               </button>
 
               <button
@@ -616,7 +820,7 @@ async function handleOtpSubmit(e) {
                     setFieldErrors((f) => ({ ...f, email: '' }))
                   }}
                   onBlur={() => setFieldErrors((f) => ({ ...f, email: validateEmail(email) }))}
-                  placeholder="admin@csba.ph"
+                  placeholder={portal.placeholder}
                   aria-invalid={!!fieldErrors.email}
                   aria-describedby={fieldErrors.email ? 'reset-email-error' : undefined}
                   className={cn(
@@ -646,6 +850,7 @@ async function handleOtpSubmit(e) {
               <Button
                 type="submit"
                 disabled={loading}
+                aria-busy={loading}
                 className="mt-2 w-full bg-teal-600 text-white shadow-sm transition-colors hover:bg-teal-700 focus-visible:ring-teal-500 disabled:opacity-60"
               >
                 <Mail className="mr-2 h-4 w-4" />
@@ -667,8 +872,8 @@ async function handleOtpSubmit(e) {
               <div className="flex items-start gap-2 rounded-md border border-teal-200 bg-teal-50 p-3 text-sm text-teal-800">
                 <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
                 <p>
-                  Sent to <span className="font-medium">{email.trim()}</span>. Didn\u2019t get it?
-                  Check your spam folder, or try again in a few minutes.
+                  Sent to <span className="font-medium">{normalizeEmail(email)}</span>. Didn\u2019t
+                  get it? Check your spam folder, or try again in a few minutes.
                 </p>
               </div>
               <Button

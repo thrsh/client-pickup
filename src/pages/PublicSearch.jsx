@@ -2,11 +2,14 @@ import React, { useEffect, useRef, useState } from 'react'
 import {
   Search,
   X,
+  Loader2,
   Package,
+  Truck,
   MapPin,
   ArrowRight,
   Clock,
   Navigation,
+  CheckCircle2,
   Frown,
   Sparkles,
   Landmark,
@@ -15,6 +18,7 @@ import { supabase } from '../lib/supabaseClient'
 import { Input } from '../components/ui/input'
 
 const SUGGESTION_MIN_CHARS = 3
+const MAX_RESERVE_BATCH = 500
 const BANKS = [
   'BDO Unibank',
   'Bank of the Philippine Islands (BPI)',
@@ -35,6 +39,7 @@ export default function PublicSearch() {
   const [payeeQuery, setPayeeQuery] = useState('')
   const [payorQuery, setPayorQuery] = useState('')
   const [matchedCount, setMatchedCount] = useState(0)
+  const [matchedIds, setMatchedIds] = useState([])
   const [loading, setLoading] = useState(false)
   const [hasSearched, setHasSearched] = useState(false)
 
@@ -45,6 +50,12 @@ export default function PublicSearch() {
   const [payorSuggestions, setPayorSuggestions] = useState([])
   const [showPayorSuggestions, setShowPayorSuggestions] = useState(false)
   const payorBoxRef = useRef(null)
+
+  const [showConfirm, setShowConfirm] = useState(false)
+  const [collectorName, setCollectorName] = useState('')
+  const [reserving, setReserving] = useState(false)
+  const [reserveError, setReserveError] = useState('')
+  const [successInfo, setSuccessInfo] = useState(null)
 
   // Distinct banks pulled from what's actually available right now, so the
   // public dropdown never lists a bank with nothing left to find (and never
@@ -117,10 +128,7 @@ export default function PublicSearch() {
     return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [])
 
-  // Search logic and Supabase queries. Only the count is needed now (the
-  // reserve flow — and the row ids it depended on — has been removed), so
-  // this asks Postgrest for a count-only result via head: true, which
-  // skips returning any rows.
+  // Search logic and Supabase queries
   async function fetchMatchCount(bankTerm, payeeTerm, payorTerm) {
     const bankValue = bankTerm.trim()
     const payee = payeeTerm.trim()
@@ -128,29 +136,30 @@ export default function PublicSearch() {
 
     if (!bankValue || !payee || !payor) {
       setMatchedCount(0)
+      setMatchedIds([])
       setLoading(false)
       return
     }
 
     setLoading(true)
+    setReserveError('')
 
-    // Reservations can still be created elsewhere (e.g. admin tooling), so
-    // expired ones are reclaimed here too — otherwise a stale reservation
-    // would make an actually-available check look unavailable in this count.
     await supabase.rpc('reclaim_expired_reservations')
 
     let req = supabase
       .from('checks')
-      .select('id', { count: 'exact', head: true })
+      .select('id', { count: 'exact' })
       .eq('status', 'available')
       .eq('bank', bankValue)
+      .limit(MAX_RESERVE_BATCH)
 
     if (payee) req = req.ilike('payee', `%${payee}%`)
     if (payor) req = req.ilike('payor', payor)
 
-    const { count: total, error } = await req
+    const { data, count: total, error } = await req
 
     if (!error) {
+      setMatchedIds((data || []).map((r) => r.id))
       setMatchedCount(total || 0)
     }
     setLoading(false)
@@ -199,6 +208,7 @@ export default function PublicSearch() {
     setShowPayeeSuggestions(false)
     setShowPayorSuggestions(false)
     setHasSearched(true)
+    setSuccessInfo(null)
     fetchMatchCount(bank, payeeQuery, payorQuery)
   }
 
@@ -219,6 +229,57 @@ export default function PublicSearch() {
     setShowPayorSuggestions(false)
   }
 
+  function clearAll() {
+    setBank('')
+    setPayeeQuery('')
+    setPayorQuery('')
+    setPayeeSuggestions([])
+    setPayorSuggestions([])
+    setShowPayeeSuggestions(false)
+    setShowPayorSuggestions(false)
+    setMatchedCount(0)
+    setMatchedIds([])
+    setHasSearched(false)
+  }
+
+  function openConfirm() {
+    if (matchedCount === 0) return
+    setReserveError('')
+    setShowConfirm(true)
+  }
+
+  async function confirmPickup() {
+    if (!collectorName.trim()) {
+      setReserveError('Please enter your name to continue.')
+      return
+    }
+    setReserving(true)
+    setReserveError('')
+
+    const { data, error } = await supabase.rpc('create_reservation', {
+      p_check_ids: matchedIds,
+      p_collector_name: collectorName.trim(),
+    })
+
+    setReserving(false)
+
+    if (error) {
+      setReserveError(error.message || 'Something went wrong. Please try again.')
+      return
+    }
+
+    const result = Array.isArray(data) ? data[0] : data
+    setSuccessInfo({
+      count: matchedCount,
+      expiresAt: result?.expires_at,
+      collectorName: collectorName.trim(),
+      bank,
+    })
+    setShowConfirm(false)
+    setCollectorName('')
+    fetchMatchCount(bank, payeeQuery, payorQuery)
+  }
+
   const hasQueryText = !!(bank.trim() && payeeQuery.trim() && payorQuery.trim())
 
   return (
@@ -230,6 +291,8 @@ export default function PublicSearch() {
 
         <div className="mx-auto max-w-5xl px-4 pt-6 sm:px-6 sm:pt-10">
           <Hero />
+
+          {successInfo && <SuccessManifest info={successInfo} onDismiss={() => setSuccessInfo(null)} />}
 
           {/* Symmetrical Floating Rider Search Dock */}
           <div className="relative z-20 -mt-8 mb-10 mx-auto max-w-4xl rounded-2xl bg-white p-2 shadow-[0_12px_36px_rgba(13,148,136,0.14)] ring-1 ring-slate-100 sm:-mt-12">
@@ -360,7 +423,15 @@ export default function PublicSearch() {
                 </div>
               </div>
 
-              <div className="mt-8 flex items-center justify-center">
+              <div className="mt-8 flex flex-col-reverse items-center justify-center gap-3 sm:flex-row">
+                {(bank || payeeQuery || payorQuery) && (
+                  <button
+                    onClick={clearAll}
+                    className="w-full sm:w-auto rounded-xl px-6 py-4 text-sm font-semibold text-slate-500 transition hover:bg-slate-200 hover:text-[var(--ink)]"
+                  >
+                    Clear fields
+                  </button>
+                )}
                 <button
                   onClick={handleSearch}
                   disabled={!hasQueryText}
@@ -388,6 +459,52 @@ export default function PublicSearch() {
             )}
           </div>
         </div>
+
+        {/* Sticky Bottom Action Bar — teal, light teal, orange */}
+        {hasSearched && !loading && matchedCount > 0 && !successInfo && (
+          <div className="slide-up fixed inset-x-0 bottom-0 z-40 bg-gradient-to-r from-[var(--brand-dark)] via-[var(--brand)] to-[var(--brand-dark)] px-4 pb-6 pt-5 shadow-[0_-16px_40px_rgba(13,148,136,0.35)] sm:pb-5">
+            <div className="absolute inset-x-0 top-0 h-[3px] bg-[var(--brand-light)]"></div>
+            <div className="mx-auto flex max-w-4xl flex-col items-center justify-between gap-4 sm:flex-row">
+              <div className="flex w-full items-center gap-4 sm:w-auto">
+                <div className="relative flex h-14 w-14 shrink-0 items-center justify-center rounded-full bg-[var(--brand-light)]/15 ring-1 ring-[var(--brand-light)]/40">
+                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[var(--brand-light)] opacity-20"></span>
+                  <Package className="h-7 w-7 text-[var(--brand-light)]" />
+                </div>
+                <div>
+                  <p className="text-xs font-semibold text-white uppercase tracking-wide">Ready for pickup</p>
+                  <p className="font-display text-2xl font-extrabold text-white">
+                    {matchedCount} Check{matchedCount === 1 ? '' : 's'}
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={openConfirm}
+                className="flex w-full items-center justify-center gap-2 rounded-xl bg-[var(--accent)] px-10 py-4 text-base font-semibold text-white shadow-xl shadow-black/25 transition-all hover:-translate-y-0.5 hover:bg-[var(--accent-dark)] active:scale-95 sm:w-auto"
+              >
+                <Truck className="h-5 w-5" />
+                Reserve now
+              </button>
+            </div>
+          </div>
+        )}
+
+        {showConfirm && (
+      <ConfirmModal
+  count={matchedCount}
+  bank={bank}
+  payee={payeeQuery}
+  payor={payorQuery}
+  collectorName={collectorName}
+  onCollectorNameChange={setCollectorName}
+  onCancel={() => {
+    setShowConfirm(false)
+    setReserveError('')
+  }}
+  onConfirm={confirmPickup}
+  reserving={reserving}
+  error={reserveError}
+/>
+        )}
       </div>
     </div>
   )
@@ -559,6 +676,43 @@ function RouteGraphic() {
   )
 }
 
+function SuccessManifest({ info, onDismiss }) {
+  return (
+    <div className="slide-up relative z-20 mb-10 overflow-hidden rounded-2xl border border-[var(--brand)]/30 bg-white shadow-xl shadow-[var(--brand)]/10">
+      <div className="absolute right-0 top-0 h-full w-32 bg-gradient-to-l from-[var(--brand-light)] to-transparent opacity-50"></div>
+      <div className="flex items-start p-6 sm:p-8 relative z-10">
+        <div className="mr-5 flex h-14 w-14 shrink-0 items-center justify-center rounded-full bg-[var(--brand)] shadow-lg shadow-[var(--brand)]/30">
+          <CheckCircle2 className="h-7 w-7 text-white" />
+        </div>
+        <div className="flex-1">
+          <h3 className="font-display text-xl font-extrabold text-[var(--ink-dark)]">
+            {info.count} Check{info.count === 1 ? '' : 's'} Reserved!
+          </h3>
+          <p className="mt-1 text-base font-medium text-slate-600">
+            Assigned to <span className="font-semibold text-[var(--ink-dark)] bg-[var(--brand-light)]/50 px-2 py-0.5 rounded">{info.collectorName}</span>
+            {info.bank && (
+              <>
+                {' '}from <span className="font-semibold text-[var(--ink-dark)]">{info.bank}</span>
+              </>
+            )}
+            .
+          </p>
+          <div className="mt-4 flex items-center gap-3 rounded-xl bg-[var(--accent-soft)] p-4 text-sm font-semibold text-[var(--accent-dark)] border border-[var(--accent)]/20">
+            <Clock className="h-5 w-5 shrink-0" />
+            Pick up within 1 hour {info.expiresAt ? `(by ${new Date(info.expiresAt).toLocaleTimeString()})` : ''} or the reservation expires.
+          </div>
+        </div>
+        <button
+          onClick={onDismiss}
+          className="ml-4 rounded-full bg-slate-100 p-2.5 text-slate-500 transition hover:bg-slate-200 hover:text-[var(--ink-dark)]"
+        >
+          <X className="h-5 w-5" />
+        </button>
+      </div>
+    </div>
+  )
+}
+
 function useCountUp(target, active) {
   const [value, setValue] = useState(0)
   const fromRef = useRef(0)
@@ -636,7 +790,7 @@ function ManifestCountCard({ loading, count, bank, payee, payor }) {
     )
   }
 
-  // "Success" State Graphic — now just a count display, no reserve CTA.
+  // "Success" State Graphic
   return (
     <div className="slide-up relative overflow-hidden rounded-2xl bg-white shadow-xl border border-[var(--brand-light)]">
       <div className="absolute top-0 h-1.5 w-full bg-gradient-to-r from-[var(--brand)] to-[var(--accent)]"></div>
@@ -651,17 +805,16 @@ function ManifestCountCard({ loading, count, bank, payee, payor }) {
         </div>
 
         <h2 className="font-display text-3xl font-extrabold text-[var(--ink-dark)] mt-2">
-          Checks available
+          Checks ready for pickup
         </h2>
 
-        <div className="my-6 flex items-center gap-3">
-          <Package className="h-10 w-10 text-[var(--brand)]" />
+        <div className="my-6">
           <span className="font-display text-7xl font-extrabold tabular-nums text-[var(--brand)]">
             {displayCount}
           </span>
         </div>
 
-  <div className="flex flex-col items-center gap-3 mt-2 w-full">
+       <div className="flex flex-col items-center gap-3 mt-2 w-full">
   <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">Check details</p>
   <div className="w-full max-w-md grid grid-cols-3 gap-0 rounded-xl bg-slate-50 shadow-inner border border-slate-200 overflow-hidden">
     <div className="flex flex-col items-center gap-1 px-4 py-4 border-r border-slate-200">
@@ -672,39 +825,129 @@ function ManifestCountCard({ loading, count, bank, payee, payor }) {
     </div>
     <div className="flex flex-col items-center gap-1 px-4 py-4 border-r border-slate-200">
       <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+       
         Payee
       </span>
       <span className="text-sm font-semibold text-[var(--ink)] text-center break-words">{payee}</span>
     </div>
     <div className="flex flex-col items-center gap-1 px-4 py-4">
       <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+     
         Payor
       </span>
       <span className="text-sm font-semibold text-[var(--ink)] text-center break-words">{payor}</span>
     </div>
   </div>
-
-  {/* Pickup location */}
-  <div className="w-full max-w-md rounded-xl bg-[var(--brand)]/5 border border-[var(--brand-light)] px-5 py-4">
-    <div className="flex items-center justify-center gap-1.5 text-[11px] font-semibold uppercase tracking-widest text-[var(--brand-dark)] mb-2">
-      <MapPin className="h-3.5 w-3.5" />
-      Pickup location
-    </div>
-    <p className="text-sm font-semibold text-[var(--ink-dark)]">Manila Office</p>
-    <p className="mt-1 text-sm leading-relaxed text-slate-600">
-      4th Floor, Unit 407-408<br />
-      Kawayan Building 1, PARQAL<br />
-      Aseana City, D. Macapagal Ave.<br />
-      Brgy. Tambo, Parañaque City 1701<br />
-      Philippines
-    </p>
-  </div>
-
   <div className="flex items-center gap-1.5 text-xs font-medium text-slate-400">
     <Clock className="h-3.5 w-3.5" />
     Queried {new Date().toLocaleString()}
   </div>
 </div>
+      </div>
+    </div>
+  )
+}
+function ConfirmModal({ count, bank, payee, payor, collectorName, onCollectorNameChange, onCancel, onConfirm, reserving, error }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-[var(--ink-dark)]/70 p-4 backdrop-blur-sm">
+      <div className="slide-up flex w-full max-w-md flex-col overflow-hidden rounded-2xl bg-white shadow-2xl border border-white/20 relative">
+
+        {/* Top Header Accent Line */}
+        <div className="h-1.5 w-full bg-gradient-to-r from-[var(--brand)] to-[var(--accent)]"></div>
+
+        {/* Modal Header */}
+        <div className="px-8 py-6 text-center border-b border-slate-100 relative overflow-hidden bg-white">
+          <svg className="absolute top-0 right-0 w-32 h-32 text-[var(--brand-light)] opacity-30 pointer-events-none" viewBox="0 0 100 100" fill="currentColor">
+            <polygon points="100,0 100,100 0,0" />
+          </svg>
+          <h2 className="font-display text-2xl font-extrabold text-[var(--ink-dark)] relative z-10">Confirm reservation</h2>
+          <p className="mt-2 text-sm text-slate-500 font-medium relative z-10">
+            You are about to secure these items for exactly 1 hour.
+          </p>
+        </div>
+
+        {/* Modal Body */}
+        <div className="px-8 py-8 bg-slate-50">
+          {/* Summary card: count + bank/payee/payor + timestamp */}
+          <div className="mb-8 overflow-hidden rounded-2xl bg-white shadow-sm border border-slate-200 relative">
+            <div className="absolute -left-6 -top-6 h-20 w-20 rounded-full bg-[var(--brand-light)]/50 blur-xl pointer-events-none"></div>
+            <div className="absolute -right-6 -top-6 h-20 w-20 rounded-full bg-[var(--accent-soft)]/50 blur-xl pointer-events-none"></div>
+
+            <div className="relative z-10 flex flex-col items-center pt-6 pb-5">
+              <span className="text-xs font-semibold uppercase tracking-widest text-slate-400 mb-1">Total checks to claim</span>
+              <span className="font-display text-5xl font-extrabold text-[var(--brand)]">{count}</span>
+            </div>
+
+            <div className="relative z-10 grid grid-cols-3 border-t border-slate-100">
+              <div className="flex flex-col items-center gap-1 px-3 py-4 border-r border-slate-100">
+                <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                  Bank
+                </span>
+                <span className="text-sm font-semibold text-[var(--ink)] text-center break-words">{bank}</span>
+              </div>
+              <div className="flex flex-col items-center gap-1 px-3 py-4 border-r border-slate-100">
+                <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+            
+                  Payee
+                </span>
+                <span className="text-sm font-semibold text-[var(--ink)] text-center break-words">{payee}</span>
+              </div>
+              <div className="flex flex-col items-center gap-1 px-3 py-4">
+                <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+               
+                  Payor
+                </span>
+                <span className="text-sm font-semibold text-[var(--ink)] text-center break-words">{payor}</span>
+              </div>
+            </div>
+
+            <div className="relative z-10 flex items-center justify-center gap-1.5 border-t border-slate-100 bg-slate-50/60 py-2.5 text-xs font-medium text-slate-400">
+              <Clock className="h-3.5 w-3.5" />
+              Reserving on {new Date().toLocaleString(undefined, {
+                dateStyle: 'medium',
+                timeStyle: 'short',
+              })}
+            </div>
+          </div>
+
+          <div className="space-y-3">
+            <label className="block text-center text-xs font-semibold uppercase tracking-widest text-[var(--ink)]/60">
+              Enter Collector's Full name
+            </label>
+            <Input
+              value={collectorName}
+              onChange={(e) => onCollectorNameChange(e.target.value)}
+              placeholder="e.g. John Doe"
+              className="text-center text-lg font-semibold h-16 rounded-2xl border-slate-200 bg-white shadow-sm focus-visible:ring-2 focus-visible:ring-[var(--brand)] focus-visible:border-[var(--brand)] transition-all"
+              autoFocus
+            />
+          </div>
+
+          {error && (
+            <p className="mt-4 flex items-center justify-center gap-2 rounded-lg bg-red-50 p-3 text-sm font-semibold text-red-600 border border-red-100 scale-in text-center">
+              <X className="h-5 w-5 shrink-0"/> {error}
+            </p>
+          )}
+        </div>
+
+        {/* Modal Actions */}
+        <div className="flex flex-col gap-3 px-8 py-6 bg-white border-t border-slate-100">
+          <button
+            onClick={onConfirm}
+            disabled={reserving}
+            className="flex w-full items-center justify-center gap-2 rounded-xl bg-[var(--accent)] hover:bg-[var(--accent-dark)] py-4 text-lg font-semibold text-white shadow-lg shadow-[var(--accent)]/40 transition-all hover:-translate-y-0.5 disabled:transform-none disabled:opacity-60"
+          >
+            {reserving ? <Loader2 className="h-5 w-5 animate-spin" /> : <CheckCircle2 className="h-6 w-6" />}
+            Confirm pickup
+          </button>
+          <button
+            onClick={onCancel}
+            disabled={reserving}
+            className="w-full bg-transparent py-3 text-sm font-semibold text-slate-500 transition-colors hover:text-[var(--ink-dark)] disabled:opacity-50"
+          >
+            Cancel
+          </button>
+        </div>
       </div>
     </div>
   )

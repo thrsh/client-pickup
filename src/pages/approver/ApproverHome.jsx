@@ -74,10 +74,12 @@
 // ReviewModal notes (read before touching):
 //   - The modal is deliberately wide (max-w-6xl / xl:max-w-7xl) with a
 //     table-fixed layout and explicit column widths so it never needs
-//     horizontal scrolling at normal viewport sizes — don't reintroduce
-//     truncate-without-title cells or shrink the modal back down without
-//     re-checking that long payee/payor/check-no values still fit or are
-//     at least fully readable via the title tooltip.
+//     horizontal scrolling at normal viewport sizes. Payee/payor still
+//     truncate with a title tooltip, but Check No. does NOT — it's the
+//     field an approver cross-references against the physical check, so
+//     it must always render in full (wraps via break-all rather than
+//     truncating) instead of relying on a hover tooltip to see the rest.
+//     Don't reintroduce `truncate` on that column.
 //   - The modal has a real focus trap (Tab/Shift+Tab wrap within the
 //     dialog) and restores focus to whatever triggered it on close, on
 //     top of the existing "focus cancel button on open" and "Escape to
@@ -1488,12 +1490,12 @@ function ApprovalGroupRow({
                         {selectedCheckIds.has(c.checkId) ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
                       </button>
                     </td>
-                  <td className="px-4 py-3 font-mono text-xs text-ink-700">
-  <span className="flex items-start gap-1">
-    <Hash className="mt-0.5 h-3 w-3 shrink-0 text-ink-300" />
-    <span className="break-all">{c.check_no ?? '—'}</span>
-  </span>
-</td>
+                    <td className="px-4 py-3 font-mono text-xs text-ink-700">
+                      <span className="flex items-start gap-1">
+                        <Hash className="mt-0.5 h-3 w-3 shrink-0 text-ink-300" />
+                        <span className="break-all">{c.check_no ?? '—'}</span>
+                      </span>
+                    </td>
                     <td className="px-2 py-2.5">
                       <BankBadge bank={c.bank} />
                     </td>
@@ -1717,10 +1719,10 @@ function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash
             <div className="max-h-[42vh] overflow-y-auto">
               <table className="w-full table-fixed text-sm">
                 <colgroup>
-                <col className="w-[12%]" />  {/* check no. */}
-<col className="w-[9%]" />  {/* bank */}
-<col className="w-[13%]" />  {/* payee */}
-<col className="w-[9%]" />  {/* payor */}
+                  <col className="w-[14%]" />{/* check no. — never truncated, see below */}
+                  <col className="w-[9%]" />{/* bank */}
+                  <col className="w-[12%]" />{/* payee */}
+                  <col className="w-[8%]" />{/* payor */}
                   <col className="w-[9%]" />
                   <col className="w-[8%]" />
                   <col className="w-[5%]" />
@@ -1757,10 +1759,15 @@ function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash
                           flagRow && 'bg-orange-50 ring-1 ring-inset ring-orange-300'
                         )}
                       >
-                        <td className="truncate px-4 py-3 font-mono text-xs text-ink-700" title={c.check_no || undefined}>
-                          <span className="flex items-center gap-1">
-                            <Hash className="h-3 w-3 shrink-0 text-ink-300" />
-                            <span className="truncate">{c.check_no ?? '—'}</span>
+                        {/* Check No. is what an approver cross-references
+                            against the physical check in hand, so it must
+                            always be fully visible — wraps via break-all
+                            instead of truncating with just a hover
+                            tooltip. Do not add `truncate` back here. */}
+                        <td className="px-4 py-3 font-mono text-xs text-ink-700">
+                          <span className="flex items-start gap-1">
+                            <Hash className="mt-0.5 h-3 w-3 shrink-0 text-ink-300" />
+                            <span className="break-all">{c.check_no ?? '—'}</span>
                           </span>
                         </td>
                         <td className="px-4 py-3">

@@ -11,12 +11,12 @@ import {
 import { cn } from '../lib/utils'
 
 const links = [
-  { to: '/admin', label: 'Overview', icon: LayoutGrid, end: true },
-  { to: '/admin/upload', label: 'Upload file', icon: UploadCloud },
-  { to: '/admin/checks', label: 'Checks register', icon: ListChecks },
-  { to: '/admin/pickups', label: 'Pending pickups', icon: Clock },
-  { to: '/admin/reports', label: 'Reports', icon: BarChart3 },
-  { to: '/admin/qr', label: 'QR code', icon: QrCode },
+  { to: '/verifier', label: 'Overview', icon: LayoutGrid, end: true },
+  { to: '/verifier/upload', label: 'Upload file', icon: UploadCloud },
+  { to: '/verifier/checks', label: 'Checks register', icon: ListChecks },
+  { to: '/verifier/pickups', label: 'Pending pickups', icon: Clock },
+  { to: '/verifier/reports', label: 'Reports', icon: BarChart3 },
+  { to: '/verifier/qr', label: 'QR code', icon: QrCode },
 ]
 
 export default function AdminLayout() {
