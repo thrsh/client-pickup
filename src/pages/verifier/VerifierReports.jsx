@@ -29,7 +29,8 @@ import { Input } from '../../components/ui/input'
 import { Select } from '../../components/ui/select'
 import { useToast } from '../../components/ui/toast'
 import { formatCurrency } from '../../lib/utils'
-
+// AdminReports.jsx and AdminUpload.jsx
+import { logAuditEvent } from '../../lib/adminAuditApi'
 // Corporate Branding Colors
 const BRAND = {
   teal: '#0d9488', // teal-600
@@ -1447,7 +1448,15 @@ export default function AdminReports() {
         variant: 'success',
         title: 'Report downloaded',
         description: `${rawRows.length} check${rawRows.length === 1 ? '' : 's'} included in the ${config.title.toLowerCase()}.`,
+      
       })
+      logAuditEvent('report_generated', {
+  format: 'xlsx',
+  report_type: previewMeta.configKey,
+  row_count: rawRows.length,
+  payor: previewMeta.payor || null,
+  bank_filter: previewMeta.bankAll ? 'all' : previewMeta.banks,
+}).catch(() => {})
     } catch (err) {
       const message = err?.message || 'Failed to generate the report. Please try again.'
       push?.({ variant: 'error', title: 'Download failed', description: message })
@@ -1485,23 +1494,30 @@ export default function AdminReports() {
   }
 
   function handleDownloadPdf() {
-    if (!previewMeta || rawRows.length === 0) return
-    setDownloadingPdf(true)
-    try {
-      const config = REPORT_CONFIG[previewMeta.configKey]
-      const doc = buildPdfDocument(
-        previewMeta.configKey,
-        rawRows,
-        reportMetaArgs(),
-        previewMeta.configKey === 'stale_unreleased' ? bankBreakdown : []
-      )
-      doc.save(`${reportFilename(config)}.pdf`)
-    } catch (err) {
-      push?.({ variant: 'error', title: 'PDF download failed', description: err?.message || 'Please try again.' })
-    } finally {
-      setDownloadingPdf(false)
-    }
+  if (!previewMeta || rawRows.length === 0) return
+  setDownloadingPdf(true)
+  try {
+    const config = REPORT_CONFIG[previewMeta.configKey]
+    const doc = buildPdfDocument(
+      previewMeta.configKey,
+      rawRows,
+      reportMetaArgs(),
+      previewMeta.configKey === 'stale_unreleased' ? bankBreakdown : []
+    )
+    doc.save(`${reportFilename(config)}.pdf`)
+    logAuditEvent('report_generated', {
+      format: 'pdf',
+      report_type: previewMeta.configKey,
+      row_count: rawRows.length,
+      payor: previewMeta.payor || null,
+      bank_filter: previewMeta.bankAll ? 'all' : previewMeta.banks,
+    }).catch(() => {})
+  } catch (err) {
+    push?.({ variant: 'error', title: 'PDF download failed', description: err?.message || 'Please try again.' })
+  } finally {
+    setDownloadingPdf(false)
   }
+}
 
   const activeConfig = previewMeta ? REPORT_CONFIG[previewMeta.configKey] : null
 

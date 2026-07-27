@@ -1,14 +1,23 @@
 // src/components/Navbar.jsx
 //
 // Same component as before, updated for: the admin -> verifier rename
-// (role label chip covers 'verifier' and the new 'admin'), and the move to
-// a single shared /login route (was three separate per-role login paths).
-import React from 'react'
+// (role label chip covers 'verifier' and the new 'admin'), the move to
+// a single shared /login route (was three separate per-role login paths),
+// and audit logging for sign-out — see handleSignOut below.
+//
+// Layout fix (see PR notes): `id="app-topbar"` moved from the inner <nav>
+// to the outer <header>, since ResizeObserver needs to measure the full
+// header (accent line + logo row + nav row), not just the nav row alone.
+// Row height stays the original fixed h-16/h-20 — that's the correct
+// visual size; the logo overflowing it slightly is intentional/acceptable
+// here, not something to "fix" by growing the row.
+import React, { useState } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { LogOut, User } from 'lucide-react'
 import { supabase } from '../lib/supabaseClient'
 import { Button } from './ui/button'
 import { useProfile } from '../context/ProfileContext'
+import { recordLogout } from '../lib/adminAuditApi'
 
 const PROTECTED_PREFIXES = ['/verifier', '/admin', '/approver']
 const LOGIN_PATH = '/login'
@@ -24,18 +33,34 @@ export function Navbar({ user }) {
   const location = useLocation()
   const navigate = useNavigate()
   const { role } = useProfile()
+  const [signingOut, setSigningOut] = useState(false)
 
   const isProtectedArea =
     PROTECTED_PREFIXES.some((p) => location.pathname.startsWith(p)) &&
     location.pathname !== LOGIN_PATH
 
   async function handleSignOut() {
+    if (signingOut) return // guards a fast double-click firing this twice
+    setSigningOut(true)
+
+    // Audit-log BEFORE tearing down the session, not after — once
+    // supabase.auth.signOut() completes there's no live session left to
+    // attribute the event to, so logging afterward would silently drop it.
+    // This is fire-and-forget: a failed audit write should never block the
+    // user from actually signing out.
+    if (user?.id) {
+      await recordLogout(user.id).catch(() => {})
+    }
+
     await supabase.auth.signOut()
     navigate(LOGIN_PATH)
   }
 
   return (
-    <header className="sticky top-0 z-50 w-full border-b border-teal-100 bg-white/80 shadow-[0_1px_0_0_rgba(13,148,136,0.06)] backdrop-blur-md transition-all duration-300">
+    <header
+      id="app-topbar"
+      className="sticky top-0 z-50 w-full border-b border-teal-100 bg-white/80 shadow-[0_1px_0_0_rgba(13,148,136,0.06)] backdrop-blur-md transition-all duration-300"
+    >
       {/* Thin teal → orange accent line, the header's one signature detail */}
       <div className="h-[3px] w-full bg-gradient-to-r from-teal-500 via-teal-400 to-orange-400" />
 
@@ -66,11 +91,13 @@ export function Navbar({ user }) {
               <Button
                 variant="outline"
                 size="sm"
-                className="group flex items-center gap-2 border-orange-200 bg-white text-orange-600 transition-all duration-200 hover:border-orange-300 hover:bg-orange-500 hover:text-white hover:shadow-md hover:shadow-orange-200/60"
+                disabled={signingOut}
+                aria-busy={signingOut}
+                className="group flex items-center gap-2 border-orange-200 bg-white text-orange-600 transition-all duration-200 hover:border-orange-300 hover:bg-orange-500 hover:text-white hover:shadow-md hover:shadow-orange-200/60 disabled:opacity-60"
                 onClick={handleSignOut}
               >
                 <LogOut className="h-4 w-4 transition-transform duration-200 group-hover:translate-x-0.5" />
-                <span className="hidden sm:inline">Sign out</span>
+                <span className="hidden sm:inline">{signingOut ? 'Signing out…' : 'Sign out'}</span>
               </Button>
             </>
           )}

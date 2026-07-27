@@ -2,23 +2,21 @@ import React, { useEffect, useRef, useState } from 'react'
 import {
   Search,
   X,
-  Loader2,
   Package,
-  Truck,
   MapPin,
   ArrowRight,
   Clock,
   Navigation,
-  CheckCircle2,
   Frown,
   Sparkles,
   Landmark,
+  Building2,
+  ExternalLink,
 } from 'lucide-react'
 import { supabase } from '../lib/supabaseClient'
 import { Input } from '../components/ui/input'
 
 const SUGGESTION_MIN_CHARS = 3
-const MAX_RESERVE_BATCH = 500
 const BANKS = [
   'BDO Unibank',
   'Bank of the Philippine Islands (BPI)',
@@ -32,14 +30,95 @@ const BANKS = [
   'EastWest Bank',
   'Philippine Savings Bank (PSBank)',
 ]
+
+// ---------------------------------------------------------------------------
+// Branch / pickup-location configuration
+// ---------------------------------------------------------------------------
+// Matches the `pickup_branch` column on public.checks.
+const BRANCH_FIELD = 'pickup_branch'
+
+// Central registry of every pickup office. Adding a 3rd branch later means
+// adding one more entry here — nothing else in the component needs to change.
+const OFFICES = {
+  'CSBA - PARQAL': {
+    label: 'Parañaque Office',
+    shortLabel: 'Parañaque',
+    address: {
+      line1: '4th Floor, Unit 407-408',
+      line2: 'Kawayan Building 1, PARQAL',
+      line3: 'Aseana City, D. Macapagal Ave.',
+      line4: 'Brgy. Tambo, Parañaque City 1701',
+    },
+    lat: 14.52764285019307,
+    lng: 120.9887007953413,
+    // Live photographic panorama of the actual storefront/entrance — tied to
+    // a specific panorama ID, so it always shows this exact spot.
+    streetViewSrc:
+      'https://www.google.com/maps/embed?pb=!4v1784790445760!6m8!1m7!1stp6zRb466QqO5055aEP0OQ!2m2!1d14.52764285019307!2d120.9887007953413!3f180.6539755155262!4f0.671128233677635!5f0.4000000000000002',
+    placeId: null,
+  },
+  'CSBA - BGC': {
+    label: 'Taguig Office',
+    shortLabel: 'BGC, Taguig',
+    address: {
+      line1: 'Bonifacio Technology Center',
+      line2: '31st Street cor 2nd Avenue',
+      line3: 'Bonifacio Global City',
+      line4: 'Taguig, 1634',
+    },
+    // Verified via Google Places (place_id: ChIJnU0t-PnIlzMRraT9qk8Vp2s) —
+    // this is Google's own coordinate for the Bonifacio Technology Center
+    // building itself, not an eyeballed estimate.
+    lat: 14.5547443,
+    lng: 121.0444729,
+    placeId: 'ChIJnU0t-PnIlzMRraT9qk8Vp2s',
+    // No hand-curated panorama (heading/pitch/fov aimed at the entrance) has
+    // been captured for this branch yet. Leaving this unset is safe: getStreetViewSrc()
+    // below auto-derives a Street View embed from lat/lng, so the tab still
+    // works today. Once someone grabs a proper embed code from Google Maps
+    // (Share > Embed a map > Street View, aimed at the actual entrance),
+    // paste its `pb=...` URL here for a sharper, pre-aimed shot — same
+    // format as the Parañaque entry.
+    streetViewSrc: null,
+  },
+}
+
+// Builds a coordinate-pinned map (not an address-text search) so there is
+// exactly one marker at the exact building, with no other nearby places
+// competing for a pin — reused for both the embed and the directions link.
+function getMapSrc(office) {
+  return `https://www.google.com/maps?q=${office.lat},${office.lng}&z=19&output=embed`
+}
+function getDirectionsUrl(office) {
+  return `https://www.google.com/maps/dir/?api=1&destination=${office.lat},${office.lng}`
+}
+
+// Resolves the Street View embed for an office:
+// 1. A hand-curated `streetViewSrc` (specific panorama + heading/pitch/fov,
+//    aimed at the entrance) always wins when present — highest precision.
+// 2. Otherwise, auto-derive one directly from the office's lat/lng using
+//    Google's no-API-key "svembed" endpoint. Google resolves this to
+//    whichever real panorama is nearest those coordinates, so it degrades
+//    gracefully instead of showing nothing — no manual pano-hunting required
+//    to onboard a new branch.
+// Returns null only if the office has no coordinates at all, so callers can
+// safely hide the tab in that (should-never-happen) case.
+function getStreetViewSrc(office) {
+  if (office.streetViewSrc) return office.streetViewSrc
+  if (office.lat == null || office.lng == null) return null
+  return `https://www.google.com/maps?layer=c&cbll=${office.lat},${office.lng}&cbp=12,0,,0,0&output=svembed`
+}
+
+const DEFAULT_BRANCH_KEY = Object.keys(OFFICES)[0]
+
 export default function PublicSearch() {
   const [bank, setBank] = useState('')
-
 
   const [payeeQuery, setPayeeQuery] = useState('')
   const [payorQuery, setPayorQuery] = useState('')
   const [matchedCount, setMatchedCount] = useState(0)
-  const [matchedIds, setMatchedIds] = useState([])
+  // Per-branch counts for the current query, e.g. { 'CSBA - PARQAL': 3, 'CSBA - BGC': 1 }
+  const [branchCounts, setBranchCounts] = useState({})
   const [loading, setLoading] = useState(false)
   const [hasSearched, setHasSearched] = useState(false)
 
@@ -50,45 +129,6 @@ export default function PublicSearch() {
   const [payorSuggestions, setPayorSuggestions] = useState([])
   const [showPayorSuggestions, setShowPayorSuggestions] = useState(false)
   const payorBoxRef = useRef(null)
-
-  const [showConfirm, setShowConfirm] = useState(false)
-  const [collectorName, setCollectorName] = useState('')
-  const [reserving, setReserving] = useState(false)
-  const [reserveError, setReserveError] = useState('')
-  const [successInfo, setSuccessInfo] = useState(null)
-
-  // Distinct banks pulled from what's actually available right now, so the
-  // public dropdown never lists a bank with nothing left to find (and never
-  // needs to be kept in sync by hand with the admin upload form's bank
-  // list). This is a public, unauthenticated read — only the `bank` column
-  // of `available` checks, nothing sensitive.
-  useEffect(() => {
-    let cancelled = false
-    async function loadBanks() {
-      setBankOptionsLoading(true)
-      try {
-        const { data, error } = await supabase
-          .from('checks')
-          .select('bank')
-          .eq('status', 'available')
-          .not('bank', 'is', null)
-          .limit(2000)
-        if (!cancelled && !error) {
-          const distinct = [...new Set((data || []).map((r) => r.bank).filter(Boolean))].sort()
-          setBankOptions(distinct)
-        }
-      } catch {
-        // Non-fatal — the select just renders empty and the person can
-        // still retry; the search itself doesn't depend on this list.
-      } finally {
-        if (!cancelled) setBankOptionsLoading(false)
-      }
-    }
-    loadBanks()
-    return () => {
-      cancelled = true
-    }
-  }, [])
 
   // Live suggestions effects
   useEffect(() => {
@@ -129,6 +169,19 @@ export default function PublicSearch() {
   }, [])
 
   // Search logic and Supabase queries
+  function buildBaseQuery(bankValue, payee, payor) {
+    let req = supabase
+      .from('checks')
+      .select('id', { count: 'exact', head: true })
+      .eq('status', 'available')
+      .eq('bank', bankValue)
+
+    if (payee) req = req.ilike('payee', `%${payee}%`)
+    if (payor) req = req.ilike('payor', payor)
+
+    return req
+  }
+
   async function fetchMatchCount(bankTerm, payeeTerm, payorTerm) {
     const bankValue = bankTerm.trim()
     const payee = payeeTerm.trim()
@@ -136,33 +189,43 @@ export default function PublicSearch() {
 
     if (!bankValue || !payee || !payor) {
       setMatchedCount(0)
-      setMatchedIds([])
+      setBranchCounts({})
       setLoading(false)
       return
     }
 
     setLoading(true)
-    setReserveError('')
 
-    await supabase.rpc('reclaim_expired_reservations')
+    try {
+      // Total count across all branches, plus a per-branch breakdown fired
+      // in parallel — one lightweight head-count query per known office.
+      const branchKeys = Object.keys(OFFICES)
+      const [totalResult, ...branchResults] = await Promise.all([
+        buildBaseQuery(bankValue, payee, payor),
+        ...branchKeys.map((key) =>
+          buildBaseQuery(bankValue, payee, payor).eq(BRANCH_FIELD, key)
+        ),
+      ])
 
-    let req = supabase
-      .from('checks')
-      .select('id', { count: 'exact' })
-      .eq('status', 'available')
-      .eq('bank', bankValue)
-      .limit(MAX_RESERVE_BATCH)
+      if (totalResult.error) throw totalResult.error
 
-    if (payee) req = req.ilike('payee', `%${payee}%`)
-    if (payor) req = req.ilike('payor', payor)
+      const nextBranchCounts = {}
+      branchKeys.forEach((key, idx) => {
+        const result = branchResults[idx]
+        if (!result.error) {
+          nextBranchCounts[key] = result.count || 0
+        }
+      })
 
-    const { data, count: total, error } = await req
-
-    if (!error) {
-      setMatchedIds((data || []).map((r) => r.id))
-      setMatchedCount(total || 0)
+      setMatchedCount(totalResult.count || 0)
+      setBranchCounts(nextBranchCounts)
+    } catch (err) {
+      console.error('Failed to fetch check matches:', err)
+      setMatchedCount(0)
+      setBranchCounts({})
+    } finally {
+      setLoading(false)
     }
-    setLoading(false)
   }
 
   async function fetchSuggestions(field, term) {
@@ -208,7 +271,6 @@ export default function PublicSearch() {
     setShowPayeeSuggestions(false)
     setShowPayorSuggestions(false)
     setHasSearched(true)
-    setSuccessInfo(null)
     fetchMatchCount(bank, payeeQuery, payorQuery)
   }
 
@@ -238,92 +300,45 @@ export default function PublicSearch() {
     setShowPayeeSuggestions(false)
     setShowPayorSuggestions(false)
     setMatchedCount(0)
-    setMatchedIds([])
+    setBranchCounts({})
     setHasSearched(false)
-  }
-
-  function openConfirm() {
-    if (matchedCount === 0) return
-    setReserveError('')
-    setShowConfirm(true)
-  }
-
-  async function confirmPickup() {
-    if (!collectorName.trim()) {
-      setReserveError('Please enter your name to continue.')
-      return
-    }
-    setReserving(true)
-    setReserveError('')
-
-    const { data, error } = await supabase.rpc('create_reservation', {
-      p_check_ids: matchedIds,
-      p_collector_name: collectorName.trim(),
-    })
-
-    setReserving(false)
-
-    if (error) {
-      setReserveError(error.message || 'Something went wrong. Please try again.')
-      return
-    }
-
-    const result = Array.isArray(data) ? data[0] : data
-    setSuccessInfo({
-      count: matchedCount,
-      expiresAt: result?.expires_at,
-      collectorName: collectorName.trim(),
-      bank,
-    })
-    setShowConfirm(false)
-    setCollectorName('')
-    fetchMatchCount(bank, payeeQuery, payorQuery)
   }
 
   const hasQueryText = !!(bank.trim() && payeeQuery.trim() && payorQuery.trim())
 
   return (
-    <div className="psp-page rider-app min-h-screen pb-32 relative overflow-hidden">
+    <div className="psp-page rider-app min-h-screen pb-20 relative overflow-hidden">
       <PageStyles />
       <BackgroundGeometry />
 
       <div className="relative z-10">
-
         <div className="mx-auto max-w-5xl px-4 pt-6 sm:px-6 sm:pt-10">
           <Hero />
-
-          {successInfo && <SuccessManifest info={successInfo} onDismiss={() => setSuccessInfo(null)} />}
 
           {/* Symmetrical Floating Rider Search Dock */}
           <div className="relative z-20 -mt-8 mb-10 mx-auto max-w-4xl rounded-2xl bg-white p-2 shadow-[0_12px_36px_rgba(13,148,136,0.14)] ring-1 ring-slate-100 sm:-mt-12">
             <div className="rounded-xl bg-slate-50 p-6 sm:p-8">
-              <div className="mb-6 flex items-center justify-center gap-2">
-              
-               
-              </div>
-
               <div className="mb-6">
                 <label className="mb-2 block text-center text-[12px] font-semibold uppercase tracking-wide text-[var(--ink)]/55">
                   Bank
                 </label>
                 <div className="relative group mx-auto max-w-md">
                   <Landmark className="pointer-events-none absolute left-4 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400 transition-colors group-focus-within:text-[var(--brand)]" />
-             <select
-  value={bank}
-  onChange={(e) => setBank(e.target.value)}
-  aria-label="Select bank"
-  className="h-14 w-full appearance-none rounded-xl border border-slate-200 bg-white pl-12 pr-10 text-base font-medium text-[var(--ink)] shadow-sm transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand)] focus-visible:border-[var(--brand)]"
->
-  <option value="">Select a bank...</option>
-  {BANKS.map((b) => (
-    <option key={b} value={b}>
-      {b}
-    </option>
-  ))}
-</select>
+                  <select
+                    value={bank}
+                    onChange={(e) => setBank(e.target.value)}
+                    aria-label="Select bank"
+                    className="h-14 w-full appearance-none rounded-xl border border-slate-200 bg-white pl-12 pr-10 text-base font-medium text-[var(--ink)] shadow-sm transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand)] focus-visible:border-[var(--brand)]"
+                  >
+                    <option value="">Select a bank...</option>
+                    {BANKS.map((b) => (
+                      <option key={b} value={b}>
+                        {b}
+                      </option>
+                    ))}
+                  </select>
                   <ArrowRight className="pointer-events-none absolute right-4 top-1/2 h-4 w-4 -translate-y-1/2 rotate-90 text-slate-400" />
                 </div>
-               
               </div>
 
               <div className="flex flex-col gap-6 sm:flex-row sm:items-start">
@@ -451,60 +466,21 @@ export default function PublicSearch() {
           </div>
 
           {/* Results area */}
-          <div className="mx-auto max-w-4xl relative z-10">
+          <div className="mx-auto max-w-4xl relative z-10 pb-16">
             {!hasQueryText ? (
               <PromptState />
             ) : (
-              <ManifestCountCard loading={loading} count={matchedCount} bank={bank} payee={payeeQuery} payor={payorQuery} />
+              <ManifestCountCard
+                loading={loading}
+                count={matchedCount}
+                branchCounts={branchCounts}
+                bank={bank}
+                payee={payeeQuery}
+                payor={payorQuery}
+              />
             )}
           </div>
         </div>
-
-        {/* Sticky Bottom Action Bar — teal, light teal, orange */}
-        {hasSearched && !loading && matchedCount > 0 && !successInfo && (
-          <div className="slide-up fixed inset-x-0 bottom-0 z-40 bg-gradient-to-r from-[var(--brand-dark)] via-[var(--brand)] to-[var(--brand-dark)] px-4 pb-6 pt-5 shadow-[0_-16px_40px_rgba(13,148,136,0.35)] sm:pb-5">
-            <div className="absolute inset-x-0 top-0 h-[3px] bg-[var(--brand-light)]"></div>
-            <div className="mx-auto flex max-w-4xl flex-col items-center justify-between gap-4 sm:flex-row">
-              <div className="flex w-full items-center gap-4 sm:w-auto">
-                <div className="relative flex h-14 w-14 shrink-0 items-center justify-center rounded-full bg-[var(--brand-light)]/15 ring-1 ring-[var(--brand-light)]/40">
-                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[var(--brand-light)] opacity-20"></span>
-                  <Package className="h-7 w-7 text-[var(--brand-light)]" />
-                </div>
-                <div>
-                  <p className="text-xs font-semibold text-white uppercase tracking-wide">Ready for pickup</p>
-                  <p className="font-display text-2xl font-extrabold text-white">
-                    {matchedCount} Check{matchedCount === 1 ? '' : 's'}
-                  </p>
-                </div>
-              </div>
-              <button
-                onClick={openConfirm}
-                className="flex w-full items-center justify-center gap-2 rounded-xl bg-[var(--accent)] px-10 py-4 text-base font-semibold text-white shadow-xl shadow-black/25 transition-all hover:-translate-y-0.5 hover:bg-[var(--accent-dark)] active:scale-95 sm:w-auto"
-              >
-                <Truck className="h-5 w-5" />
-                Reserve now
-              </button>
-            </div>
-          </div>
-        )}
-
-        {showConfirm && (
-      <ConfirmModal
-  count={matchedCount}
-  bank={bank}
-  payee={payeeQuery}
-  payor={payorQuery}
-  collectorName={collectorName}
-  onCollectorNameChange={setCollectorName}
-  onCancel={() => {
-    setShowConfirm(false)
-    setReserveError('')
-  }}
-  onConfirm={confirmPickup}
-  reserving={reserving}
-  error={reserveError}
-/>
-        )}
       </div>
     </div>
   )
@@ -547,21 +523,6 @@ function PageStyles() {
       }
 
       @media (prefers-reduced-motion: no-preference) {
-        .radar-sweep {
-          animation: radar 3s linear infinite;
-          transform-origin: center;
-        }
-        @keyframes radar {
-          from { transform: rotate(0deg); }
-          to { transform: rotate(360deg); }
-        }
-
-        .pulse-marker { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
-        @keyframes pulse {
-          0%, 100% { opacity: 1; transform: scale(1); }
-          50% { opacity: .7; transform: scale(1.15); box-shadow: 0 0 20px rgba(13, 148, 136, 0.5); }
-        }
-
         .slide-up { animation: slideUp 0.5s cubic-bezier(0.16, 1, 0.3, 1); }
         @keyframes slideUp {
           from { transform: translateY(40px); opacity: 0; }
@@ -589,19 +550,18 @@ function PageStyles() {
         background-image: radial-gradient(#e2e8f0 2px, transparent 2px);
         background-size: 24px 24px;
       }
+
+      .map-frame-wrap {
+        aspect-ratio: 16 / 9;
+      }
+      @media (min-width: 640px) {
+        .map-frame-wrap { aspect-ratio: 21 / 9; }
+      }
     `}</style>
   )
 }
 
 function BackgroundGeometry() {
-  // NOTE: SVG's `points` attribute on <polygon> only accepts plain numbers
-  // (user units), not percentage strings like "40%". The previous version
-  // used percentages here, which is invalid syntax — browsers silently drop
-  // any polygon with a malformed points list, so none of these shapes were
-  // ever painted and the page looked plain white. Fixing this by giving the
-  // <svg> a 0–100 viewBox (stretched to fill via preserveAspectRatio="none")
-  // and using plain numbers 0–100, which behaves exactly like percentages
-  // of the container but is valid SVG.
   return (
     <div className="absolute inset-0 z-0 pointer-events-none overflow-hidden">
       <svg
@@ -610,13 +570,11 @@ function BackgroundGeometry() {
         preserveAspectRatio="none"
         xmlns="http://www.w3.org/2000/svg"
       >
-        {/* Large subtle shapes */}
         <polygon points="0,0 40,0 0,60" fill="var(--brand-light)" opacity="0.3" />
         <polygon points="100,0 100,30 70,0" fill="var(--accent-soft)" opacity="0.5" />
         <polygon points="0,100 30,100 0,70" fill="#e2e8f0" opacity="0.4" />
         <polygon points="100,100 60,100 100,50" fill="var(--brand-light)" opacity="0.2" />
 
-        {/* Floating background triangles */}
         <polygon points="15,20 20,30 10,30" fill="var(--brand)" opacity="0.05" />
         <polygon points="85,40 90,30 80,30" fill="var(--accent)" opacity="0.05" />
         <polygon points="20,80 25,70 15,70" fill="var(--ink)" opacity="0.04" />
@@ -634,7 +592,6 @@ function Hero() {
       <div className="grid grid-cols-1 md:grid-cols-2 gap-8 items-center h-full">
         <div className="relative z-10 flex flex-col justify-center px-6 pb-14 pt-12 sm:px-12 sm:pb-20 sm:pt-16 md:pr-0">
           <div className="mb-6 inline-flex self-start items-center gap-2 rounded-full bg-[var(--brand-light)]/20 px-4 py-2 text-xs font-semibold uppercase tracking-wider text-[var(--brand-light)] backdrop-blur-md border border-[var(--brand-light)]/30">
-          
             Credit Solutions & Business Alliances, Inc.
           </div>
           <h1 className="font-display text-4xl font-extrabold leading-tight sm:text-5xl lg:text-6xl">
@@ -652,6 +609,7 @@ function Hero() {
     </div>
   )
 }
+
 function RouteGraphic() {
   return (
     <div className="relative hidden h-full w-full items-center justify-center overflow-hidden md:flex">
@@ -672,43 +630,6 @@ function RouteGraphic() {
           transform: 'translate(42%, -2%)',
         }}
       />
-    </div>
-  )
-}
-
-function SuccessManifest({ info, onDismiss }) {
-  return (
-    <div className="slide-up relative z-20 mb-10 overflow-hidden rounded-2xl border border-[var(--brand)]/30 bg-white shadow-xl shadow-[var(--brand)]/10">
-      <div className="absolute right-0 top-0 h-full w-32 bg-gradient-to-l from-[var(--brand-light)] to-transparent opacity-50"></div>
-      <div className="flex items-start p-6 sm:p-8 relative z-10">
-        <div className="mr-5 flex h-14 w-14 shrink-0 items-center justify-center rounded-full bg-[var(--brand)] shadow-lg shadow-[var(--brand)]/30">
-          <CheckCircle2 className="h-7 w-7 text-white" />
-        </div>
-        <div className="flex-1">
-          <h3 className="font-display text-xl font-extrabold text-[var(--ink-dark)]">
-            {info.count} Check{info.count === 1 ? '' : 's'} Reserved!
-          </h3>
-          <p className="mt-1 text-base font-medium text-slate-600">
-            Assigned to <span className="font-semibold text-[var(--ink-dark)] bg-[var(--brand-light)]/50 px-2 py-0.5 rounded">{info.collectorName}</span>
-            {info.bank && (
-              <>
-                {' '}from <span className="font-semibold text-[var(--ink-dark)]">{info.bank}</span>
-              </>
-            )}
-            .
-          </p>
-          <div className="mt-4 flex items-center gap-3 rounded-xl bg-[var(--accent-soft)] p-4 text-sm font-semibold text-[var(--accent-dark)] border border-[var(--accent)]/20">
-            <Clock className="h-5 w-5 shrink-0" />
-            Pick up within 1 hour {info.expiresAt ? `(by ${new Date(info.expiresAt).toLocaleTimeString()})` : ''} or the reservation expires.
-          </div>
-        </div>
-        <button
-          onClick={onDismiss}
-          className="ml-4 rounded-full bg-slate-100 p-2.5 text-slate-500 transition hover:bg-slate-200 hover:text-[var(--ink-dark)]"
-        >
-          <X className="h-5 w-5" />
-        </button>
-      </div>
     </div>
   )
 }
@@ -748,8 +669,34 @@ function useCountUp(target, active) {
   return value
 }
 
-function ManifestCountCard({ loading, count, bank, payee, payor }) {
+function ManifestCountCard({ loading, count, branchCounts, bank, payee, payor }) {
   const displayCount = useCountUp(count, !loading)
+
+  // Which branches actually have matching checks, ranked by count.
+  const activeBranchKeys = Object.keys(OFFICES).filter((key) => (branchCounts[key] || 0) > 0)
+
+  // Checks matched by the query but tagged with a branch not in OFFICES
+  // (e.g. new branch added to the DB before the UI was updated for it).
+  const unmappedCount = Math.max(
+    0,
+    count - activeBranchKeys.reduce((sum, key) => sum + (branchCounts[key] || 0), 0)
+  )
+
+  const [selectedBranchKey, setSelectedBranchKey] = useState(null)
+
+  // Keep the selected branch tab in sync with the latest search results:
+  // default to whichever matched branch has the most checks.
+  useEffect(() => {
+    if (activeBranchKeys.length === 0) {
+      setSelectedBranchKey(null)
+      return
+    }
+    const sorted = [...activeBranchKeys].sort(
+      (a, b) => (branchCounts[b] || 0) - (branchCounts[a] || 0)
+    )
+    setSelectedBranchKey(sorted[0])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [count, JSON.stringify(branchCounts)])
 
   if (loading) {
     return (
@@ -790,16 +737,22 @@ function ManifestCountCard({ loading, count, bank, payee, payor }) {
     )
   }
 
-  // "Success" State Graphic
+  const selectedOffice = selectedBranchKey ? OFFICES[selectedBranchKey] : null
+
+  // "Success" State Graphic — flows straight into the pickup-location
+  // section below so the whole thing reads as one continuous surface
+  // rather than stacked cards.
   return (
     <div className="slide-up relative overflow-hidden rounded-2xl bg-white shadow-xl border border-[var(--brand-light)]">
       <div className="absolute top-0 h-1.5 w-full bg-gradient-to-r from-[var(--brand)] to-[var(--accent)]"></div>
 
-      {/* Decorative background blobs */}
+      {/* Decorative background blobs, spread across the full card height */}
       <div className="absolute -left-20 -top-20 h-64 w-64 rounded-full bg-[var(--brand-light)] opacity-40 blur-3xl pointer-events-none"></div>
-      <div className="absolute -right-20 -bottom-20 h-64 w-64 rounded-full bg-[var(--accent-soft)] opacity-40 blur-3xl pointer-events-none"></div>
+      <div className="absolute -right-24 top-1/3 h-72 w-72 rounded-full bg-[var(--accent-soft)] opacity-30 blur-3xl pointer-events-none"></div>
+      <div className="absolute -left-16 bottom-0 h-56 w-56 rounded-full bg-[var(--brand-light)] opacity-30 blur-3xl pointer-events-none"></div>
 
-      <div className="relative z-10 flex flex-col items-center px-6 py-14 text-center">
+      {/* Count + query summary */}
+      <div className="relative z-10 flex flex-col items-center px-6 pt-14 text-center sm:px-8">
         <div className="mb-4 inline-flex items-center gap-2 rounded-full bg-[var(--brand)]/10 px-4 py-1.5 text-xs font-semibold uppercase tracking-widest text-[var(--brand-dark)]">
           <Sparkles className="h-4 w-4" /> Scan successful
         </div>
@@ -814,141 +767,208 @@ function ManifestCountCard({ loading, count, bank, payee, payor }) {
           </span>
         </div>
 
-       <div className="flex flex-col items-center gap-3 mt-2 w-full">
-  <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">Check details</p>
-  <div className="w-full max-w-md grid grid-cols-3 gap-0 rounded-xl bg-slate-50 shadow-inner border border-slate-200 overflow-hidden">
-    <div className="flex flex-col items-center gap-1 px-4 py-4 border-r border-slate-200">
-      <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-        Bank
-      </span>
-      <span className="text-sm font-semibold text-[var(--ink)] text-center break-words">{bank}</span>
+        <div className="flex w-full max-w-lg flex-col items-center gap-3">
+          <div className="grid w-full grid-cols-3 divide-x divide-slate-200 overflow-hidden rounded-xl border border-slate-200 bg-slate-50 shadow-inner">
+            <div className="flex flex-col items-center gap-1.5 px-4 py-4">
+              <span className="flex items-center gap-1 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                <Landmark className="h-3 w-3" /> Bank
+              </span>
+              <span className="text-sm font-semibold text-[var(--ink)] text-center break-words">{bank}</span>
+            </div>
+            <div className="flex flex-col items-center gap-1.5 px-4 py-4">
+              <span className="flex items-center gap-1 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                <MapPin className="h-3 w-3" /> Payee
+              </span>
+              <span className="text-sm font-semibold text-[var(--ink)] text-center break-words">{payee}</span>
+            </div>
+            <div className="flex flex-col items-center gap-1.5 px-4 py-4">
+              <span className="flex items-center gap-1 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                <Search className="h-3 w-3" /> Payor
+              </span>
+              <span className="text-sm font-semibold text-[var(--ink)] text-center break-words">{payor}</span>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5 text-xs font-medium text-slate-400">
+            <Clock className="h-3.5 w-3.5" />
+            Queried {new Date().toLocaleString()}
+          </div>
+        </div>
+      </div>
+
+      {/* Labeled divider — the seam between the count and the pickup info */}
+      <div className="relative z-10 mt-10 px-6 sm:px-8">
+        <div className="h-px w-full bg-gradient-to-r from-transparent via-slate-200 to-transparent"></div>
+        <span className="absolute left-1/2 top-0 inline-flex -translate-x-1/2 -translate-y-1/2 items-center gap-1.5 rounded-full border border-slate-200 bg-white px-4 py-1.5 text-[11px] font-semibold uppercase tracking-widest text-slate-400 shadow-sm">
+          <MapPin className="h-3 w-3 text-[var(--accent)]" /> Where to collect
+        </span>
+      </div>
+
+      {/* Branch switcher — only shown when more than one branch has matches */}
+      {activeBranchKeys.length > 1 && (
+        <div className="relative z-10 mt-8 flex flex-wrap items-center justify-center gap-2 px-6 sm:px-8">
+          {activeBranchKeys.map((key) => {
+            const office = OFFICES[key]
+            const isSelected = key === selectedBranchKey
+            return (
+              <button
+                key={key}
+                type="button"
+                onClick={() => setSelectedBranchKey(key)}
+                aria-pressed={isSelected}
+                className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-sm font-semibold transition-colors ${
+                  isSelected
+                    ? 'border-[var(--brand)] bg-[var(--brand)] text-white shadow-sm'
+                    : 'border-slate-200 bg-white text-slate-600 hover:border-[var(--brand-light)] hover:text-[var(--brand-dark)]'
+                }`}
+              >
+                <Building2 className="h-3.5 w-3.5" />
+                {office.shortLabel}
+                <span
+                  className={`rounded-full px-2 py-0.5 text-xs font-bold tabular-nums ${
+                    isSelected ? 'bg-white/20 text-white' : 'bg-slate-100 text-slate-500'
+                  }`}
+                >
+                  {branchCounts[key] || 0}
+                </span>
+              </button>
+            )
+          })}
+        </div>
+      )}
+
+      {/* Pickup location + interactive map */}
+      {selectedOffice ? (
+        <OfficeDetails office={selectedOffice} />
+      ) : (
+        <UnmappedBranchNotice count={unmappedCount} />
+      )}
+
+      {unmappedCount > 0 && selectedOffice && (
+        <div className="relative z-10 mx-6 mb-8 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs font-medium text-amber-700 sm:mx-8">
+          {unmappedCount} of your {count} matching {unmappedCount === 1 ? 'check is' : 'checks are'} at a branch not
+          shown here — please contact CSBA for pickup details on those.
+        </div>
+      )}
     </div>
-    <div className="flex flex-col items-center gap-1 px-4 py-4 border-r border-slate-200">
-      <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-       
-        Payee
-      </span>
-      <span className="text-sm font-semibold text-[var(--ink)] text-center break-words">{payee}</span>
-    </div>
-    <div className="flex flex-col items-center gap-1 px-4 py-4">
-      <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-     
-        Payor
-      </span>
-      <span className="text-sm font-semibold text-[var(--ink)] text-center break-words">{payor}</span>
-    </div>
-  </div>
-  <div className="flex items-center gap-1.5 text-xs font-medium text-slate-400">
-    <Clock className="h-3.5 w-3.5" />
-    Queried {new Date().toLocaleString()}
-  </div>
-</div>
+  )
+}
+
+function OfficeDetails({ office }) {
+  const streetViewSrc = getStreetViewSrc(office)
+  const hasStreetView = Boolean(streetViewSrc)
+  const [mapView, setMapView] = useState(hasStreetView ? 'street' : 'map')
+
+  // If the selected office changes and (in the edge case of missing
+  // coordinates) has no street view available, make sure we're never stuck
+  // showing a stale/blank "street" tab.
+  useEffect(() => {
+    if (!hasStreetView && mapView === 'street') {
+      setMapView('map')
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [office, hasStreetView])
+
+  const mapSrc = getMapSrc(office)
+  const directionsUrl = getDirectionsUrl(office)
+
+  return (
+    <div className="relative z-10 grid grid-cols-1 gap-8 px-6 pb-8 pt-9 text-left sm:grid-cols-5 sm:gap-10 sm:px-8 sm:pb-10">
+      <div className="flex flex-col justify-center sm:col-span-2">
+        <div className="flex items-center gap-2">
+          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-[var(--brand)]/10 text-[var(--brand-dark)]">
+            <Building2 className="h-4.5 w-4.5" />
+          </span>
+          <h3 className="font-display text-xl font-extrabold text-[var(--ink-dark)]">{office.label}</h3>
+        </div>
+        <p className="mt-4 text-[15px] font-medium leading-relaxed text-slate-600">
+          {office.address.line1}
+          <br />
+          {office.address.line2}
+          <br />
+          {office.address.line3}
+          <br />
+          {office.address.line4}
+        </p>
+
+        <a
+          href={directionsUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="group mt-6 inline-flex w-fit items-center justify-center gap-2 rounded-xl bg-[var(--accent)] px-6 py-3.5 text-sm font-semibold text-white shadow-lg shadow-[var(--accent)]/30 transition-all hover:-translate-y-0.5 hover:bg-[var(--accent-dark)] hover:shadow-[var(--accent)]/50"
+        >
+          <Navigation className="h-4 w-4" />
+          Get directions
+          <ExternalLink className="h-3.5 w-3.5 opacity-70 transition-transform group-hover:translate-x-0.5" />
+        </a>
+      </div>
+
+      <div className="sm:col-span-3">
+        {/* View switcher — Street view tab only renders when the office has
+            a real panorama configured, so we never show a broken embed. */}
+        <div className="mb-3 inline-flex rounded-lg bg-slate-100 p-1">
+          {hasStreetView && (
+            <button
+              type="button"
+              onClick={() => setMapView('street')}
+              aria-pressed={mapView === 'street'}
+              className={`rounded-md px-4 py-2 text-xs font-semibold uppercase tracking-wide transition-colors ${
+                mapView === 'street'
+                  ? 'bg-white text-[var(--brand-dark)] shadow-sm'
+                  : 'text-slate-500 hover:text-[var(--ink)]'
+              }`}
+            >
+              Street view
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => setMapView('map')}
+            aria-pressed={mapView === 'map'}
+            className={`rounded-md px-4 py-2 text-xs font-semibold uppercase tracking-wide transition-colors ${
+              mapView === 'map'
+                ? 'bg-white text-[var(--brand-dark)] shadow-sm'
+                : 'text-slate-500 hover:text-[var(--ink)]'
+            }`}
+          >
+            Map
+          </button>
+        </div>
+
+        <div className="map-frame-wrap relative w-full overflow-hidden rounded-2xl border border-slate-200 shadow-md">
+          <iframe
+            key={`${office.label}-${mapView}`}
+            title={mapView === 'street' ? `Street view of CSBA ${office.label}` : `Map location of CSBA ${office.label}`}
+            src={mapView === 'street' ? streetViewSrc : mapSrc}
+            className="absolute inset-0 h-full w-full border-0"
+            loading="lazy"
+            referrerPolicy="no-referrer-when-downgrade"
+            allowFullScreen
+          />
+          <div className="pointer-events-none absolute inset-0 rounded-2xl ring-1 ring-inset ring-black/5"></div>
+
+          <div className="pointer-events-none absolute left-3 top-3 flex items-center gap-1.5 rounded-full bg-white/90 px-3 py-1.5 text-[11px] font-semibold text-[var(--brand-dark)] shadow-sm backdrop-blur">
+            <span className="relative flex h-2 w-2">
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[var(--brand)] opacity-60"></span>
+              <span className="relative inline-flex h-2 w-2 rounded-full bg-[var(--brand)]"></span>
+            </span>
+            {mapView === 'street' ? 'Street view — actual building' : 'Exact location — no other pins'}
+          </div>
+        </div>
       </div>
     </div>
   )
 }
-function ConfirmModal({ count, bank, payee, payor, collectorName, onCollectorNameChange, onCancel, onConfirm, reserving, error }) {
+
+function UnmappedBranchNotice({ count }) {
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-[var(--ink-dark)]/70 p-4 backdrop-blur-sm">
-      <div className="slide-up flex w-full max-w-md flex-col overflow-hidden rounded-2xl bg-white shadow-2xl border border-white/20 relative">
-
-        {/* Top Header Accent Line */}
-        <div className="h-1.5 w-full bg-gradient-to-r from-[var(--brand)] to-[var(--accent)]"></div>
-
-        {/* Modal Header */}
-        <div className="px-8 py-6 text-center border-b border-slate-100 relative overflow-hidden bg-white">
-          <svg className="absolute top-0 right-0 w-32 h-32 text-[var(--brand-light)] opacity-30 pointer-events-none" viewBox="0 0 100 100" fill="currentColor">
-            <polygon points="100,0 100,100 0,0" />
-          </svg>
-          <h2 className="font-display text-2xl font-extrabold text-[var(--ink-dark)] relative z-10">Confirm reservation</h2>
-          <p className="mt-2 text-sm text-slate-500 font-medium relative z-10">
-            You are about to secure these items for exactly 1 hour.
-          </p>
-        </div>
-
-        {/* Modal Body */}
-        <div className="px-8 py-8 bg-slate-50">
-          {/* Summary card: count + bank/payee/payor + timestamp */}
-          <div className="mb-8 overflow-hidden rounded-2xl bg-white shadow-sm border border-slate-200 relative">
-            <div className="absolute -left-6 -top-6 h-20 w-20 rounded-full bg-[var(--brand-light)]/50 blur-xl pointer-events-none"></div>
-            <div className="absolute -right-6 -top-6 h-20 w-20 rounded-full bg-[var(--accent-soft)]/50 blur-xl pointer-events-none"></div>
-
-            <div className="relative z-10 flex flex-col items-center pt-6 pb-5">
-              <span className="text-xs font-semibold uppercase tracking-widest text-slate-400 mb-1">Total checks to claim</span>
-              <span className="font-display text-5xl font-extrabold text-[var(--brand)]">{count}</span>
-            </div>
-
-            <div className="relative z-10 grid grid-cols-3 border-t border-slate-100">
-              <div className="flex flex-col items-center gap-1 px-3 py-4 border-r border-slate-100">
-                <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-                  Bank
-                </span>
-                <span className="text-sm font-semibold text-[var(--ink)] text-center break-words">{bank}</span>
-              </div>
-              <div className="flex flex-col items-center gap-1 px-3 py-4 border-r border-slate-100">
-                <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-            
-                  Payee
-                </span>
-                <span className="text-sm font-semibold text-[var(--ink)] text-center break-words">{payee}</span>
-              </div>
-              <div className="flex flex-col items-center gap-1 px-3 py-4">
-                <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-               
-                  Payor
-                </span>
-                <span className="text-sm font-semibold text-[var(--ink)] text-center break-words">{payor}</span>
-              </div>
-            </div>
-
-            <div className="relative z-10 flex items-center justify-center gap-1.5 border-t border-slate-100 bg-slate-50/60 py-2.5 text-xs font-medium text-slate-400">
-              <Clock className="h-3.5 w-3.5" />
-              Reserving on {new Date().toLocaleString(undefined, {
-                dateStyle: 'medium',
-                timeStyle: 'short',
-              })}
-            </div>
-          </div>
-
-          <div className="space-y-3">
-            <label className="block text-center text-xs font-semibold uppercase tracking-widest text-[var(--ink)]/60">
-              Enter Collector's Full name
-            </label>
-            <Input
-              value={collectorName}
-              onChange={(e) => onCollectorNameChange(e.target.value)}
-              placeholder="e.g. John Doe"
-              className="text-center text-lg font-semibold h-16 rounded-2xl border-slate-200 bg-white shadow-sm focus-visible:ring-2 focus-visible:ring-[var(--brand)] focus-visible:border-[var(--brand)] transition-all"
-              autoFocus
-            />
-          </div>
-
-          {error && (
-            <p className="mt-4 flex items-center justify-center gap-2 rounded-lg bg-red-50 p-3 text-sm font-semibold text-red-600 border border-red-100 scale-in text-center">
-              <X className="h-5 w-5 shrink-0"/> {error}
-            </p>
-          )}
-        </div>
-
-        {/* Modal Actions */}
-        <div className="flex flex-col gap-3 px-8 py-6 bg-white border-t border-slate-100">
-          <button
-            onClick={onConfirm}
-            disabled={reserving}
-            className="flex w-full items-center justify-center gap-2 rounded-xl bg-[var(--accent)] hover:bg-[var(--accent-dark)] py-4 text-lg font-semibold text-white shadow-lg shadow-[var(--accent)]/40 transition-all hover:-translate-y-0.5 disabled:transform-none disabled:opacity-60"
-          >
-            {reserving ? <Loader2 className="h-5 w-5 animate-spin" /> : <CheckCircle2 className="h-6 w-6" />}
-            Confirm pickup
-          </button>
-          <button
-            onClick={onCancel}
-            disabled={reserving}
-            className="w-full bg-transparent py-3 text-sm font-semibold text-slate-500 transition-colors hover:text-[var(--ink-dark)] disabled:opacity-50"
-          >
-            Cancel
-          </button>
-        </div>
+    <div className="relative z-10 flex flex-col items-center gap-3 px-6 py-12 text-center sm:px-8">
+      <div className="flex h-14 w-14 items-center justify-center rounded-full bg-amber-50 text-amber-500 border border-amber-200">
+        <Building2 className="h-6 w-6" />
       </div>
+      <p className="max-w-sm text-sm font-medium text-slate-500">
+        {count} matching {count === 1 ? 'check is' : 'checks are'} held at a branch we don't have pickup details for
+        yet. Please contact CSBA directly to arrange collection.
+      </p>
     </div>
   )
 }

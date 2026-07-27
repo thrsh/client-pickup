@@ -80,6 +80,19 @@
 //   history including approvals and returns. Doing the two fetches by
 //   hand and merging client-side removes that dependency entirely.
 //
+// PICKUP BRANCH NOTE (added):
+//   checks.pickup_branch identifies which CSBA office a check is meant to
+//   be collected from (e.g. "CSBA - PARQAL", "CSBA - BGC"). This is
+//   informational/filterable here, same treatment as `bank`: selected
+//   alongside the other check columns, displayed as a small badge next
+//   to the Bank badge in every tab's table AND in the submit/recall
+//   modal's per-check cards, filterable via the same `checks!inner` +
+//   `.eq()` technique already used for bankFilter (see the load()
+//   comments below), and included in CSV export. PICKUP_BRANCHES below
+//   is the single source of truth for known branch values/labels — keep
+//   it in sync with the OFFICES config in the public-facing
+//   PublicSearch.jsx if a new branch is added there.
+//
 // Requires migration_approval_workflow.sql AND migration_return_tracking.sql
 // to have been run first. Together they provide, at minimum:
 //   - checks.status extended with 'pending_approval' and 'returned'
@@ -143,6 +156,7 @@ import {
   Landmark,
   ClipboardList,
   ReceiptText,
+  Building2,
 } from 'lucide-react'
 import { supabase } from '../../lib/supabaseClient'
 import { Input } from '../../components/ui/input'
@@ -169,6 +183,15 @@ const PENDING_CRITICAL_MINUTES = 240
 // is captured alongside the number and folded into that single column by
 // composeReceiptNo() below rather than requiring a new migration.
 const RECEIPT_TYPES = ['PR', 'AR', 'OR']
+
+// Known pickup branches — see the PICKUP BRANCH NOTE at the top of this
+// file. `value` must match checks.pickup_branch exactly (case-sensitive).
+// Keep this in sync with the OFFICES config in PublicSearch.jsx.
+const PICKUP_BRANCHES = [
+  { value: 'CSBA - PARQAL', label: 'Parañaque' },
+  { value: 'CSBA - BGC', label: 'Taguig / BGC' },
+]
+const PICKUP_BRANCH_LABELS = Object.fromEntries(PICKUP_BRANCHES.map((b) => [b.value, b.label]))
 
 // Check-level statuses that belong in the Active tab. A check that has
 // been approved (picked_up), is awaiting approval (pending_approval), or
@@ -243,6 +266,7 @@ function lineItems(reservation, tab) {
           checkId: c.id,
           row_number: c.row_number,
           bank: c.bank,
+          pickupBranch: c.pickup_branch,
           payee: c.payee,
           payor: c.payor,
           check_no: c.check_no,
@@ -272,6 +296,7 @@ function lineItems(reservation, tab) {
     checkId: c.id,
     row_number: c.row_number,
     bank: c.bank,
+    pickupBranch: c.pickup_branch,
     payee: c.payee,
     payor: c.payor,
     check_no: c.check_no,
@@ -393,6 +418,7 @@ export default function AdminPickups() {
   const [loadError, setLoadError] = useState('')
   const [collectorFilter, setCollectorFilter] = useState('')
   const [bankFilter, setBankFilter] = useState('')
+  const [branchFilter, setBranchFilter] = useState('')
   const [checkSearch, setCheckSearch] = useState('')
   const [quickFilter, setQuickFilter] = useState('all') // 'all' | 'expiring' | 'stale' | 'returned' | history outcome keys
   const [sortBy, setSortBy] = useState('expires_asc')
@@ -440,13 +466,13 @@ export default function AdminPickups() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab])
 
-  // Debounced re-fetch when the collector or bank filter changes
+  // Debounced re-fetch when the collector, bank, or branch filter changes
   useEffect(() => {
     clearTimeout(debounceRef.current)
     debounceRef.current = setTimeout(() => load(false), 250)
     return () => clearTimeout(debounceRef.current)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [collectorFilter, bankFilter])
+  }, [collectorFilter, bankFilter, branchFilter])
 
   // Keep countdowns/wait-timers live and periodically pull fresh data
   // (also catches reservations that expired naturally, or got decided by
@@ -522,29 +548,31 @@ export default function AdminPickups() {
         // CHECK-STATUS NOTE) — without `status` here there would be no way
         // to tell a plain reserved check apart from one an approver just
         // returned for correction, or to keep an already-approved check
-        // from wrongly reappearing here. Both tabs also select `bank` so
-        // the check's issuing bank can be shown/filtered here without a
-        // second round trip. Pending Approval additionally pulls the OR
-        // no. / AR collected / remarks / submitted_at the admin entered
-        // when submitting. History fetches the audit log separately below
-        // — see the HISTORY-TAB DATA NOTE at the top of this file for why.
+        // from wrongly reappearing here. Both tabs also select `bank` and
+        // `pickup_branch` so the check's issuing bank and pickup branch can
+        // be shown/filtered here without a second round trip. Pending
+        // Approval additionally pulls the OR no. / AR collected / remarks
+        // / submitted_at the admin entered when submitting. History
+        // fetches the audit log separately below — see the HISTORY-TAB
+        // DATA NOTE at the top of this file for why.
         //
-        // When a bank filter is active, the embedded `checks` resource is
-        // aliased with `!inner` instead of a plain left embed. PostgREST
-        // treats a bare `checks(...)` embed as a LEFT join — filtering it
-        // with `.eq('checks.bank', ...)` only trims which child rows come
-        // back, it does NOT exclude parent reservations that simply have
-        // no checks from that bank (they'd still show up with an empty
-        // checks array). `checks!inner(...)` makes it an INNER join, so
-        // `.eq('checks.bank', ...)` below actually restricts which
+        // When a bank or branch filter is active, the embedded `checks`
+        // resource is aliased with `!inner` instead of a plain left embed.
+        // PostgREST treats a bare `checks(...)` embed as a LEFT join —
+        // filtering it with `.eq('checks.bank', ...)` only trims which
+        // child rows come back, it does NOT exclude parent reservations
+        // that simply have no checks matching the filter (they'd still
+        // show up with an empty checks array). `checks!inner(...)` makes
+        // it an INNER join, so `.eq(...)` below actually restricts which
         // reservations are returned at all, not just which of their
         // checks are embedded.
-        const checksJoin = bankFilter && tab !== 'history' ? 'checks!inner' : 'checks'
+        const needsInnerJoin = (bankFilter || branchFilter) && tab !== 'history'
+        const checksJoin = needsInnerJoin ? 'checks!inner' : 'checks'
         const selectClause =
           tab === 'active'
-            ? `id, collector_name, status, reserved_at, expires_at, picked_up_at, ${checksJoin}(id, row_number, bank, payee, payor, check_no, check_date, amount, status, return_reason, returned_at, returned_by_name)`
+            ? `id, collector_name, status, reserved_at, expires_at, picked_up_at, ${checksJoin}(id, row_number, bank, pickup_branch, payee, payor, check_no, check_date, amount, status, return_reason, returned_at, returned_by_name)`
             : tab === 'pending_approval'
-            ? `id, collector_name, status, reserved_at, expires_at, ${checksJoin}(id, row_number, bank, payee, payor, check_no, check_date, amount, or_no, ar_collected, attached_2307, remarks, submitted_at, submitted_by_name)`
+            ? `id, collector_name, status, reserved_at, expires_at, ${checksJoin}(id, row_number, bank, pickup_branch, payee, payor, check_no, check_date, amount, or_no, ar_collected, attached_2307, remarks, submitted_at, submitted_by_name)`
             : 'id, collector_name, status, reserved_at, expires_at, picked_up_at'
 
         let req = supabase
@@ -559,17 +587,21 @@ export default function AdminPickups() {
           req = req.ilike('collector_name', `%${trimmedFilter}%`)
         }
 
-        // With `checksJoin` set to `checks!inner` above whenever a bank
-        // filter is active, this `.eq()` does two things at once: it
-        // restricts which pickup_reservations rows come back at all (only
-        // ones with ≥1 matching check survive the inner join), AND it
-        // trims the embedded `checks` array down to just the matching
-        // checks — so the table only ever renders checks from the
-        // selected bank. History doesn't embed checks in this query at
-        // all (its checks come from a separate lookup below), so its bank
-        // filter is applied client-side after that data is merged.
+        // With `checksJoin` set to `checks!inner` above whenever a bank or
+        // branch filter is active, these `.eq()` calls do two things at
+        // once: they restrict which pickup_reservations rows come back at
+        // all (only ones with ≥1 matching check survive the inner join),
+        // AND they trim the embedded `checks` array down to just the
+        // matching checks — so the table only ever renders checks from
+        // the selected bank/branch. History doesn't embed checks in this
+        // query at all (its checks come from a separate lookup below), so
+        // its bank/branch filters are applied client-side after that data
+        // is merged.
         if (bankFilter && tab !== 'history') {
           req = req.eq('checks.bank', bankFilter)
+        }
+        if (branchFilter && tab !== 'history') {
+          req = req.eq('checks.pickup_branch', branchFilter)
         }
 
         const { data, error } = await req
@@ -608,11 +640,17 @@ export default function AdminPickups() {
         // combo already does the real filtering server-side, but
         // re-filtering client-side means a future change to the select
         // clause (e.g. someone drops the `!inner`) can't silently regress
-        // into showing checks from the wrong bank.
+        // into showing checks from the wrong bank or branch.
         if (bankFilter && tab !== 'history') {
           rows = rows.map((r) => ({
             ...r,
             checks: (Array.isArray(r.checks) ? r.checks : []).filter((c) => c.bank === bankFilter),
+          }))
+        }
+        if (branchFilter && tab !== 'history') {
+          rows = rows.map((r) => ({
+            ...r,
+            checks: (Array.isArray(r.checks) ? r.checks : []).filter((c) => c.pickup_branch === branchFilter),
           }))
         }
 
@@ -644,7 +682,7 @@ export default function AdminPickups() {
             if (checkIds.length > 0) {
               const { data: checksData, error: checksError } = await supabase
                 .from('checks')
-                .select('id, row_number, bank, payee, payor, check_no, check_date, amount')
+                .select('id, row_number, bank, pickup_branch, payee, payor, check_no, check_date, amount')
                 .in('id', checkIds)
 
               if (!isMountedRef.current || requestId !== requestIdRef.current) return
@@ -667,17 +705,22 @@ export default function AdminPickups() {
             })
             rows = rows.map((r) => ({ ...r, activity: byReservation.get(r.id) || [] }))
 
-            // History's bank filter is applied here, client-side, since the
-            // checks for this tab come from the separate lookup above
-            // rather than an embed the query itself can filter on. A
+            // History's bank/branch filters are applied here, client-side,
+            // since the checks for this tab come from the separate lookup
+            // above rather than an embed the query itself can filter on. A
             // reservation is kept only if at least one of its logged
-            // checks matches the selected bank; lineItems()/matchesCheckSearch
-            // will still only ever *display* checks matching whatever the
-            // bank column says, so this just controls which orders appear
-            // at all.
+            // checks matches the selected bank/branch; lineItems()/
+            // matchesCheckSearch will still only ever *display* checks
+            // matching whatever the bank/pickup_branch columns say, so
+            // this just controls which orders appear at all.
             if (bankFilter) {
               rows = rows.filter((r) =>
                 (r.activity || []).some((a) => a.checks && a.checks.bank === bankFilter)
+              )
+            }
+            if (branchFilter) {
+              rows = rows.filter((r) =>
+                (r.activity || []).some((a) => a.checks && a.checks.pickup_branch === branchFilter)
               )
             }
           }
@@ -705,7 +748,7 @@ export default function AdminPickups() {
         inFlightRef.current = false
       }
     },
-    [tab, collectorFilter, bankFilter]
+    [tab, collectorFilter, bankFilter, branchFilter]
   )
 
   function minutesLeft(expiresAt) {
@@ -755,9 +798,9 @@ export default function AdminPickups() {
     return 'normal'
   }
 
-  // Combines the (already server-filtered-by-collector/bank) list with the
-  // client-side check search, the quick filter (expiring / stale / returned
-  // / history outcome depending on tab), and sort.
+  // Combines the (already server-filtered-by-collector/bank/branch) list
+  // with the client-side check search, the quick filter (expiring / stale
+  // / returned / history outcome depending on tab), and sort.
   const visibleReservations = useMemo(() => {
     const term = checkSearch.trim()
     let list = reservations.filter((r) => matchesCheckSearch(sortedLineItems(r, tab), term))
@@ -1184,12 +1227,12 @@ export default function AdminPickups() {
     const isPending = tab === 'pending_approval'
     const isActive = tab === 'active'
     const headers = isHistory
-      ? ['Collector', 'Status', 'Reserved at', 'Resolved at', 'Bank', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount', 'Outcome', 'OR no.', 'AR collected', '2307 Attached', 'Remarks']
+      ? ['Collector', 'Status', 'Reserved at', 'Resolved at', 'Bank', 'Pickup branch', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount', 'Outcome', 'OR no.', 'AR collected', '2307 Attached', 'Remarks']
       : isPending
-      ? ['Collector', 'Status', 'Reserved at', 'Bank', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount', 'OR no.', 'AR collected', '2307 Attached', 'Remarks', 'Submitted by', 'Submitted at']
+      ? ['Collector', 'Status', 'Reserved at', 'Bank', 'Pickup branch', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount', 'OR no.', 'AR collected', '2307 Attached', 'Remarks', 'Submitted by', 'Submitted at']
       : isActive
-      ? ['Collector', 'Status', 'Reserved at', 'Bank', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount', 'Check status', 'Return reason', 'Returned by', 'Returned at']
-      : ['Collector', 'Status', 'Reserved at', 'Bank', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount']
+      ? ['Collector', 'Status', 'Reserved at', 'Bank', 'Pickup branch', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount', 'Check status', 'Return reason', 'Returned by', 'Returned at']
+      : ['Collector', 'Status', 'Reserved at', 'Bank', 'Pickup branch', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount']
 
     const rows = [headers]
     visibleReservations.forEach((r) => {
@@ -1197,16 +1240,17 @@ export default function AdminPickups() {
       if (items.length === 0) {
         rows.push(
           isHistory
-            ? [r.collector_name || '', r.status || '', r.reserved_at || '', r.picked_up_at || '', '', '', '', '', '', '', '', '', '', '', '']
+            ? [r.collector_name || '', r.status || '', r.reserved_at || '', r.picked_up_at || '', '', '', '', '', '', '', '', '', '', '', '', '']
             : isPending
-            ? [r.collector_name || '', r.status || '', r.reserved_at || '', '', '', '', '', '', '', '', '', '', '', '', '']
+            ? [r.collector_name || '', r.status || '', r.reserved_at || '', '', '', '', '', '', '', '', '', '', '', '', '', '']
             : isActive
-            ? [r.collector_name || '', r.status || '', r.reserved_at || '', '', '', '', '', '', '', '', '', '', '']
-            : [r.collector_name || '', r.status || '', r.reserved_at || '', '', '', '', '', '', '']
+            ? [r.collector_name || '', r.status || '', r.reserved_at || '', '', '', '', '', '', '', '', '', '', '', '']
+            : [r.collector_name || '', r.status || '', r.reserved_at || '', '', '', '', '', '', '', '']
         )
         return
       }
       items.forEach((c) => {
+        const branchLabel = PICKUP_BRANCH_LABELS[c.pickupBranch] || c.pickupBranch || ''
         rows.push(
           isHistory
             ? [
@@ -1215,6 +1259,7 @@ export default function AdminPickups() {
                 r.reserved_at || '',
                 r.picked_up_at || '',
                 c.bank || '',
+                branchLabel,
                 c.check_no || '',
                 c.payee || '',
                 c.payor || '',
@@ -1232,6 +1277,7 @@ export default function AdminPickups() {
                 r.status || '',
                 r.reserved_at || '',
                 c.bank || '',
+                branchLabel,
                 c.check_no || '',
                 c.payee || '',
                 c.payor || '',
@@ -1250,6 +1296,7 @@ export default function AdminPickups() {
                 r.status || '',
                 r.reserved_at || '',
                 c.bank || '',
+                branchLabel,
                 c.check_no || '',
                 c.payee || '',
                 c.payor || '',
@@ -1265,6 +1312,7 @@ export default function AdminPickups() {
                 r.status || '',
                 r.reserved_at || '',
                 c.bank || '',
+                branchLabel,
                 c.check_no || '',
                 c.payee || '',
                 c.payor || '',
@@ -1567,6 +1615,23 @@ export default function AdminPickups() {
           </select>
         </div>
 
+        <div className="relative shrink-0 sm:w-48">
+          <Building2 className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-ink-300" />
+          <select
+            value={branchFilter}
+            onChange={(e) => setBranchFilter(e.target.value)}
+            aria-label="Filter by pickup branch"
+            className="w-full rounded-md border border-ink-200 bg-white py-2 pl-9 pr-8 text-sm text-ink-700 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-teal-500"
+          >
+            <option value="">All branches</option>
+            {PICKUP_BRANCHES.map((b) => (
+              <option key={b.value} value={b.value}>
+                {b.label}
+              </option>
+            ))}
+          </select>
+        </div>
+
         <div className="relative flex-1">
           <Filter className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-ink-300" />
           <Input
@@ -1673,7 +1738,7 @@ export default function AdminPickups() {
       ) : visibleReservations.length === 0 ? (
         <EmptyState
           tab={tab}
-          hasFilter={!!collectorFilter.trim() || !!bankFilter || !!checkSearch.trim() || quickFilter !== 'all'}
+          hasFilter={!!collectorFilter.trim() || !!bankFilter || !!branchFilter || !!checkSearch.trim() || quickFilter !== 'all'}
         />
       ) : (
         <div className="space-y-2.5">
@@ -1926,6 +1991,35 @@ function BankBadge({ bank }) {
   )
 }
 
+// Small pill for which CSBA branch a check is meant to be picked up from —
+// same visual treatment as BankBadge (dashed "Unknown" fallback, truncated
+// label with a title tooltip) but in a distinct color so Bank and Branch
+// are never confused at a glance. Unmapped values (a pickup_branch on the
+// row that isn't in PICKUP_BRANCHES) still render using the raw stored
+// string rather than falling back to "Unknown" — an admin needs to see
+// exactly what's in the database even if this file's label map hasn't
+// been updated for a newly added branch yet.
+function BranchBadge({ branch }) {
+  if (!branch) {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full border border-dashed border-ink-200 px-2 py-0.5 text-[11px] font-medium text-ink-400">
+        <Building2 className="h-3 w-3" />
+        Unknown
+      </span>
+    )
+  }
+  const label = PICKUP_BRANCH_LABELS[branch] || branch
+  return (
+    <span
+      className="inline-flex max-w-[150px] items-center gap-1 truncate rounded-full bg-sky-50 px-2 py-0.5 text-[11px] font-medium text-sky-700"
+      title={label}
+    >
+      <Building2 className="h-3 w-3 shrink-0" />
+      <span className="truncate">{label}</span>
+    </span>
+  )
+}
+
 function OutcomeBadge({ outcome }) {
   if (outcome === 'picked_up' || outcome === 'approved') {
     return (
@@ -1956,6 +2050,14 @@ function OutcomeBadge({ outcome }) {
       <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-700">
         <RotateCcw className="h-3 w-3" />
         Returned for correction
+      </span>
+    )
+  }
+  if (outcome === 'recalled') {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full bg-orange-100 px-2 py-0.5 text-[11px] font-medium text-orange-700">
+        <Undo2 className="h-3 w-3" />
+        Recalled for correction
       </span>
     )
   }
@@ -2120,6 +2222,7 @@ function ReservationRow({
                   <tr className="border-b border-ink-50 text-left text-[11px] uppercase tracking-wide text-ink-400">
                     <th className="px-4 py-2 font-medium">#</th>
                     <th className="px-2 py-2 font-medium">Bank</th>
+                    <th className="px-2 py-2 font-medium">Branch</th>
                     <th className="px-2 py-2 font-medium">Check no.</th>
                     <th className="px-2 py-2 font-medium">Payee</th>
                     <th className="px-2 py-2 font-medium">Payor</th>
@@ -2149,6 +2252,9 @@ function ReservationRow({
                       <td className="px-4 py-2.5 font-mono text-xs text-ink-400">{idx + 1}</td>
                       <td className="px-2 py-2.5">
                         <BankBadge bank={c.bank} />
+                      </td>
+                      <td className="px-2 py-2.5">
+                        <BranchBadge branch={c.pickupBranch} />
                       </td>
                       <td className="px-2 py-2.5 font-mono text-xs text-ink-700">
                         <span className="flex items-center gap-1">
@@ -2263,7 +2369,7 @@ function ReservationRow({
                 </tbody>
                 <tfoot>
                   <tr className="border-t border-ink-100 bg-ink-50/40">
-                    <td colSpan={6} className="px-4 py-2 text-right text-xs font-medium text-ink-500">
+                    <td colSpan={7} className="px-4 py-2 text-right text-xs font-medium text-ink-500">
                       Order total
                     </td>
                     <td className="px-4 py-2 text-right font-mono font-semibold text-ink-900">
@@ -2758,6 +2864,7 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
                           </button>
                           <div className="h-6 w-px bg-ink-100" />
                           <BankBadge bank={c.bank} />
+                          <BranchBadge branch={c.pickupBranch} />
                           <div>
                             <p className="text-sm font-semibold text-ink-900">{c.payee || '—'}</p>
                             <p className="font-mono text-[11px] text-ink-400">
@@ -2941,6 +3048,7 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
                   >
                     <div className="flex items-center gap-3">
                       <BankBadge bank={c.bank} />
+                      <BranchBadge branch={c.pickupBranch} />
                       <div>
                         <p className="text-sm font-semibold text-ink-900">{c.payee || '—'}</p>
                         <p className="font-mono text-[11px] text-ink-400">

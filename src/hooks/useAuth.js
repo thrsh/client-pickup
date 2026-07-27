@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 import { supabase } from '../lib/supabaseClient'
+import { recordLogout } from '../lib/adminAuditApi'
 
 export function useAuth() {
   const [session, setSession] = useState(null)
@@ -18,5 +19,16 @@ export function useAuth() {
     return () => listener.subscription.unsubscribe()
   }, [])
 
-  return { session, loading, user: session?.user ?? null }
+  // Centralized so every sign-out path (AdminLayout, Navbar, anywhere else)
+  // goes through the same audit-logging + supabase.auth.signOut() sequence,
+  // in the right order: record BEFORE the session is torn down, never after.
+  const signOut = useCallback(async () => {
+    const userId = session?.user?.id
+    if (userId) {
+      await recordLogout(userId).catch(() => {})
+    }
+    await supabase.auth.signOut()
+  }, [session])
+
+  return { session, loading, user: session?.user ?? null, signOut }
 }

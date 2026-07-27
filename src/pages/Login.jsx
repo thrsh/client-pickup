@@ -23,6 +23,7 @@ import { Input } from '../components/ui/input'
 import { Button } from '../components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '../components/ui/card'
 import { cn } from '../lib/utils'
+import { recordLogin } from '../lib/adminAuditApi'
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const OTP_LENGTH = 6
@@ -300,7 +301,9 @@ export default function Login() {
 
   // Step 1: verify password. On success, immediately drop the session
   // (signInWithPassword grants a live session token) and require a fresh
-  // OTP before treating the user as authenticated.
+  // OTP before treating the user as authenticated. NOTE: this session is
+  // deliberately thrown away, so it is NOT logged as a login — the real
+  // login is recorded in submitOtp below, once OTP verification succeeds.
   async function handleSubmit(e) {
     e.preventDefault()
 
@@ -368,7 +371,8 @@ export default function Login() {
     setMode('otp')
   }
 
-  // Step 2: verify the 6-digit code. This is what actually establishes the session.
+  // Step 2: verify the 6-digit code. This is what actually establishes the
+  // session — so this is where the login gets recorded, not handleSubmit.
   async function submitOtp(code) {
     if (!/^\d{6}$/.test(code)) {
       setOtpError('Enter the 6-digit code.')
@@ -410,6 +414,15 @@ export default function Login() {
     clearOtpResendState(trimmedEmail)
 
     const { data: { user } } = await supabase.auth.getUser()
+
+    // Real login happens HERE — the password-check session in handleSubmit
+    // above gets torn down immediately and never counts. Fire-and-forget:
+    // a failed audit write should never block someone from getting into
+    // their account.
+    if (user?.id) {
+      recordLogin(user.id).catch(() => {})
+    }
+
     const { data: profile, error: profileError } = await supabase
       .from('profiles')
       .select('role')

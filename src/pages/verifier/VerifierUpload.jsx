@@ -32,14 +32,52 @@ import { Card, CardContent } from '../../components/ui/card'
 import { Select } from '../../components/ui/select'
 import { useToast } from '../../components/ui/toast'
 import { normalizeDate, formatCurrency, cn } from '../../lib/utils'
+import { logAuditEvent } from '../../lib/adminAuditApi'
 
-const REQUIRED_FIELDS = [
-  { key: 'payee', label: 'Payee' },
-  { key: 'payor', label: 'Payor' },
-  { key: 'check_no', label: 'Check No' },
-  { key: 'check_date', label: 'Check Date' },
-  { key: 'amount', label: 'Amount' },
+// ----------------------------------------------------------------------------
+// Field configuration. Toggle EXTRA_FIELDS_REQUIRED to `true` the day
+// Client Ref No / Pickup Branch / Account Number become mandatory for every
+// upload — mappingComplete, the red-asterisk markers, and the missing-value
+// flags all read from FIELD_DEFS[...].required, so this is the ONLY line
+// that needs to change to make that switch.
+//
+// CORE_FIELDS vs EXTRA_FIELDS is a SEPARATE split from required/optional —
+// it controls table STRUCTURE (which dedicated columns exist), not
+// validation. This is deliberate: if EXTRA_FIELDS_REQUIRED flips to true,
+// these three fields must NOT also get folded into the generic
+// "required columns" header loop, or they'd render twice (once from their
+// own <th>, once from a required-fields loop that now includes them).
+// ----------------------------------------------------------------------------
+const EXTRA_FIELDS_REQUIRED = false
+
+const FIELD_DEFS = [
+  { key: 'payee', label: 'Payee', required: true },
+  { key: 'payor', label: 'Payor', required: true },
+  { key: 'check_no', label: 'Check No', required: true },
+  { key: 'check_date', label: 'Check Date', required: true },
+  { key: 'amount', label: 'Amount', required: true },
+  { key: 'client_ref_no', label: 'Client Ref. No', required: EXTRA_FIELDS_REQUIRED },
+  { key: 'pickup_branch', label: 'Pickup Branch', required: EXTRA_FIELDS_REQUIRED },
+  { key: 'account_number', label: 'Account Number', required: EXTRA_FIELDS_REQUIRED },
 ]
+const FIELD_DEFS_BY_KEY = Object.fromEntries(FIELD_DEFS.map((f) => [f.key, f]))
+
+const CORE_FIELD_KEYS = ['payee', 'payor', 'check_no', 'check_date', 'amount']
+const CORE_FIELDS = FIELD_DEFS.filter((f) => CORE_FIELD_KEYS.includes(f.key))
+const EXTRA_FIELDS = FIELD_DEFS.filter((f) => !CORE_FIELD_KEYS.includes(f.key))
+
+// Used ONLY for "map N required fields to continue" messaging and the
+// mappingComplete gate — never for table layout (see note above).
+const REQUIRED_FIELDS = FIELD_DEFS.filter((f) => f.required)
+
+const CLIENT_REF_MAX_LENGTH = 12
+const ACCOUNT_NUMBER_MAX_LENGTH = 12
+const PICKUP_BRANCH_MAX_LENGTH = 100
+
+// Include, Row, Bank + every configured field column — computed instead of
+// hardcoded so it can never drift out of sync with the actual <th> count,
+// including if more optional fields are added later.
+const PREVIEW_COLSPAN = CORE_FIELDS.length + EXTRA_FIELDS.length + 3
 
 // Default bank list — extend/edit as needed, or swap this for a Supabase
 // lookup (e.g. a `banks` table) later without touching anything else,
@@ -97,13 +135,21 @@ const FLAG_LABELS = {
   futureDate: 'Check dated in the future',
   duplicateCheckNo: 'Exact duplicate row (same bank, payee, payor, check no. & check date)',
   existsInSystem: 'This exact row is already imported',
+  missingClientRefNo: 'Missing client ref. no.',
+  invalidClientRefNo: 'Client ref. no. must be digits only (max 12 characters)',
+  missingAccountNumber: 'Missing account number',
+  invalidAccountNumber: 'Account number must be digits only (max 12 characters)',
+  missingPickupBranch: 'Missing pickup branch',
+  pickupBranchFormat: 'Pickup branch format looks unusual (expected e.g. "CSBA - Parqal")',
 }
 
 // Builds the composite key duplicate detection is scoped to. A row is only
 // a duplicate if EVERY ONE of bank, payee, payor, check no., and check
 // date matches another row exactly — change any single field (a different
 // payee, a different date, etc.) and it's a distinct, allowed row, even if
-// everything else lines up.
+// everything else lines up. (Ref no./account number are NOT part of this
+// key today — add them here later if duplicates should also be scoped by
+// those fields.)
 function fullRowKey(bank, checkNo, payee, payor, checkDate) {
   return [bank, checkNo, payee, payor, checkDate]
     .map((v) => String(v ?? '').trim().toLowerCase())
@@ -118,6 +164,9 @@ function guessColumn(headers, field) {
     check_no: /check.?no|check.?number/i,
     check_date: /check.?date|date/i,
     amount: /amount|amt/i,
+    client_ref_no: /client.?ref|ref.?no|reference/i,
+    pickup_branch: /pickup.?branch|branch/i,
+    account_number: /account.?(no|number|num)/i,
   }
   const idx = headers.findIndex((h) => patterns[field].test(String(h).trim()))
   return idx >= 0 ? headers[idx] : ''
@@ -178,11 +227,48 @@ function normalizeAmountValue(raw) {
   return Math.round(value * 100) / 100
 }
 
+// Excel/Sheets sometimes stores an all-digit column as a genuine NUMBER
+// rather than text. `toFixed(0)` avoids exponential notation (e.g.
+// "1.2e+11") that plain String(raw) could otherwise produce for large
+// values. NOTE: this can't recover leading zeros the source file already
+// lost by typing that column as Number format instead of Text — that's a
+// spreadsheet-formatting issue upstream of this app, not fixable here.
+// Ask the source to format Client Ref No / Account Number columns as Text
+// before export if this becomes a recurring problem.
+function numericCellToString(raw) {
+  if (typeof raw === 'number') {
+    return Number.isFinite(raw) ? raw.toFixed(0) : String(raw)
+  }
+  return String(raw ?? '').trim()
+}
+
+// Strictly digits-only, capped at maxLength. Blank is valid — these fields
+// are optional for now (see EXTRA_FIELDS_REQUIRED above). Kept as a
+// STRING, never parsed to Number, so leading zeros survive.
+function normalizeDigitsOnly(raw, maxLength) {
+  const value = numericCellToString(raw).trim()
+  if (!value) return { value: '', present: false, valid: true }
+  const valid = /^\d+$/.test(value) && value.length <= maxLength
+  return { value, present: true, valid }
+}
+
+// Soft format check only — flags anything that doesn't look like
+// "CODE - Location" (e.g. "CSBA - Parqal") for review, but NEVER blocks
+// import, since real branch names will vary more than one pattern can
+// fully anticipate.
+const PICKUP_BRANCH_FORMAT_RE = /^[A-Za-z0-9.&']+(\s+[A-Za-z0-9.&']+)*\s-\s[A-Za-z0-9.&' ]+$/
+
+function normalizePickupBranch(raw, maxLength) {
+  const value = normalizeText(raw).slice(0, maxLength)
+  if (!value) return { value: '', present: false, formatOk: true }
+  return { value, present: true, formatOk: PICKUP_BRANCH_FORMAT_RE.test(value) }
+}
+
 function downloadTemplate() {
   const csvContent = [
-    'Payee,Payor,Check No,Check Date,Amount',
-    'Jane Doe,Acme Corp,00123,2024-01-15,250.00',
-    'John Smith,Acme Corp,00124,2024-02-03,1050.75',
+    'Payee,Payor,Check No,Check Date,Amount,Client Ref No,Pickup Branch,Account Number',
+    'Jane Doe,Acme Corp,00123,2024-01-15,250.00,123456789012,CSBA - Parqal,000123456789',
+    'John Smith,Acme Corp,00124,2024-02-03,1050.75,,,',
   ].join('\n')
   const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' })
   const url = URL.createObjectURL(blob)
@@ -201,7 +287,7 @@ function downloadTemplate() {
 function downloadFlaggedRows(rows, fileNameBase) {
   if (rows.length === 0) return
   const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`
-  const header = 'Row,Bank,Payee,Payor,Check No,Check Date,Amount,Issues'
+  const header = 'Row,Bank,Payee,Payor,Check No,Check Date,Amount,Client Ref No,Pickup Branch,Account Number,Issues'
   const lines = rows.map((r) => {
     const issues = Object.entries(FLAG_LABELS)
       .filter(([key]) => r.flags[key])
@@ -215,6 +301,9 @@ function downloadFlaggedRows(rows, fileNameBase) {
       esc(r.check_no),
       esc(r.check_date || ''),
       r.amount,
+      esc(r.client_ref_no || ''),
+      esc(r.pickup_branch || ''),
+      esc(r.account_number || ''),
       esc(issues),
     ].join(',')
   })
@@ -296,9 +385,23 @@ export default function AdminUpload() {
     const checkNoIdx = headers.indexOf(mapping.check_no)
     const dateIdx = headers.indexOf(mapping.check_date)
     const amountIdx = headers.indexOf(mapping.amount)
+    // Optional for now — only look up an index if the column was actually
+    // mapped; -1 means "not present in this file," which is allowed.
+    const clientRefIdx = mapping.client_ref_no ? headers.indexOf(mapping.client_ref_no) : -1
+    const pickupBranchIdx = mapping.pickup_branch ? headers.indexOf(mapping.pickup_branch) : -1
+    const accountNumberIdx = mapping.account_number ? headers.indexOf(mapping.account_number) : -1
 
     const draft = rawRows.map((row, i) => {
       const rawAmount = normalizeAmountValue(row[amountIdx])
+      const clientRef = normalizeDigitsOnly(clientRefIdx >= 0 ? row[clientRefIdx] : '', CLIENT_REF_MAX_LENGTH)
+      const accountNumber = normalizeDigitsOnly(
+        accountNumberIdx >= 0 ? row[accountNumberIdx] : '',
+        ACCOUNT_NUMBER_MAX_LENGTH,
+      )
+      const pickupBranch = normalizePickupBranch(
+        pickupBranchIdx >= 0 ? row[pickupBranchIdx] : '',
+        PICKUP_BRANCH_MAX_LENGTH,
+      )
       return {
         index: i,
         rowNumber: i + 2, // +2 accounts for the header row occupying row 1
@@ -309,6 +412,15 @@ export default function AdminUpload() {
         check_date: normalizeDate(row[dateIdx]),
         amount: Number.isNaN(rawAmount) ? 0 : rawAmount,
         amountInvalid: Number.isNaN(rawAmount),
+        client_ref_no: clientRef.value,
+        clientRefPresent: clientRef.present,
+        clientRefValid: clientRef.valid,
+        account_number: accountNumber.value,
+        accountNumberPresent: accountNumber.present,
+        accountNumberValid: accountNumber.valid,
+        pickup_branch: pickupBranch.value,
+        pickupBranchPresent: pickupBranch.present,
+        pickupBranchFormatOk: pickupBranch.formatOk,
       }
     })
 
@@ -339,6 +451,12 @@ export default function AdminUpload() {
         duplicateCheckNo:
           !!r.check_no &&
           rowCounts.get(fullRowKey(r.bank, r.check_no, r.payee, r.payor, r.check_date)) > 1,
+        missingClientRefNo: FIELD_DEFS_BY_KEY.client_ref_no.required && !r.clientRefPresent,
+        invalidClientRefNo: r.clientRefPresent && !r.clientRefValid,
+        missingAccountNumber: FIELD_DEFS_BY_KEY.account_number.required && !r.accountNumberPresent,
+        invalidAccountNumber: r.accountNumberPresent && !r.accountNumberValid,
+        missingPickupBranch: FIELD_DEFS_BY_KEY.pickup_branch.required && !r.pickupBranchPresent,
+        pickupBranchFormat: r.pickupBranchPresent && !r.pickupBranchFormatOk,
       }
       const hasIssue = Object.values(flags).some(Boolean)
       return { ...r, flags, hasIssue }
@@ -584,7 +702,7 @@ export default function AdminUpload() {
 
         const autoMap = {}
         const detected = {}
-        REQUIRED_FIELDS.forEach(({ key }) => {
+        FIELD_DEFS.forEach(({ key }) => {
           const guess = guessColumn(cleanHeaders, key)
           autoMap[key] = guess
           detected[key] = !!guess
@@ -689,6 +807,9 @@ export default function AdminUpload() {
       check_no: r.check_no,
       check_date: r.check_date,
       amount: r.amount,
+      client_ref_no: r.client_ref_no || null,
+      pickup_branch: r.pickup_branch || null,
+      account_number: r.account_number || null,
     }))
 
     try {
@@ -724,6 +845,14 @@ export default function AdminUpload() {
         }
         setImportProgress(Math.round((Math.min(i + chunk.length, toInsert.length) / toInsert.length) * 100))
       }
+
+      logAuditEvent('checks_uploaded', {
+        batch_id: batch.id,
+        file_name: fileName,
+        bank: bankValue,
+        row_count: toInsert.length,
+        excluded_count: enrichedRows.length - toInsert.length,
+      }).catch(() => {})
 
       const excludedTotal = enrichedRows.length - toInsert.length
       push({
@@ -935,10 +1064,15 @@ export default function AdminUpload() {
                     Map your columns
                   </h3>
                   <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                    {REQUIRED_FIELDS.map(({ key, label }) => (
+                    {FIELD_DEFS.map(({ key, label, required }) => (
                       <div key={key}>
                         <label className="mb-1 flex items-center gap-1.5 text-xs font-medium text-ink-500">
                           {label}
+                          {required ? (
+                            <span className="text-red-500">*</span>
+                          ) : (
+                            <span className="text-[10px] font-normal text-ink-300">(optional)</span>
+                          )}
                           {autoDetected[key] && mapping[key] && (
                             <span className="flex items-center gap-0.5 rounded-full bg-teal-100 px-1.5 py-0.5 text-[10px] font-medium text-teal-700">
                               <Sparkles className="h-2.5 w-2.5" />
@@ -953,9 +1087,9 @@ export default function AdminUpload() {
                             setMapping((m) => ({ ...m, [key]: value }))
                             setAutoDetected((d) => ({ ...d, [key]: false }))
                           }}
-                          className={cn(!mapping[key] && 'ring-1 ring-orange-400/60')}
+                          className={cn(required && !mapping[key] && 'ring-1 ring-orange-400/60')}
                         >
-                          <option value="">— Select column —</option>
+                          <option value="">{required ? '— Select column —' : '— Not in this file —'}</option>
                           {headers.map((h) => (
                             <option key={h} value={h}>
                               {h}
@@ -968,7 +1102,8 @@ export default function AdminUpload() {
 
                   {!mappingComplete && (
                     <p className="mt-3 flex items-center gap-1.5 text-xs font-medium text-orange-600">
-                      <AlertTriangle className="h-3.5 w-3.5" /> Map all five fields to continue.
+                      <AlertTriangle className="h-3.5 w-3.5" /> Map all {REQUIRED_FIELDS.length} required field
+                      {REQUIRED_FIELDS.length === 1 ? '' : 's'} to continue.
                     </p>
                   )}
 
@@ -1148,9 +1283,9 @@ export default function AdminUpload() {
                           <th className="px-3 py-2 font-medium">Include</th>
                           <th className="px-3 py-2 font-medium">Row</th>
                           <th className="px-3 py-2 font-medium">Bank</th>
-                          {REQUIRED_FIELDS.map(({ key, label }) => (
+                          {CORE_FIELDS.map(({ key, label }) => (
                             <th key={key} className="px-3 py-2 font-medium">
-                              {label === 'Check No' ? (
+                              {key === 'check_no' ? (
                                 <span className="relative inline-flex items-center gap-1">
                                   {label}
                                   <button
@@ -1171,6 +1306,16 @@ export default function AdminUpload() {
                                 </span>
                               ) : (
                                 label
+                              )}
+                            </th>
+                          ))}
+                          {EXTRA_FIELDS.map(({ key, label, required }) => (
+                            <th key={key} className="px-3 py-2 font-medium">
+                              {label}
+                              {!required && (
+                                <span className="ml-1 text-[10px] font-normal normal-case text-teal-400">
+                                  (optional)
+                                </span>
                               )}
                             </th>
                           ))}
@@ -1228,36 +1373,15 @@ export default function AdminUpload() {
                               </td>
                               <td className="px-3 py-2 font-mono text-ink-300">{r.rowNumber}</td>
                               <td className="px-3 py-2 text-ink-700">{r.bank}</td>
-                              <td
-                                className={cn(
-                                  'px-3 py-2',
-                                  r.flags.missingPayee ? 'font-medium text-orange-600' : 'text-ink-700',
-                                )}
-                              >
-                                {r.flags.missingPayee ? (
-                                  <span className="inline-flex items-center gap-1">
-                                    <AlertTriangle className="h-3 w-3 shrink-0" />
-                                    Missing
-                                  </span>
-                                ) : (
-                                  r.payee || '—'
-                                )}
-                              </td>
-                              <td
-                                className={cn(
-                                  'px-3 py-2',
-                                  r.flags.missingPayor ? 'font-medium text-orange-600' : 'text-ink-700',
-                                )}
-                              >
-                                {r.flags.missingPayor ? (
-                                  <span className="inline-flex items-center gap-1">
-                                    <AlertTriangle className="h-3 w-3 shrink-0" />
-                                    Missing
-                                  </span>
-                                ) : (
-                                  r.payor || '—'
-                                )}
-                              </td>
+
+                              <PreviewCell
+                                value={r.payee}
+                                missing={r.flags.missingPayee}
+                              />
+                              <PreviewCell
+                                value={r.payor}
+                                missing={r.flags.missingPayor}
+                              />
                               <td
                                 className={cn(
                                   'px-3 py-2 font-mono',
@@ -1289,60 +1413,57 @@ export default function AdminUpload() {
                                   </span>
                                 )}
                               </td>
-                              <td
-                                className={cn(
-                                  'px-3 py-2',
-                                  r.flags.missingDate || r.flags.futureDate
-                                    ? 'font-medium text-orange-600'
-                                    : 'text-ink-700',
-                                )}
-                              >
-                                {r.flags.missingDate ? (
-                                  <span className="inline-flex items-center gap-1">
-                                    <AlertTriangle className="h-3 w-3 shrink-0" />
-                                    Missing
-                                  </span>
-                                ) : r.flags.futureDate ? (
-                                  <span
-                                    className="inline-flex items-center gap-1"
-                                    title="This check is dated in the future"
-                                  >
-                                    <AlertTriangle className="h-3 w-3 shrink-0" />
-                                    {r.check_date}
-                                  </span>
-                                ) : (
-                                  r.check_date || '—'
-                                )}
-                              </td>
-                              <td
-                                className={cn(
-                                  'px-3 py-2 font-mono',
-                                  r.flags.invalidAmount || r.flags.negativeAmount
-                                    ? 'font-medium text-orange-600'
-                                    : 'text-ink-700',
-                                )}
-                              >
-                                {r.flags.invalidAmount ? (
-                                  <span className="inline-flex items-center gap-1">
-                                    <AlertTriangle className="h-3 w-3 shrink-0" />
-                                    Invalid
-                                  </span>
-                                ) : (
-                                  <span
-                                    className="inline-flex items-center gap-1"
-                                    title={r.flags.negativeAmount ? 'Negative amount' : undefined}
-                                  >
-                                    {r.flags.negativeAmount && <AlertTriangle className="h-3 w-3 shrink-0" />}
-                                    {formatCurrency(r.amount)}
-                                  </span>
-                                )}
-                              </td>
+                              <PreviewCell
+                                value={r.check_date}
+                                missing={r.flags.missingDate}
+                                invalid={r.flags.futureDate}
+                                missingLabel="Missing"
+                                tooltip={r.flags.futureDate ? 'This check is dated in the future' : undefined}
+                              />
+                              <PreviewCell
+                                value={r.flags.invalidAmount ? undefined : formatCurrency(r.amount)}
+                                missing={r.flags.invalidAmount}
+                                missingLabel="Invalid"
+                                invalid={r.flags.negativeAmount}
+                                tooltip={r.flags.negativeAmount ? 'Negative amount' : undefined}
+                                mono
+                              />
+                              <PreviewCell
+                                value={r.client_ref_no}
+                                missing={r.flags.missingClientRefNo}
+                                invalid={r.flags.invalidClientRefNo}
+                                tooltip={
+                                  r.flags.invalidClientRefNo
+                                    ? `Must be digits only, max ${CLIENT_REF_MAX_LENGTH} characters`
+                                    : undefined
+                                }
+                                mono
+                              />
+                              <PreviewCell
+                                value={r.pickup_branch}
+                                missing={r.flags.missingPickupBranch}
+                                invalid={r.flags.pickupBranchFormat}
+                                tooltip={
+                                  r.flags.pickupBranchFormat ? 'Expected format e.g. "CSBA - Parqal"' : undefined
+                                }
+                              />
+                              <PreviewCell
+                                value={r.account_number}
+                                missing={r.flags.missingAccountNumber}
+                                invalid={r.flags.invalidAccountNumber}
+                                tooltip={
+                                  r.flags.invalidAccountNumber
+                                    ? `Must be digits only, max ${ACCOUNT_NUMBER_MAX_LENGTH} characters`
+                                    : undefined
+                                }
+                                mono
+                              />
                             </tr>
                           )
                         })}
                         {previewRows.length === 0 && (
                           <tr>
-                            <td colSpan={8} className="px-3 py-10 text-center text-ink-300">
+                            <td colSpan={PREVIEW_COLSPAN} className="px-3 py-10 text-center text-ink-300">
                               <div className="flex flex-col items-center gap-1.5">
                                 <Search className="h-5 w-5 text-ink-200" />
                                 <span>No rows match your search or filter.</span>
@@ -1455,6 +1576,34 @@ export default function AdminUpload() {
         </CardContent>
       </Card>
     </div>
+  )
+}
+
+// Generic preview-table cell: shows a "Missing"/"Invalid" pill with an
+// icon when the value fails validation, otherwise the value itself
+// (optionally flagged as needing review, e.g. a future-dated check or a
+// negative amount that's present but still worth a second look).
+// Extracted because this exact three-state pattern (missing / present-
+// but-flagged / normal) was previously duplicated across 7+ table cells;
+// keeping it in one place means a future styling tweak only happens once.
+function PreviewCell({ value, missing, missingLabel = 'Missing', invalid, tooltip, mono = false }) {
+  if (missing) {
+    return (
+      <td className="px-3 py-2 font-medium text-orange-600">
+        <span className="inline-flex items-center gap-1">
+          <AlertTriangle className="h-3 w-3 shrink-0" />
+          {missingLabel}
+        </span>
+      </td>
+    )
+  }
+  return (
+    <td className={cn('px-3 py-2', mono && 'font-mono', invalid ? 'font-medium text-orange-600' : 'text-ink-700')}>
+      <span className="inline-flex items-center gap-1" title={tooltip}>
+        {invalid && <AlertTriangle className="h-3 w-3 shrink-0" />}
+        {value || '—'}
+      </span>
+    </td>
   )
 }
 

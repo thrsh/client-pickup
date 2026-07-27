@@ -1,4 +1,12 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+  useTransition,
+} from 'react'
 import {
   Search,
   RotateCcw,
@@ -23,6 +31,7 @@ import {
   CircleCheckBig,
   Clock,
   Landmark,
+  Building2,
   UserRound,
   ClipboardList,
   ReceiptText,
@@ -37,39 +46,93 @@ import { Card, CardContent } from '../../components/ui/card'
 import { useToast } from '../../components/ui/toast'
 import { formatCurrency, formatDate, cn } from '../../lib/utils'
 
+/**
+ * @typedef {Object} CheckRow
+ * @property {string} id
+ * @property {number} row_number
+ * @property {string|null} bank
+ * @property {string|null} pickup_branch
+ * @property {string} payee
+ * @property {string|null} payor
+ * @property {string|null} check_no
+ * @property {string|null} check_date
+ * @property {number} amount
+ * @property {'available'|'reserved'|'pending_approval'|'returned'|'picked_up'} status
+ * @property {string|null} picked_up_by
+ * @property {string|null} collector_name
+ * @property {string|null} or_no
+ * @property {boolean|null} ar_collected
+ * @property {boolean|null} attached_2307
+ * @property {string|null} remarks
+ * @property {string|null} return_reason
+ * @property {{file_name?: string, uploaded_at?: string}|null} upload_batches
+ */
+
 const PAGE_SIZE_OPTIONS = [25, 50, 100]
-const SORTABLE_COLUMNS = ['payee', 'check_date', 'amount', 'uploaded_at', 'bank']
+const SORTABLE_COLUMNS = ['payee', 'check_date', 'amount', 'uploaded_at', 'bank', 'pickup_branch']
 const DEBOUNCE_MS = 300
 const RECEIPT_TYPES = ['PR', 'AR', 'OR']
 
-// Every status a single check row can be in. 'reserved' and 'returned'
-// checks are NOT submissions this page can act on directly — they're
-// managed per-reservation on the Pending Pickups (AdminPickups) page — but
-// this register still needs to display them accurately instead of falling
-// through to "picked up" just because they aren't 'available' or
-// 'pending_approval'.
+// Single source of truth for every status a check row can hold. Drives the
+// status <select>, the KPI cards, the header summary line, and label
+// lookups — so none of those can drift out of sync with each other the
+// way five hand-written switch statements previously could.
+// 'reserved' and 'returned' checks are NOT submissions this page can act
+// on directly — they're managed per-reservation on the Pending Pickups
+// (AdminPickups) page — but this register still displays them accurately.
+const STATUS_CONFIG = Object.freeze({
+  available: {
+    value: 'available',
+    label: 'Available',
+    icon: Wallet,
+    secondary: 'Ready for pickup',
+    accent: 'teal',
+    summaryClass: 'text-ledger-stamp',
+  },
+  reserved: {
+    value: 'reserved',
+    label: 'Reserved',
+    icon: Clock,
+    secondary: 'Held by a collector',
+    accent: 'sky',
+    summaryClass: 'text-sky-600',
+  },
+  pending_approval: {
+    value: 'pending_approval',
+    label: 'Pending approval',
+    icon: Hourglass,
+    secondary: 'Awaiting approver review',
+    accent: 'orange',
+    summaryClass: 'text-amber-600',
+  },
+  returned: {
+    value: 'returned',
+    label: 'Returned',
+    icon: RotateCcw,
+    secondary: 'Sent back for correction',
+    accent: 'amber',
+    summaryClass: 'text-orange-600',
+  },
+  picked_up: {
+    value: 'picked_up',
+    label: 'Picked up',
+    icon: CircleCheckBig,
+    secondary: 'Completed pickups',
+    accent: 'teal',
+    summaryClass: '',
+  },
+})
+const STATUS_ORDER = Object.freeze(['available', 'reserved', 'pending_approval', 'returned', 'picked_up'])
+
+function statusLabel(s) {
+  return STATUS_CONFIG[s]?.label || s || 'Unknown'
+}
 
 function composeReceiptNo(entry) {
   const type = entry?.receiptType || ''
   const no = entry?.receiptNo?.trim() || ''
   if (!type || !no) return ''
   return `${type}-${no}`
-}
-function statusLabel(s) {
-  switch (s) {
-    case 'available':
-      return 'Available'
-    case 'reserved':
-      return 'Reserved'
-    case 'pending_approval':
-      return 'Pending approval'
-    case 'returned':
-      return 'Returned'
-    case 'picked_up':
-      return 'Picked up'
-    default:
-      return s || 'Unknown'
-  }
 }
 
 function formatDateTime(ts) {
@@ -84,22 +147,93 @@ function formatDateTime(ts) {
   })
 }
 
+// ---------------------------------------------------------------------------
+// Filter state, consolidated into a single reducer instead of ten separate
+// useState calls. This keeps every filter update to one state transition
+// (fewer renders when several fields change together, e.g. resetAllFilters),
+// and makes adding a new filter dimension (pickup_branch) a one-line change
+// instead of touching a new useState + a new setter prop everywhere.
+// ---------------------------------------------------------------------------
+
+const INITIAL_FILTER_STATE = Object.freeze({
+  query: '',
+  status: 'all',
+  dateFrom: '',
+  dateTo: '',
+  amountMin: '',
+  amountMax: '',
+  fileFilter: '',
+  collectorFilter: '',
+  bankFilter: '',
+  branchFilter: '',
+})
+
+function filtersReducer(state, action) {
+  switch (action.type) {
+    case 'SET_FIELD':
+      return { ...state, [action.field]: action.value }
+    case 'CLEAR_ADVANCED':
+      return {
+        ...state,
+        dateFrom: '',
+        dateTo: '',
+        amountMin: '',
+        amountMax: '',
+        fileFilter: '',
+        collectorFilter: '',
+        bankFilter: '',
+        branchFilter: '',
+      }
+    case 'RESET_ALL':
+      return INITIAL_FILTER_STATE
+    default:
+      return state
+  }
+}
+
+// Debounces a fast-changing value (typed search text, typed amounts)
+// without delaying discrete selections (dropdowns, dates), which apply
+// immediately. Keeps the network cheap while keeping the UI responsive.
+function useDebouncedValue(value, delayMs) {
+  const [debounced, setDebounced] = useState(value)
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(value), delayMs)
+    return () => clearTimeout(t)
+  }, [value, delayMs])
+  return debounced
+}
+
 export default function AdminChecks() {
   const { name: adminName } = useProfile()
-  const [query, setQuery] = useState('')
-  const [status, setStatus] = useState('all')
+
+  const [filterState, dispatchFilter] = useReducer(filtersReducer, INITIAL_FILTER_STATE)
+  const {
+    query,
+    status,
+    dateFrom,
+    dateTo,
+    amountMin,
+    amountMax,
+    fileFilter,
+    collectorFilter,
+    bankFilter,
+    branchFilter,
+  } = filterState
+
+  const setField = useCallback((field, value) => dispatchFilter({ type: 'SET_FIELD', field, value }), [])
+  const clearAdvancedFilters = useCallback(() => dispatchFilter({ type: 'CLEAR_ADVANCED' }), [])
+  const resetAllFilters = useCallback(() => {
+    dispatchFilter({ type: 'RESET_ALL' })
+    setSortKey('created_at')
+    setSortAsc(false)
+  }, [])
+
   const [showAdvanced, setShowAdvanced] = useState(false)
-  const [dateFrom, setDateFrom] = useState('')
-  const [dateTo, setDateTo] = useState('')
-  const [amountMin, setAmountMin] = useState('')
-  const [amountMax, setAmountMax] = useState('')
-  const [fileFilter, setFileFilter] = useState('')
-  const [collectorFilter, setCollectorFilter] = useState('')
-  const [bankFilter, setBankFilter] = useState('')
 
   const [fileOptions, setFileOptions] = useState([])
   const [collectorOptions, setCollectorOptions] = useState([])
   const [bankOptions, setBankOptions] = useState([])
+  const [branchOptions, setBranchOptions] = useState([])
 
   const [sortKey, setSortKey] = useState('created_at')
   const [sortAsc, setSortAsc] = useState(false)
@@ -112,25 +246,17 @@ export default function AdminChecks() {
   const [page, setPage] = useState(0)
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
+  const [isPending, startTransition] = useTransition()
 
   // Lightweight status breakdown for the current filters (head-only counts,
   // so this stays cheap no matter how large the underlying table gets).
-  // Also powers the KPI cards at the top of the page. Covers every status
-  // a check row can actually hold — not just the ones this page can act on.
-  const [stats, setStats] = useState({
-    available: null,
-    reserved: null,
-    pendingApproval: null,
-    returned: null,
-    pickedUp: null,
-  })
+  // Also powers the KPI cards at the top of the page. Initialized from
+  // STATUS_ORDER so it automatically covers every status a check can hold.
+  const [stats, setStats] = useState(() => Object.fromEntries(STATUS_ORDER.map((s) => [s, null])))
 
   // Submit-for-approval modal. `submitTargets` is null when the modal is
   // closed, or the array of check rows it's acting on (one row for a
-  // single-check submission, several for a bulk one) when it's open. The
-  // modal itself owns the collector-name and per-check field state; this
-  // component only owns the network call and its in-flight/error state so
-  // both the single-row and bulk entry points can share one code path.
+  // single-check submission, several for a bulk one) when it's open.
   const [submitTargets, setSubmitTargets] = useState(null)
   const [submitSubmitting, setSubmitSubmitting] = useState(false)
   const [submitError, setSubmitError] = useState('')
@@ -175,7 +301,7 @@ export default function AdminChecks() {
 
   async function loadFilterOptions() {
     try {
-      const [batchesRes, collectorsRes, banksRes] = await Promise.all([
+      const [batchesRes, collectorsRes, banksRes, branchesRes] = await Promise.all([
         supabase.from('upload_batches').select('id, file_name').order('uploaded_at', { ascending: false }).limit(200),
         // Collector suggestions pool together everyone who has ever
         // finished a pickup (picked_up_by) and everyone currently
@@ -186,11 +312,12 @@ export default function AdminChecks() {
           .select('picked_up_by, collector_name')
           .or('picked_up_by.not.is.null,collector_name.not.is.null')
           .limit(1000),
-        // Distinct banks read straight off the checks table (the source of
-        // truth for what's actually been imported), not off a fixed list —
-        // so the filter always reflects what's really in the register, even
-        // if the upload form's bank list changes later.
+        // Distinct banks and branches read straight off the checks table
+        // (the source of truth for what's actually been imported), not off
+        // a fixed list — so the filters always reflect what's really in
+        // the register, even if an upload form's dropdown list changes.
         supabase.from('checks').select('bank').not('bank', 'is', null).limit(2000),
+        supabase.from('checks').select('pickup_branch').not('pickup_branch', 'is', null).limit(2000),
       ])
       if (!batchesRes.error) setFileOptions(batchesRes.data || [])
       if (!collectorsRes.error) {
@@ -209,36 +336,51 @@ export default function AdminChecks() {
         ].sort()
         setBankOptions(distinctBanks)
       }
+      if (!branchesRes.error) {
+        const distinctBranches = [
+          ...new Set((branchesRes.data || []).map((r) => r.pickup_branch).filter(Boolean)),
+        ].sort()
+        setBranchOptions(distinctBranches)
+      }
     } catch {
       // Filter suggestions are a convenience only — ignore failures here.
     }
   }
 
-  const filters = useMemo(
+  // Only free-text / numeric-typed fields are debounced. Dropdowns and
+  // dates fire a fetch immediately since they're discrete, low-frequency
+  // interactions — debouncing them would only add perceived latency.
+  const debouncedQuery = useDebouncedValue(query, DEBOUNCE_MS)
+  const debouncedAmountMin = useDebouncedValue(amountMin, DEBOUNCE_MS)
+  const debouncedAmountMax = useDebouncedValue(amountMax, DEBOUNCE_MS)
+
+  const effectiveFilters = useMemo(
     () => ({
-      query,
+      query: debouncedQuery,
       status,
       dateFrom,
       dateTo,
-      amountMin,
-      amountMax,
+      amountMin: debouncedAmountMin,
+      amountMax: debouncedAmountMax,
       fileFilter,
       collectorFilter,
       bankFilter,
+      branchFilter,
       sortKey,
       sortAsc,
       pageSize,
     }),
     [
-      query,
+      debouncedQuery,
       status,
       dateFrom,
       dateTo,
-      amountMin,
-      amountMax,
+      debouncedAmountMin,
+      debouncedAmountMax,
       fileFilter,
       collectorFilter,
       bankFilter,
+      branchFilter,
       sortKey,
       sortAsc,
       pageSize,
@@ -250,20 +392,18 @@ export default function AdminChecks() {
   useEffect(() => {
     setPage(0)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filters])
+  }, [effectiveFilters])
 
-  // Single debounced fetch driven by filters + page together. Using one
-  // effect (rather than a separate filters-effect and page-effect that each
-  // called load) avoids firing two overlapping requests on mount / on every
-  // filter change, which could previously race and show stale results.
+  // Single fetch effect driven by filters + page together, wrapped in a
+  // transition so React can keep typing/clicking responsive while the
+  // fetch is in flight rather than blocking on the loading state.
   useEffect(() => {
-    const t = setTimeout(() => {
+    startTransition(() => {
       load(page)
       loadStats()
-    }, DEBOUNCE_MS)
-    return () => clearTimeout(t)
+    })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filters, page])
+  }, [effectiveFilters, page])
 
   // Selection only ever refers to the currently loaded page, so it's
   // cleared whenever that page's data changes underneath it.
@@ -277,16 +417,17 @@ export default function AdminChecks() {
   const applyCommonFilters = useCallback(
     (req) => {
       let r = req
-      if (query.trim()) {
-        const s = query.trim().toLowerCase()
+      if (debouncedQuery.trim()) {
+        const s = debouncedQuery.trim().toLowerCase()
         r = r.or(`payee.ilike.%${s}%,payor.ilike.%${s}%,check_no.ilike.%${s}%`)
       }
       if (dateFrom) r = r.gte('check_date', dateFrom)
       if (dateTo) r = r.lte('check_date', dateTo)
-      if (amountMin) r = r.gte('amount', Number(amountMin))
-      if (amountMax) r = r.lte('amount', Number(amountMax))
+      if (debouncedAmountMin) r = r.gte('amount', Number(debouncedAmountMin))
+      if (debouncedAmountMax) r = r.lte('amount', Number(debouncedAmountMax))
       if (fileFilter) r = r.eq('upload_batch_id', fileFilter)
       if (bankFilter) r = r.eq('bank', bankFilter)
+      if (branchFilter) r = r.eq('pickup_branch', branchFilter)
       // A collector can show up as either the person a check is currently
       // reserved/pending/returned against, or the person it was ultimately
       // logged as picked up by, so match either column. This is a second,
@@ -298,7 +439,7 @@ export default function AdminChecks() {
       }
       return r
     },
-    [query, dateFrom, dateTo, amountMin, amountMax, fileFilter, bankFilter, collectorFilter],
+    [debouncedQuery, dateFrom, dateTo, debouncedAmountMin, debouncedAmountMax, fileFilter, bankFilter, branchFilter, collectorFilter],
   )
 
   const load = useCallback(
@@ -311,7 +452,7 @@ export default function AdminChecks() {
         let req = supabase
           .from('checks')
           .select(
-            'id, row_number, bank, payee, payor, check_no, check_date, amount, status, picked_up_by, picked_up_at, or_no, ar_collected, attached_2307, remarks, collector_name, submitted_by_name, submitted_at, return_reason, returned_at, returned_by_name, upload_batches(file_name, uploaded_at)',
+            'id, row_number, bank, pickup_branch, payee, payor, check_no, check_date, amount, status, picked_up_by, picked_up_at, or_no, ar_collected, attached_2307, remarks, collector_name, submitted_by_name, submitted_at, return_reason, returned_at, returned_by_name, upload_batches(file_name, uploaded_at)',
             { count: 'exact' },
           )
           .range(pageIndex * pageSize, pageIndex * pageSize + pageSize - 1)
@@ -354,44 +495,25 @@ export default function AdminChecks() {
 
   // Head-only counts (no rows fetched) so the status split stays cheap
   // regardless of table size, and reflects every filter except status
-  // itself so the split is always meaningful. This also feeds the KPI
-  // cards at the top of the page. Covers all five statuses a check can
-  // hold, not just the two/three this page can act on directly.
+  // itself so the split is always meaningful. Driven by STATUS_ORDER so
+  // every status a check can hold is covered with a single Promise.all
+  // loop instead of five hand-written queries.
   const loadStats = useCallback(async () => {
     try {
-      const [availableRes, reservedRes, pendingRes, returnedRes, pickedUpRes] = await Promise.all([
-        applyCommonFilters(supabase.from('checks').select('id', { count: 'exact', head: true })).eq(
-          'status',
-          'available',
+      const results = await Promise.all(
+        STATUS_ORDER.map((s) =>
+          applyCommonFilters(supabase.from('checks').select('id', { count: 'exact', head: true })).eq('status', s),
         ),
-        applyCommonFilters(supabase.from('checks').select('id', { count: 'exact', head: true })).eq(
-          'status',
-          'reserved',
-        ),
-        applyCommonFilters(supabase.from('checks').select('id', { count: 'exact', head: true })).eq(
-          'status',
-          'pending_approval',
-        ),
-        applyCommonFilters(supabase.from('checks').select('id', { count: 'exact', head: true })).eq(
-          'status',
-          'returned',
-        ),
-        applyCommonFilters(supabase.from('checks').select('id', { count: 'exact', head: true })).eq(
-          'status',
-          'picked_up',
-        ),
-      ])
+      )
       if (!isMountedRef.current) return
-      setStats({
-        available: availableRes.error ? null : availableRes.count ?? 0,
-        reserved: reservedRes.error ? null : reservedRes.count ?? 0,
-        pendingApproval: pendingRes.error ? null : pendingRes.count ?? 0,
-        returned: returnedRes.error ? null : returnedRes.count ?? 0,
-        pickedUp: pickedUpRes.error ? null : pickedUpRes.count ?? 0,
+      const next = {}
+      STATUS_ORDER.forEach((s, i) => {
+        next[s] = results[i].error ? null : results[i].count ?? 0
       })
+      setStats(next)
     } catch {
       if (isMountedRef.current) {
-        setStats({ available: null, reserved: null, pendingApproval: null, returned: null, pickedUp: null })
+        setStats(Object.fromEntries(STATUS_ORDER.map((s) => [s, null])))
       }
     }
   }, [applyCommonFilters])
@@ -405,51 +527,58 @@ export default function AdminChecks() {
     }
   }
 
-  function clearAdvancedFilters() {
-    setDateFrom('')
-    setDateTo('')
-    setAmountMin('')
-    setAmountMax('')
-    setFileFilter('')
-    setCollectorFilter('')
-    setBankFilter('')
-  }
-
-  function resetAllFilters() {
-    setQuery('')
-    setStatus('all')
-    clearAdvancedFilters()
-    setSortKey('created_at')
-    setSortAsc(false)
-  }
-
-  const hasAdvancedFilters = !!(dateFrom || dateTo || amountMin || amountMax || fileFilter || collectorFilter || bankFilter)
+  const hasAdvancedFilters = !!(
+    dateFrom ||
+    dateTo ||
+    amountMin ||
+    amountMax ||
+    fileFilter ||
+    collectorFilter ||
+    bankFilter ||
+    branchFilter
+  )
   const hasAnyFilters = hasAdvancedFilters || !!query.trim() || status !== 'all'
 
   const activeChips = useMemo(() => {
     const chips = []
-    if (status !== 'all') chips.push({ key: 'status', label: `Status: ${statusLabel(status)}`, clear: () => setStatus('all') })
-    if (bankFilter) chips.push({ key: 'bank', label: `Bank: ${bankFilter}`, clear: () => setBankFilter('') })
-    if (dateFrom || dateTo) chips.push({ key: 'dates', label: `Date: ${dateFrom || '…'} → ${dateTo || '…'}`, clear: () => { setDateFrom(''); setDateTo('') } })
-    if (amountMin || amountMax) chips.push({ key: 'amount', label: `Amount: ${amountMin || '0'} - ${amountMax || '∞'}`, clear: () => { setAmountMin(''); setAmountMax('') } })
+    if (status !== 'all') chips.push({ key: 'status', label: `Status: ${statusLabel(status)}`, clear: () => setField('status', 'all') })
+    if (bankFilter) chips.push({ key: 'bank', label: `Bank: ${bankFilter}`, clear: () => setField('bankFilter', '') })
+    if (branchFilter) chips.push({ key: 'branch', label: `Branch: ${branchFilter}`, clear: () => setField('branchFilter', '') })
+    if (dateFrom || dateTo)
+      chips.push({
+        key: 'dates',
+        label: `Date: ${dateFrom || '…'} → ${dateTo || '…'}`,
+        clear: () => {
+          setField('dateFrom', '')
+          setField('dateTo', '')
+        },
+      })
+    if (amountMin || amountMax)
+      chips.push({
+        key: 'amount',
+        label: `Amount: ${amountMin || '0'} - ${amountMax || '∞'}`,
+        clear: () => {
+          setField('amountMin', '')
+          setField('amountMax', '')
+        },
+      })
     if (fileFilter) {
       const f = fileOptions.find((o) => String(o.id) === String(fileFilter))
-      chips.push({ key: 'file', label: `File: ${f?.file_name || fileFilter}`, clear: () => setFileFilter('') })
+      chips.push({ key: 'file', label: `File: ${f?.file_name || fileFilter}`, clear: () => setField('fileFilter', '') })
     }
-    if (collectorFilter) chips.push({ key: 'collector', label: `Collector: ${collectorFilter}`, clear: () => setCollectorFilter('') })
+    if (collectorFilter) chips.push({ key: 'collector', label: `Collector: ${collectorFilter}`, clear: () => setField('collectorFilter', '') })
     return chips
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status, bankFilter, dateFrom, dateTo, amountMin, amountMax, fileFilter, collectorFilter, fileOptions])
+  }, [status, bankFilter, branchFilter, dateFrom, dateTo, amountMin, amountMax, fileFilter, collectorFilter, fileOptions, setField])
 
   // ---------------------------------------------------------------------
   // Submit for approval (available -> pending_approval)
   // ---------------------------------------------------------------------
 
-  function openSubmitModal(targetRows) {
+  const openSubmitModal = useCallback((targetRows) => {
     if (!targetRows || targetRows.length === 0) return
     setSubmitError('')
     setSubmitTargets(targetRows)
-  }
+  }, [])
 
   function closeSubmitModal() {
     if (submitSubmitting) return
@@ -524,7 +653,7 @@ export default function AdminChecks() {
       // already serializes this for the jsonb param, and double-encoding
       // it makes Postgres receive a jsonb *string* instead of a jsonb
       // *array*.
-    const p_check_outcomes = included.map((r) => {
+      const p_check_outcomes = included.map((r) => {
         const entry = entries[r.id]
         return {
           check_id: r.id,
@@ -536,14 +665,11 @@ export default function AdminChecks() {
         }
       })
 
-      const { data: reservationId, error } = await supabase.rpc(
-        'admin_submit_checks_for_approval',
-        {
-          p_collector_name: trimmedName,
-          p_admin_name: trimmedAdminName,
-          p_check_outcomes,
-        },
-      )
+      const { data: reservationId, error } = await supabase.rpc('admin_submit_checks_for_approval', {
+        p_collector_name: trimmedName,
+        p_admin_name: trimmedAdminName,
+        p_check_outcomes,
+      })
 
       if (!isMountedRef.current) return
 
@@ -574,50 +700,62 @@ export default function AdminChecks() {
   // `.in('id', ids)` call covers the single-row and bulk cases alike.
   // ---------------------------------------------------------------------
 
-  async function cancelSubmissions(ids, label) {
-    if (ids.length === 0) return
-    setCancelingIds((prev) => {
-      const next = new Set(prev)
-      ids.forEach((id) => next.add(id))
-      return next
-    })
-    try {
-      const { error } = await supabase
-        .from('checks')
-        .update({ status: 'available', or_no: null, ar_collected: null, attached_2307: null, remarks: null, collector_name: null, submitted_by_name: null, submitted_at: null })
-        .in('id', ids)
-
-      if (error) {
-        push({ variant: 'error', title: 'Could not cancel submission', description: error.message })
-        return
-      }
-      push({
-        variant: 'info',
-        title: 'Submission cancelled',
-        description: label || `${ids.length} check${ids.length === 1 ? '' : 's'}`,
-      })
-      setSelectedIds(new Set())
-      load(page)
-      loadStats()
-    } catch (err) {
-      push({ variant: 'error', title: 'Could not cancel submission', description: err?.message || 'Please try again.' })
-    } finally {
+  const cancelSubmissions = useCallback(
+    async (ids, label) => {
+      if (ids.length === 0) return
       setCancelingIds((prev) => {
         const next = new Set(prev)
-        ids.forEach((id) => next.delete(id))
+        ids.forEach((id) => next.add(id))
         return next
       })
-    }
-  }
+      try {
+        const { error } = await supabase
+          .from('checks')
+          .update({
+            status: 'available',
+            or_no: null,
+            ar_collected: null,
+            attached_2307: null,
+            remarks: null,
+            collector_name: null,
+            submitted_by_name: null,
+            submitted_at: null,
+          })
+          .in('id', ids)
 
-  function toggleRowSelected(id) {
+        if (error) {
+          push({ variant: 'error', title: 'Could not cancel submission', description: error.message })
+          return
+        }
+        push({
+          variant: 'info',
+          title: 'Submission cancelled',
+          description: label || `${ids.length} check${ids.length === 1 ? '' : 's'}`,
+        })
+        setSelectedIds(new Set())
+        load(page)
+        loadStats()
+      } catch (err) {
+        push({ variant: 'error', title: 'Could not cancel submission', description: err?.message || 'Please try again.' })
+      } finally {
+        setCancelingIds((prev) => {
+          const next = new Set(prev)
+          ids.forEach((id) => next.delete(id))
+          return next
+        })
+      }
+    },
+    [push, load, loadStats, page],
+  )
+
+  const toggleRowSelected = useCallback((id) => {
     setSelectedIds((prev) => {
       const next = new Set(prev)
       if (next.has(id)) next.delete(id)
       else next.add(id)
       return next
     })
-  }
+  }, [])
 
   const allOnPageSelected = rows.length > 0 && rows.every((r) => selectedIds.has(r.id))
   const someOnPageSelected = rows.some((r) => selectedIds.has(r.id))
@@ -639,6 +777,7 @@ export default function AdminChecks() {
   const rangeStart = count === 0 ? 0 : page * pageSize + 1
   const rangeEnd = Math.min(count, page * pageSize + pageSize)
   const cellPad = density === 'compact' ? 'px-2 py-1' : 'px-3 py-2'
+  const showBusy = loading || isPending
 
   return (
     <div>
@@ -651,21 +790,20 @@ export default function AdminChecks() {
           </p>
         </div>
         <div className="flex items-center gap-3 text-right">
-          {!loading && !loadError && (
+          {!loadError && (
             <div className="text-[10px] text-ink-400">
               <p className="font-mono">
                 {rangeStart}–{rangeEnd} of {count.toLocaleString()}
               </p>
               <p className="mt-0.5 flex flex-wrap items-center justify-end gap-x-2 gap-y-0.5 font-mono">
-                <span className="text-ledger-stamp">{stats.available ?? '—'} available</span>
-                <span className="text-ink-300">·</span>
-                <span className="text-sky-600">{stats.reserved ?? '—'} reserved</span>
-                <span className="text-ink-300">·</span>
-                <span className="text-amber-600">{stats.pendingApproval ?? '—'} pending</span>
-                <span className="text-ink-300">·</span>
-                <span className="text-orange-600">{stats.returned ?? '—'} returned</span>
-                <span className="text-ink-300">·</span>
-                <span>{stats.pickedUp ?? '—'} picked up</span>
+                {STATUS_ORDER.map((s, i) => (
+                  <React.Fragment key={s}>
+                    {i > 0 && <span className="text-ink-300">·</span>}
+                    <span className={STATUS_CONFIG[s].summaryClass}>
+                      {stats[s] ?? '—'} {STATUS_CONFIG[s].label.toLowerCase()}
+                    </span>
+                  </React.Fragment>
+                ))}
               </p>
             </div>
           )}
@@ -680,45 +818,20 @@ export default function AdminChecks() {
         <KpiCard
           icon={Layers}
           label="Matching filters"
-          value={loading ? null : count}
-          secondary={loading ? null : count === 0 ? 'No results' : `${rangeStart}–${rangeEnd} shown`}
+          value={showBusy ? null : count}
+          secondary={showBusy ? null : count === 0 ? 'No results' : `${rangeStart}–${rangeEnd} shown`}
           accent="lightTeal"
         />
-        <KpiCard
-          icon={Wallet}
-          label="Available"
-          value={loading ? null : stats.available}
-          secondary="Ready for pickup"
-          accent="teal"
-        />
-        <KpiCard
-          icon={Clock}
-          label="Reserved"
-          value={loading ? null : stats.reserved}
-          secondary="Held by a collector"
-          accent="sky"
-        />
-        <KpiCard
-          icon={Hourglass}
-          label="Pending approval"
-          value={loading ? null : stats.pendingApproval}
-          secondary="Awaiting approver review"
-          accent="orange"
-        />
-        <KpiCard
-          icon={RotateCcw}
-          label="Returned"
-          value={loading ? null : stats.returned}
-          secondary="Sent back for correction"
-          accent="amber"
-        />
-        <KpiCard
-          icon={CircleCheckBig}
-          label="Picked up"
-          value={loading ? null : stats.pickedUp}
-          secondary="Completed pickups"
-          accent="teal"
-        />
+        {STATUS_ORDER.map((s) => (
+          <KpiCard
+            key={s}
+            icon={STATUS_CONFIG[s].icon}
+            label={STATUS_CONFIG[s].label}
+            value={showBusy ? null : stats[s]}
+            secondary={STATUS_CONFIG[s].secondary}
+            accent={STATUS_CONFIG[s].accent}
+          />
+        ))}
       </div>
 
       <div className="mb-3 flex flex-col gap-3 sm:flex-row">
@@ -727,13 +840,13 @@ export default function AdminChecks() {
           <Input
             ref={searchInputRef}
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => setField('query', e.target.value)}
             placeholder="Search payee, payor, or check no... (press / to focus)"
             className="pl-10 pr-9"
           />
           {query && (
             <button
-              onClick={() => setQuery('')}
+              onClick={() => setField('query', '')}
               className="absolute right-3 top-1/2 -translate-y-1/2 text-ink-300 hover:text-ink-600"
               aria-label="Clear search"
             >
@@ -741,17 +854,25 @@ export default function AdminChecks() {
             </button>
           )}
         </div>
-        <Select value={status} onChange={(e) => setStatus(e.target.value)} className="sm:w-48">
+        <Select value={status} onChange={(e) => setField('status', e.target.value)} className="sm:w-48">
           <option value="all">All statuses</option>
-          <option value="available">Available</option>
-          <option value="reserved">Reserved</option>
-          <option value="pending_approval">Pending approval</option>
-          <option value="returned">Returned</option>
-          <option value="picked_up">Picked up</option>
+          {STATUS_ORDER.map((s) => (
+            <option key={s} value={s}>
+              {STATUS_CONFIG[s].label}
+            </option>
+          ))}
         </Select>
-        <Select value={bankFilter} onChange={(e) => setBankFilter(e.target.value)} className="sm:w-48">
+        <Select value={bankFilter} onChange={(e) => setField('bankFilter', e.target.value)} className="sm:w-44">
           <option value="">All banks</option>
           {bankOptions.map((b) => (
+            <option key={b} value={b}>
+              {b}
+            </option>
+          ))}
+        </Select>
+        <Select value={branchFilter} onChange={(e) => setField('branchFilter', e.target.value)} className="sm:w-44">
+          <option value="">All branches</option>
+          {branchOptions.map((b) => (
             <option key={b} value={b}>
               {b}
             </option>
@@ -792,11 +913,11 @@ export default function AdminChecks() {
         <div className="mb-4 grid gap-3 rounded-md border border-ink-100 bg-ink-50/40 p-4 sm:grid-cols-2 lg:grid-cols-4">
           <div>
             <label className="mb-1 block text-xs font-medium text-ink-500">Check date from</label>
-            <Input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} />
+            <Input type="date" value={dateFrom} onChange={(e) => setField('dateFrom', e.target.value)} />
           </div>
           <div>
             <label className="mb-1 block text-xs font-medium text-ink-500">Check date to</label>
-            <Input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} />
+            <Input type="date" value={dateTo} onChange={(e) => setField('dateTo', e.target.value)} />
           </div>
           <div>
             <label className="mb-1 block text-xs font-medium text-ink-500">Min amount</label>
@@ -804,7 +925,7 @@ export default function AdminChecks() {
               type="number"
               inputMode="decimal"
               value={amountMin}
-              onChange={(e) => setAmountMin(e.target.value)}
+              onChange={(e) => setField('amountMin', e.target.value)}
               placeholder="0.00"
             />
           </div>
@@ -814,13 +935,13 @@ export default function AdminChecks() {
               type="number"
               inputMode="decimal"
               value={amountMax}
-              onChange={(e) => setAmountMax(e.target.value)}
+              onChange={(e) => setField('amountMax', e.target.value)}
               placeholder="0.00"
             />
           </div>
           <div>
             <label className="mb-1 block text-xs font-medium text-ink-500">Source file</label>
-            <Select value={fileFilter} onChange={(e) => setFileFilter(e.target.value)}>
+            <Select value={fileFilter} onChange={(e) => setField('fileFilter', e.target.value)}>
               <option value="">All files</option>
               {fileOptions.map((f) => (
                 <option key={f.id} value={f.id}>{f.file_name}</option>
@@ -829,7 +950,7 @@ export default function AdminChecks() {
           </div>
           <div>
             <label className="mb-1 block text-xs font-medium text-ink-500">Collector (reserved, submitted, or picked up)</label>
-            <Select value={collectorFilter} onChange={(e) => setCollectorFilter(e.target.value)}>
+            <Select value={collectorFilter} onChange={(e) => setField('collectorFilter', e.target.value)}>
               <option value="">Anyone</option>
               {collectorOptions.map((c) => (
                 <option key={c} value={c}>{c}</option>
@@ -932,7 +1053,7 @@ export default function AdminChecks() {
       )}
 
       <div className="overflow-auto rounded-lg border border-ink-100 bg-white" style={{ maxHeight: 640 }}>
-        <table className="w-full min-w-[1040px] text-left text-[11px]">
+        <table className="w-full min-w-[1160px] text-left text-[11px]">
           <thead className="sticky top-0 z-10 bg-ink-50 text-[9px] uppercase tracking-wide text-ink-400">
             <tr>
               <th className={cellPad}>
@@ -948,6 +1069,7 @@ export default function AdminChecks() {
               </th>
               <th className={cn(cellPad, 'font-medium')}>File / Row</th>
               <SortableHeader label="Bank" sortKeyName="bank" currentKey={sortKey} asc={sortAsc} onClick={toggleSort} cellPad={cellPad} />
+              <SortableHeader label="Branch" sortKeyName="pickup_branch" currentKey={sortKey} asc={sortAsc} onClick={toggleSort} cellPad={cellPad} />
               <SortableHeader label="Payee" sortKeyName="payee" currentKey={sortKey} asc={sortAsc} onClick={toggleSort} cellPad={cellPad} />
               <th className={cn(cellPad, 'font-medium')}>Payor</th>
               <th className={cn(cellPad, 'font-medium')}>Check No.</th>
@@ -963,7 +1085,7 @@ export default function AdminChecks() {
               <SkeletonRows count={Math.min(pageSize, 10)} cellPad={cellPad} />
             ) : rows.length === 0 ? (
               <tr>
-                <td colSpan={11} className="px-4 py-14">
+                <td colSpan={12} className="px-4 py-14">
                   <div className="flex flex-col items-center text-center">
                     <span className="flex h-11 w-11 items-center justify-center rounded-full border border-dashed border-ink-200 text-ink-300">
                       <Inbox className="h-5 w-5" />
@@ -980,78 +1102,16 @@ export default function AdminChecks() {
               </tr>
             ) : (
               rows.map((row) => (
-                <tr key={row.id} className={cn('hover:bg-ink-50/40', selectedIds.has(row.id) && 'bg-ledger-stamp/5')}>
-                  <td className={cellPad}>
-                    <input
-                      type="checkbox"
-                      checked={selectedIds.has(row.id)}
-                      onChange={() => toggleRowSelected(row.id)}
-                      className="h-3.5 w-3.5 accent-ledger-stamp"
-                      aria-label={`Select ${row.payee}`}
-                    />
-                  </td>
-                  <td className={cn(cellPad, 'font-mono text-[10px] text-ink-400')}>
-                    {row.upload_batches?.file_name || '—'}
-                    <br />
-                    Row {row.row_number}
-                  </td>
-<td className={cn(cellPad, 'max-w-[150px]')}>
-  <BankBadge bank={row.bank} />
-</td>
-    <td className={cn(cellPad, 'max-w-[180px] truncate font-medium text-ink-800')} title={row.payee || undefined}>
-  {row.payee || '—'}
-</td>
-                  <td className={cn(cellPad, 'max-w-[140px] truncate text-ink-600')}>{row.payor || '—'}</td>
-                  <td className={cn(cellPad, 'font-mono text-ink-600')}>
-                    <CopyableCheckNo value={row.check_no} />
-                  </td>
-                  <td className={cn(cellPad, 'text-ink-600')}>
-                    {row.check_date ? formatDate(row.check_date) : '—'}
-                  </td>
-                  <td className={cn(cellPad, 'font-mono text-ink-800')}>{formatCurrency(row.amount)}</td>
-                  {/* ── Uploaded-date column ── shows when the source file was imported */}
-                  <td className={cn(cellPad, 'text-[10px] text-ink-500')}>
-                    {row.upload_batches?.uploaded_at ? formatDate(row.upload_batches.uploaded_at) : '—'}
-                  </td>
-                  <td className={cn(cellPad, 'max-w-[190px]')}>
-                    {row.status === 'available' ? (
-                      <Badge variant="available">Available</Badge>
-                    ) : row.status === 'reserved' ? (
-                      <ReservedBadge row={row} />
-                    ) : row.status === 'pending_approval' ? (
-                      <PendingApprovalBadge row={row} />
-                    ) : row.status === 'returned' ? (
-                      <ReturnedBadge row={row} />
-                    ) : (
-                      <Badge variant="pickedup">Picked up by {row.picked_up_by || 'unknown'}</Badge>
-                    )}
-                  </td>
-                  <td className={cn(cellPad, 'text-right')}>
-                    {row.status === 'available' ? (
-                      <Button size="sm" variant="stamp" onClick={() => openSubmitModal([row])}>
-                        <Send className="h-3 w-3" /> Submit for approval
-                      </Button>
-                    ) : row.status === 'pending_approval' ? (
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        onClick={() => cancelSubmissions([row.id], row.payee)}
-                        disabled={cancelingIds.has(row.id)}
-                      >
-                        {cancelingIds.has(row.id) ? (
-                          <Loader2 className="h-3 w-3 animate-spin" />
-                        ) : (
-                          <RotateCcw className="h-3 w-3" />
-                        )}
-                        {cancelingIds.has(row.id) ? 'Cancelling…' : 'Cancel submission'}
-                      </Button>
-                    ) : row.status === 'reserved' || row.status === 'returned' ? (
-                      <span className="text-[9px] italic text-ink-300">Manage in Pending Pickups</span>
-                    ) : (
-                      <span className="text-[9px] text-ink-300">Completed</span>
-                    )}
-                  </td>
-                </tr>
+                <CheckRow
+                  key={row.id}
+                  row={row}
+                  cellPad={cellPad}
+                  selected={selectedIds.has(row.id)}
+                  onToggleSelected={toggleRowSelected}
+                  canceling={cancelingIds.has(row.id)}
+                  onSubmit={openSubmitModal}
+                  onCancel={cancelSubmissions}
+                />
               ))
             )}
           </tbody>
@@ -1114,7 +1174,7 @@ export default function AdminChecks() {
 // reservation, orange (`ledger-amber`) for anything sitting in a review
 // queue, and amber for a check an approver has sent back — matching the
 // semantics already used by the per-row badges below.
-function KpiCard({ icon: Icon, label, value, secondary, accent = 'teal', loading }) {
+const KpiCard = React.memo(function KpiCard({ icon: Icon, label, value, secondary, accent = 'teal' }) {
   const accents = {
     teal: { badge: 'bg-ledger-stamp/10 text-ledger-stampDark', ring: 'border-ledger-stamp/30' },
     lightTeal: { badge: 'bg-teal-50 text-teal-600', ring: 'border-teal-200' },
@@ -1124,7 +1184,7 @@ function KpiCard({ icon: Icon, label, value, secondary, accent = 'teal', loading
     ink: { badge: 'bg-ink-50 text-ink-700', ring: 'border-ink-100' },
   }
   const style = accents[accent] || accents.teal
-  const isLoading = loading || value === null || value === undefined
+  const isLoading = value === null || value === undefined
 
   return (
     <Card>
@@ -1157,9 +1217,9 @@ function KpiCard({ icon: Icon, label, value, secondary, accent = 'teal', loading
       </CardContent>
     </Card>
   )
-}
+})
 
-function SortableHeader({ label, sortKeyName, currentKey, asc, onClick, cellPad }) {
+const SortableHeader = React.memo(function SortableHeader({ label, sortKeyName, currentKey, asc, onClick, cellPad }) {
   const isActive = currentKey === sortKeyName
   const Icon = isActive ? (asc ? ArrowUp : ArrowDown) : ArrowUpDown
   return (
@@ -1173,28 +1233,29 @@ function SortableHeader({ label, sortKeyName, currentKey, asc, onClick, cellPad 
       </button>
     </th>
   )
-}
+})
 
-// Small pill for the bank a check came from. Falls back to a dashed
-// "unknown" pill for any legacy rows imported before the bank column
-// existed, rather than rendering blank.
-function BankBadge({ bank }) {
-  if (!bank) {
+// Generic pill for a single-value dimension on a check (bank, pickup
+// branch, etc). Replaces what used to be a bank-only component duplicated
+// verbatim for every new tag-like field — one component now covers both,
+// and any future dimension of the same shape.
+function EntityBadge({ icon: Icon, value, colorClass, emptyLabel = 'Unknown' }) {
+  if (!value) {
     return (
       <span className="inline-flex items-center gap-1 rounded-full border border-dashed border-ink-200 px-2 py-0.5 text-[9px] font-medium text-ink-400">
-        <Landmark className="h-2.5 w-2.5" />
-        Unknown
+        <Icon className="h-2.5 w-2.5" />
+        {emptyLabel}
       </span>
     )
   }
   return (
- <span
-  className="inline-flex max-w-[140px] items-center gap-1 truncate rounded-full bg-teal-50 px-2 py-0.5 text-[9px] font-medium text-teal-700"
-  title={bank}
->
-  <Landmark className="h-2.5 w-2.5 shrink-0" />
-  <span className="truncate">{bank}</span>
-</span>
+    <span
+      className={cn('inline-flex max-w-[140px] items-center gap-1 truncate rounded-full px-2 py-0.5 text-[9px] font-medium', colorClass)}
+      title={value}
+    >
+      <Icon className="h-2.5 w-2.5 shrink-0" />
+      <span className="truncate">{value}</span>
+    </span>
   )
 }
 
@@ -1229,8 +1290,7 @@ function CopyableCheckNo({ value }) {
 // A check that's merely 'reserved' — a collector has claimed it but no
 // admin has submitted it for approval yet. Distinct from 'pending_approval'
 // (already submitted, waiting on an approver) and from 'returned' (was
-// submitted, an approver sent it back). Showing this plainly, instead of
-// letting it fall through to "picked up," is the main fix here.
+// submitted, an approver sent it back).
 function ReservedBadge({ row }) {
   return (
     <span
@@ -1296,7 +1356,7 @@ function PendingApprovalBadge({ row }) {
           not just a hover tooltip — so this matches how the same three
           fields are shown as real columns on the Pending Pickups page. */}
       <span className="mt-0.5 flex flex-wrap items-center gap-1">
-          {row.or_no && (
+        {row.or_no && (
           <span className="rounded bg-ink-100 px-1.5 py-0.5 font-mono text-[9px] text-ink-600">
             Receipt {row.or_no}
           </span>
@@ -1330,6 +1390,78 @@ function PendingApprovalBadge({ row }) {
     </span>
   )
 }
+
+// Single check row, memoized so selecting, canceling, or opening the modal
+// for one row no longer forces every other row in the page to re-render.
+// Props are kept to primitives + stable (useCallback'd) function references
+// from the parent so the memo comparison actually pays off.
+const CheckRow = React.memo(function CheckRow({ row, cellPad, selected, onToggleSelected, canceling, onSubmit, onCancel }) {
+  return (
+    <tr className={cn('hover:bg-ink-50/40', selected && 'bg-ledger-stamp/5')}>
+      <td className={cellPad}>
+        <input
+          type="checkbox"
+          checked={selected}
+          onChange={() => onToggleSelected(row.id)}
+          className="h-3.5 w-3.5 accent-ledger-stamp"
+          aria-label={`Select ${row.payee}`}
+        />
+      </td>
+      <td className={cn(cellPad, 'font-mono text-[10px] text-ink-400')}>
+        {row.upload_batches?.file_name || '—'}
+        <br />
+        Row {row.row_number}
+      </td>
+      <td className={cn(cellPad, 'max-w-[150px]')}>
+        <EntityBadge icon={Landmark} value={row.bank} colorClass="bg-teal-50 text-teal-700" emptyLabel="Unknown" />
+      </td>
+      <td className={cn(cellPad, 'max-w-[150px]')}>
+        <EntityBadge icon={Building2} value={row.pickup_branch} colorClass="bg-indigo-50 text-indigo-700" emptyLabel="No branch" />
+      </td>
+      <td className={cn(cellPad, 'max-w-[180px] truncate font-medium text-ink-800')} title={row.payee || undefined}>
+        {row.payee || '—'}
+      </td>
+      <td className={cn(cellPad, 'max-w-[140px] truncate text-ink-600')}>{row.payor || '—'}</td>
+      <td className={cn(cellPad, 'font-mono text-ink-600')}>
+        <CopyableCheckNo value={row.check_no} />
+      </td>
+      <td className={cn(cellPad, 'text-ink-600')}>{row.check_date ? formatDate(row.check_date) : '—'}</td>
+      <td className={cn(cellPad, 'font-mono text-ink-800')}>{formatCurrency(row.amount)}</td>
+      <td className={cn(cellPad, 'text-[10px] text-ink-500')}>
+        {row.upload_batches?.uploaded_at ? formatDate(row.upload_batches.uploaded_at) : '—'}
+      </td>
+      <td className={cn(cellPad, 'max-w-[190px]')}>
+        {row.status === 'available' ? (
+          <Badge variant="available">Available</Badge>
+        ) : row.status === 'reserved' ? (
+          <ReservedBadge row={row} />
+        ) : row.status === 'pending_approval' ? (
+          <PendingApprovalBadge row={row} />
+        ) : row.status === 'returned' ? (
+          <ReturnedBadge row={row} />
+        ) : (
+          <Badge variant="pickedup">Picked up by {row.picked_up_by || 'unknown'}</Badge>
+        )}
+      </td>
+      <td className={cn(cellPad, 'text-right')}>
+        {row.status === 'available' ? (
+          <Button size="sm" variant="stamp" onClick={() => onSubmit([row])}>
+            <Send className="h-3 w-3" /> Submit for approval
+          </Button>
+        ) : row.status === 'pending_approval' ? (
+          <Button size="sm" variant="ghost" onClick={() => onCancel([row.id], row.payee)} disabled={canceling}>
+            {canceling ? <Loader2 className="h-3 w-3 animate-spin" /> : <RotateCcw className="h-3 w-3" />}
+            {canceling ? 'Cancelling…' : 'Cancel submission'}
+          </Button>
+        ) : row.status === 'reserved' || row.status === 'returned' ? (
+          <span className="text-[9px] italic text-ink-300">Manage in Pending Pickups</span>
+        ) : (
+          <span className="text-[9px] text-ink-300">Completed</span>
+        )}
+      </td>
+    </tr>
+  )
+})
 
 // Every check starts "included" (assumed being submitted) with an empty OR
 // number and no AR-collected / 2307-attached answer, so the admin's
@@ -1551,22 +1683,9 @@ function SubmitApprovalModal({ rows, onCancel, onConfirm, submitting, error }) {
                 />
               </div>
               <div className="flex shrink-0 items-center gap-2">
-                <SummaryPill
-                  label="checks to submit"
-                  value={includeCount}
-                  tone="neutral"
-                />
-                <SummaryPill
-                  label="details entered"
-                  value={`${completedCount}/${includeCount || 0}`}
-                  tone={allComplete ? 'positive' : 'warning'}
-                />
-                <SummaryPill
-                  label="total amount"
-                  value={formatCurrency(totalAmount)}
-                  tone="neutral"
-                  mono
-                />
+                <SummaryPill label="checks to submit" value={includeCount} tone="neutral" />
+                <SummaryPill label="details entered" value={`${completedCount}/${includeCount || 0}`} tone={allComplete ? 'positive' : 'warning'} />
+                <SummaryPill label="total amount" value={formatCurrency(totalAmount)} tone="neutral" mono />
               </div>
             </div>
           </div>
@@ -1877,10 +1996,7 @@ function SummaryPill({ label, value, tone = 'neutral', mono = false }) {
 // Shared Yes/No toggle button used for the AR-collected and 2307-Attached
 // controls in the modal, so both read identically at a glance.
 function YesNoButton({ active, onClick, label, tone }) {
-  const activeClass =
-    tone === 'positive'
-      ? 'border-ledger-stamp bg-ledger-stamp text-white'
-      : 'border-ink-700 bg-ink-700 text-white'
+  const activeClass = tone === 'positive' ? 'border-ledger-stamp bg-ledger-stamp text-white' : 'border-ink-700 bg-ink-700 text-white'
   return (
     <button
       type="button"
@@ -1901,7 +2017,7 @@ function SkeletonRows({ count, cellPad }) {
     <>
       {Array.from({ length: count }).map((_, i) => (
         <tr key={i}>
-          {Array.from({ length: 11 }).map((__, j) => (
+          {Array.from({ length: 12 }).map((__, j) => (
             <td key={j} className={cellPad}>
               <div className="h-3 w-full max-w-[7rem] animate-pulse rounded bg-ink-100" />
             </td>

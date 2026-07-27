@@ -7,6 +7,7 @@ import RequireRole from './components/RequireRole'
 import RoleHome from './components/RoleHome'
 import VerifierLayout from './components/VerifierLayout' // renamed from AdminLayout
 import ApproverLayout from './components/ApproverLayout'
+import AdminLayout from './components/AdminLayout'
 import { useAuth } from './hooks/useAuth'
 import { ProfileProvider } from './context/ProfileContext'
 
@@ -23,11 +24,10 @@ import ApproverDashboard from './pages/approver/ApproverDashboard'
 import ApproverHome from './pages/approver/ApproverHome'
 import ApproverHistory from './pages/approver/ApproverHistory'
 
-// TODO: build these out for the real admin tier. This is a minimal scaffold
-// so the /admin routes resolve to something instead of 404ing while you
-// build the actual admin panel. Swap in real components/pages when ready.
 import AdminDashboard from './pages/admin/AdminDashboard'
-import AdminUsers from './pages/admin/AdminUsers';
+import AdminUsers from './pages/admin/AdminUsers'
+import AdminAuditTrail from './pages/admin/AdminAuditTrail'
+import AdminReports from './pages/admin/AdminReports'
 
 export default function App() {
   const { user } = useAuth()
@@ -86,19 +86,24 @@ export default function App() {
               <Route path="qr" element={<VerifierQR />} />
             </Route>
 
-            {/* Reserved for the real admin tier (oversees verifiers/approvers).
-                Once you seed an admin profile row and build real pages, just
-                swap the element below for your admin layout/pages. */}
+            {/* Admin tier — oversees verifiers/approvers. Dashboard, activity
+                logs (audit trail), user management, and reports all live
+                under AdminLayout's nav. */}
             <Route
               path="/admin"
               element={
                 <ProtectedRoute>
                   <RequireRole role="admin" redirectTo="/role-home">
-                    <AdminDashboard />
+                    <AdminLayout />
                   </RequireRole>
                 </ProtectedRoute>
               }
-            />
+            >
+              <Route index element={<AdminDashboard />} />
+              <Route path="audit" element={<AdminAuditTrail />} />
+              <Route path="users" element={<AdminUsers />} />
+              <Route path="reports" element={<AdminReports />} />
+            </Route>
 
             <Route
               path="/approver"
