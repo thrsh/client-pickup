@@ -669,7 +669,7 @@ function RouteGraphic() {
   return (
     <div className="relative hidden h-full w-full items-center justify-center overflow-hidden md:flex">
       <div className="absolute inset-0 flex items-center justify-center opacity-40">
-        <div className="h-72 w-72 rounded-full bg-[var(--brand-light)]/40 blur-3xl"></div>
+        <div className="h-84 w-84 rounded-full bg-[var(--brand-light)]/40 blur-3xl"></div>
       </div>
 
       <img
