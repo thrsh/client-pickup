@@ -12,6 +12,14 @@ import {
   Landmark,
   Building2,
   ExternalLink,
+  Route,
+  Phone,
+  Copy,
+  Check,
+  FileCheck,
+  FileSignature,
+  CreditCard,
+  Map as MapIcon,
 } from 'lucide-react'
 import { supabase } from '../lib/supabaseClient'
 import { Input } from '../components/ui/input'
@@ -39,10 +47,35 @@ const BRANCH_FIELD = 'pickup_branch'
 
 // Central registry of every pickup office. Adding a 3rd branch later means
 // adding one more entry here — nothing else in the component needs to change.
+// Generic, branch-agnostic checklist. Kept separate from OFFICES since this
+// is standard pickup policy rather than a per-branch fact — confirm the
+// exact wording with CSBA's ops/compliance team before treating it as final.
+const PICKUP_REQUIREMENTS = [
+  {
+    icon: 'id',
+    text: '1 valid government-issued ID',
+    // Subtle hint of commonly-accepted ID types — confirm the exact
+    // accepted list with CSBA's ops/compliance team before treating this
+    // as final policy.
+    examples: ["Passport", "Driver's License", 'National ID', 'Postal ID'],
+  },
+  { icon: 'auth', text: 'Authorization letter, if not the named payee' },
+]
+
+// Shared operating hours across branches, as provided. If a specific branch
+// ever runs a different schedule, just set that office's own `hours` field
+// to override this.
+const OFFICE_HOURS = 'Mon–Thu 8:00 AM–7:00 PM · Fri 8:00 AM–7:30 PM'
+
 const OFFICES = {
   'CSBA - PARQAL': {
     label: 'Parañaque Office',
     shortLabel: 'Parañaque',
+    // Phone is intentionally left null (not fabricated) — fill in with a
+    // confirmed number. The UI falls back to a generic "contact CSBA" line
+    // whenever it's null, so it's safe to leave unset until confirmed.
+    hours: OFFICE_HOURS,
+    phone: null, // e.g. '+63 2 8888 0000'
     address: {
       line1: '4th Floor, Unit 407-408',
       line2: 'Kawayan Building 1, PARQAL',
@@ -60,6 +93,8 @@ const OFFICES = {
   'CSBA - BGC': {
     label: 'Taguig Office',
     shortLabel: 'BGC, Taguig',
+    hours: OFFICE_HOURS,
+    phone: null,
     address: {
       line1: 'Bonifacio Technology Center',
       line2: '31st Street cor 2nd Avenue',
@@ -130,6 +165,14 @@ export default function PublicSearch() {
   const [showPayorSuggestions, setShowPayorSuggestions] = useState(false)
   const payorBoxRef = useRef(null)
 
+  // Guards against out-of-order responses: if the user fires a second search
+  // before the first one's Supabase round-trip resolves, only the response
+  // matching the *latest* request id is allowed to update state. Without
+  // this, a slow earlier request can resolve after a faster later one and
+  // silently overwrite correct results (and correct branch/location
+  // breakdown) with stale data.
+  const requestIdRef = useRef(0)
+
   // Live suggestions effects
   useEffect(() => {
     const term = payeeQuery.trim()
@@ -176,8 +219,12 @@ export default function PublicSearch() {
       .eq('status', 'available')
       .eq('bank', bankValue)
 
+    // Both fields use the same partial, case-insensitive matching strategy.
+    // (Previously payor used an exact match with no wildcards — a single
+    // missing middle name or extra space meant a real match, including one
+    // split across two branches, would silently come back as zero results.)
     if (payee) req = req.ilike('payee', `%${payee}%`)
-    if (payor) req = req.ilike('payor', payor)
+    if (payor) req = req.ilike('payor', `%${payor}%`)
 
     return req
   }
@@ -194,6 +241,7 @@ export default function PublicSearch() {
       return
     }
 
+    const thisRequestId = ++requestIdRef.current
     setLoading(true)
 
     try {
@@ -206,6 +254,10 @@ export default function PublicSearch() {
           buildBaseQuery(bankValue, payee, payor).eq(BRANCH_FIELD, key)
         ),
       ])
+
+      // A newer search has since been kicked off — drop this result rather
+      // than let it clobber the more recent one.
+      if (thisRequestId !== requestIdRef.current) return
 
       if (totalResult.error) throw totalResult.error
 
@@ -220,11 +272,14 @@ export default function PublicSearch() {
       setMatchedCount(totalResult.count || 0)
       setBranchCounts(nextBranchCounts)
     } catch (err) {
+      if (thisRequestId !== requestIdRef.current) return
       console.error('Failed to fetch check matches:', err)
       setMatchedCount(0)
       setBranchCounts({})
     } finally {
-      setLoading(false)
+      if (thisRequestId === requestIdRef.current) {
+        setLoading(false)
+      }
     }
   }
 
@@ -669,11 +724,38 @@ function useCountUp(target, active) {
   return value
 }
 
+// Builds a plain-text pickup summary and copies it to the clipboard, with a
+// brief "Copied!" confirmation state — no external toast library needed.
+function useCopySummary(text) {
+  const [copied, setCopied] = useState(false)
+  const timeoutRef = useRef(null)
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(text)
+    } catch (err) {
+      console.error('Clipboard write failed:', err)
+      return
+    }
+    setCopied(true)
+    clearTimeout(timeoutRef.current)
+    timeoutRef.current = setTimeout(() => setCopied(false), 2000)
+  }
+
+  useEffect(() => () => clearTimeout(timeoutRef.current), [])
+
+  return { copied, copy }
+}
+
 function ManifestCountCard({ loading, count, branchCounts, bank, payee, payor }) {
   const displayCount = useCountUp(count, !loading)
 
-  // Which branches actually have matching checks, ranked by count.
-  const activeBranchKeys = Object.keys(OFFICES).filter((key) => (branchCounts[key] || 0) > 0)
+  // Which branches actually have matching checks, ranked by count — this
+  // ordering drives the grid below, largest pickup first.
+  const activeBranchKeys = Object.keys(OFFICES)
+    .filter((key) => (branchCounts[key] || 0) > 0)
+    .sort((a, b) => (branchCounts[b] || 0) - (branchCounts[a] || 0))
+  const isMultiLocation = activeBranchKeys.length > 1
 
   // Checks matched by the query but tagged with a branch not in OFFICES
   // (e.g. new branch added to the DB before the UI was updated for it).
@@ -682,21 +764,15 @@ function ManifestCountCard({ loading, count, branchCounts, bank, payee, payor })
     count - activeBranchKeys.reduce((sum, key) => sum + (branchCounts[key] || 0), 0)
   )
 
-  const [selectedBranchKey, setSelectedBranchKey] = useState(null)
-
-  // Keep the selected branch tab in sync with the latest search results:
-  // default to whichever matched branch has the most checks.
-  useEffect(() => {
-    if (activeBranchKeys.length === 0) {
-      setSelectedBranchKey(null)
-      return
-    }
-    const sorted = [...activeBranchKeys].sort(
-      (a, b) => (branchCounts[b] || 0) - (branchCounts[a] || 0)
-    )
-    setSelectedBranchKey(sorted[0])
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [count, JSON.stringify(branchCounts)])
+  const summaryText = [
+    `CSBA check pickup — ${bank}`,
+    `Payee: ${payee} · Payor: ${payor}`,
+    `${count} check${count === 1 ? '' : 's'} ready for pickup`,
+    ...activeBranchKeys.map(
+      (key) => `• ${OFFICES[key].label}: ${branchCounts[key]} check${branchCounts[key] === 1 ? '' : 's'}`
+    ),
+  ].join('\n')
+  const { copied, copy: copySummary } = useCopySummary(summaryText)
 
   if (loading) {
     return (
@@ -737,204 +813,295 @@ function ManifestCountCard({ loading, count, branchCounts, bank, payee, payor })
     )
   }
 
-  const selectedOffice = selectedBranchKey ? OFFICES[selectedBranchKey] : null
-
-  // "Success" State Graphic — flows straight into the pickup-location
-  // section below so the whole thing reads as one continuous surface
-  // rather than stacked cards.
+  // "Success" state: header summary + a grid of location cards. Every
+  // matched branch renders side-by-side (not behind a tab), so a
+  // multi-location result is fully visible without extra scrolling or
+  // clicking - the grid itself *is* the multi-location feature.
   return (
     <div className="slide-up relative overflow-hidden rounded-2xl bg-white shadow-xl border border-[var(--brand-light)]">
       <div className="absolute top-0 h-1.5 w-full bg-gradient-to-r from-[var(--brand)] to-[var(--accent)]"></div>
 
-      {/* Decorative background blobs, spread across the full card height */}
+      {/* Decorative background blobs */}
       <div className="absolute -left-20 -top-20 h-64 w-64 rounded-full bg-[var(--brand-light)] opacity-40 blur-3xl pointer-events-none"></div>
-      <div className="absolute -right-24 top-1/3 h-72 w-72 rounded-full bg-[var(--accent-soft)] opacity-30 blur-3xl pointer-events-none"></div>
-      <div className="absolute -left-16 bottom-0 h-56 w-56 rounded-full bg-[var(--brand-light)] opacity-30 blur-3xl pointer-events-none"></div>
+      <div className="absolute -right-24 top-0 h-72 w-72 rounded-full bg-[var(--accent-soft)] opacity-30 blur-3xl pointer-events-none"></div>
 
-      {/* Count + query summary */}
-      <div className="relative z-10 flex flex-col items-center px-6 pt-14 text-center sm:px-8">
-        <div className="mb-4 inline-flex items-center gap-2 rounded-full bg-[var(--brand)]/10 px-4 py-1.5 text-xs font-semibold uppercase tracking-widest text-[var(--brand-dark)]">
-          <Sparkles className="h-4 w-4" /> Scan successful
-        </div>
-
-        <h2 className="font-display text-3xl font-extrabold text-[var(--ink-dark)] mt-2">
-          Checks ready for pickup
-        </h2>
-
-        <div className="my-6">
-          <span className="font-display text-7xl font-extrabold tabular-nums text-[var(--brand)]">
-            {displayCount}
-          </span>
-        </div>
-
-        <div className="flex w-full max-w-lg flex-col items-center gap-3">
-          <div className="grid w-full grid-cols-3 divide-x divide-slate-200 overflow-hidden rounded-xl border border-slate-200 bg-slate-50 shadow-inner">
-            <div className="flex flex-col items-center gap-1.5 px-4 py-4">
-              <span className="flex items-center gap-1 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-                <Landmark className="h-3 w-3" /> Bank
-              </span>
-              <span className="text-sm font-semibold text-[var(--ink)] text-center break-words">{bank}</span>
-            </div>
-            <div className="flex flex-col items-center gap-1.5 px-4 py-4">
-              <span className="flex items-center gap-1 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-                <MapPin className="h-3 w-3" /> Payee
-              </span>
-              <span className="text-sm font-semibold text-[var(--ink)] text-center break-words">{payee}</span>
-            </div>
-            <div className="flex flex-col items-center gap-1.5 px-4 py-4">
-              <span className="flex items-center gap-1 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-                <Search className="h-3 w-3" /> Payor
-              </span>
-              <span className="text-sm font-semibold text-[var(--ink)] text-center break-words">{payor}</span>
-            </div>
+      {/* Compact header: count + query on the left, location quick-glance on
+          the right. Side-by-side on desktop instead of stacked, so the
+          location cards start much higher on the page. */}
+      <div className="relative z-10 grid grid-cols-1 gap-8 border-b border-slate-100 px-6 py-8 sm:px-8 lg:grid-cols-[auto_1fr] lg:items-center lg:gap-10">
+        <div className="flex flex-col items-center text-center lg:items-start lg:text-left">
+          <div className="inline-flex items-center gap-2 rounded-full bg-[var(--brand)]/10 px-4 py-1.5 text-xs font-semibold uppercase tracking-widest text-[var(--brand-dark)]">
+            <Sparkles className="h-4 w-4" /> Scan successful
           </div>
-          <div className="flex items-center gap-1.5 text-xs font-medium text-slate-400">
+          <div className="mt-3 flex items-baseline gap-3">
+            <span className="font-display text-6xl font-extrabold tabular-nums text-[var(--brand)] sm:text-7xl">
+              {displayCount}
+            </span>
+            <span className="font-display text-lg font-bold text-[var(--ink-dark)]">
+              check{count === 1 ? '' : 's'} ready
+            </span>
+          </div>
+          <div className="mt-1 flex items-center gap-1.5 text-xs font-medium text-slate-400">
             <Clock className="h-3.5 w-3.5" />
             Queried {new Date().toLocaleString()}
           </div>
         </div>
-      </div>
 
-      {/* Labeled divider — the seam between the count and the pickup info */}
-      <div className="relative z-10 mt-10 px-6 sm:px-8">
-        <div className="h-px w-full bg-gradient-to-r from-transparent via-slate-200 to-transparent"></div>
-        <span className="absolute left-1/2 top-0 inline-flex -translate-x-1/2 -translate-y-1/2 items-center gap-1.5 rounded-full border border-slate-200 bg-white px-4 py-1.5 text-[11px] font-semibold uppercase tracking-widest text-slate-400 shadow-sm">
-          <MapPin className="h-3 w-3 text-[var(--accent)]" /> Where to collect
-        </span>
-      </div>
+        <div className="flex flex-col gap-4">
+          {/* Query chips - back in their original spot next to the count,
+              just a size up from before: full values (no truncation),
+              uppercase, readable at a glance without the full-width tiles. */}
+          <div className="flex flex-col gap-2.5">
+            <QueryChip icon={Landmark} label="Bank" value={bank} size="sm" full />
+            <div className="grid grid-cols-2 gap-2.5">
+              <QueryChip icon={MapPin} label="Payee" value={payee} full />
+              <QueryChip icon={Search} label="Payor" value={payor} full />
+            </div>
+          </div>
 
-      {/* Branch switcher — only shown when more than one branch has matches */}
-      {activeBranchKeys.length > 1 && (
-        <div className="relative z-10 mt-8 flex flex-wrap items-center justify-center gap-2 px-6 sm:px-8">
-          {activeBranchKeys.map((key) => {
-            const office = OFFICES[key]
-            const isSelected = key === selectedBranchKey
-            return (
-              <button
-                key={key}
-                type="button"
-                onClick={() => setSelectedBranchKey(key)}
-                aria-pressed={isSelected}
-                className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-sm font-semibold transition-colors ${
-                  isSelected
-                    ? 'border-[var(--brand)] bg-[var(--brand)] text-white shadow-sm'
-                    : 'border-slate-200 bg-white text-slate-600 hover:border-[var(--brand-light)] hover:text-[var(--brand-dark)]'
-                }`}
-              >
-                <Building2 className="h-3.5 w-3.5" />
-                {office.shortLabel}
-                <span
-                  className={`rounded-full px-2 py-0.5 text-xs font-bold tabular-nums ${
-                    isSelected ? 'bg-white/20 text-white' : 'bg-slate-100 text-slate-500'
-                  }`}
-                >
-                  {branchCounts[key] || 0}
+          {/* Multi-location summary - lives right next to the count instead
+              of a separate section the user has to scroll to reach. */}
+          {isMultiLocation ? (
+            <div className="rounded-xl border border-[var(--accent)]/30 bg-[var(--accent-soft)] px-4 py-3">
+              <div className="flex flex-wrap items-center gap-2 text-[var(--accent-dark)]">
+                <Route className="h-4 w-4 shrink-0" />
+                <span className="text-sm font-bold">
+                  Split across {activeBranchKeys.length} locations - visit each one below
                 </span>
-              </button>
-            )
-          })}
-        </div>
-      )}
+              </div>
+            </div>
+          ) : (
+            <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold text-slate-500">
+              <MapPin className="h-4 w-4 text-[var(--brand)]" />
+              One pickup location - see details below
+            </div>
+          )}
 
-      {/* Pickup location + interactive map */}
-      {selectedOffice ? (
-        <OfficeDetails office={selectedOffice} />
-      ) : (
-        <UnmappedBranchNotice count={unmappedCount} />
-      )}
-
-      {unmappedCount > 0 && selectedOffice && (
-        <div className="relative z-10 mx-6 mb-8 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs font-medium text-amber-700 sm:mx-8">
-          {unmappedCount} of your {count} matching {unmappedCount === 1 ? 'check is' : 'checks are'} at a branch not
-          shown here — please contact CSBA for pickup details on those.
+          <button
+            type="button"
+            onClick={copySummary}
+            className="inline-flex w-fit items-center gap-2 self-center rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-xs font-semibold text-slate-500 shadow-sm transition-colors hover:border-[var(--brand-light)] hover:text-[var(--brand-dark)] lg:self-start"
+          >
+            {copied ? <Check className="h-3.5 w-3.5 text-[var(--brand)]" /> : <Copy className="h-3.5 w-3.5" />}
+            {copied ? 'Copied to clipboard' : 'Copy pickup summary'}
+          </button>
         </div>
-      )}
+      </div>
+
+      {/* Location grid - every matched branch, always visible side-by-side */}
+      <div className="relative z-10 px-6 py-8 sm:px-8">
+        {activeBranchKeys.length > 0 ? (
+          <div
+            className={`grid gap-6 ${
+              activeBranchKeys.length === 1 ? 'grid-cols-1' : 'grid-cols-1 lg:grid-cols-2'
+            }`}
+          >
+            {activeBranchKeys.map((key) => (
+              <LocationCard
+                key={key}
+                office={OFFICES[key]}
+                count={branchCounts[key]}
+                wide={activeBranchKeys.length === 1}
+              />
+            ))}
+          </div>
+        ) : (
+          <UnmappedBranchNotice count={unmappedCount} />
+        )}
+
+        {unmappedCount > 0 && activeBranchKeys.length > 0 && (
+          <div className="mt-6 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs font-medium text-amber-700">
+            {unmappedCount} of your {count} matching {unmappedCount === 1 ? 'check is' : 'checks are'} at a branch not
+            shown here - please contact CSBA for pickup details on those.
+          </div>
+        )}
+      </div>
     </div>
   )
 }
 
-function OfficeDetails({ office }) {
+// A mid-sized query chip: bigger and bolder than the original tiny pill,
+// but not as large as a full-width tile. Full value shown (wraps instead
+// of truncating) and normalized to uppercase for scannability — the
+// underlying value used for search/copy/logic is untouched, only the
+// display is transformed.
+function QueryChip({ icon: Icon, label, value, full, size = 'md' }) {
+  const isSmall = size === 'sm'
+  return (
+    <div
+      className={`inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 ${
+        isSmall ? 'px-3 py-1.5' : 'px-3.5 py-2'
+      } ${full ? 'w-full' : ''}`}
+    >
+      <Icon className={`shrink-0 text-slate-400 ${isSmall ? 'h-3.5 w-3.5' : 'h-4 w-4'}`} />
+      <span
+        className={`shrink-0 font-semibold uppercase tracking-wide text-slate-400 ${
+          isSmall ? 'text-[10px]' : 'text-[11px]'
+        }`}
+      >
+        {label}
+      </span>
+      <span
+        className={`min-w-0 break-words font-bold uppercase tracking-wide text-[var(--ink-dark)] ${
+          isSmall ? 'text-xs' : 'text-sm'
+        }`}
+      >
+        {value}
+      </span>
+    </div>
+  )
+}
+
+// A single pickup location: identity + count, address, hours/phone (with a
+// safe generic fallback when not yet confirmed), a standard requirements
+// checklist, directions/copy actions, and an interactive map/street-view
+// toggle. Used once per matched branch inside the grid above, so multiple
+// locations are always visible together rather than switched between.
+function LocationCard({ office, count, wide }) {
   const streetViewSrc = getStreetViewSrc(office)
   const hasStreetView = Boolean(streetViewSrc)
   const [mapView, setMapView] = useState(hasStreetView ? 'street' : 'map')
+  const [addressCopied, setAddressCopied] = useState(false)
 
-  // If the selected office changes and (in the edge case of missing
-  // coordinates) has no street view available, make sure we're never stuck
-  // showing a stale/blank "street" tab.
   useEffect(() => {
-    if (!hasStreetView && mapView === 'street') {
-      setMapView('map')
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [office, hasStreetView])
+    if (!hasStreetView && mapView === 'street') setMapView('map')
+  }, [hasStreetView, mapView])
 
   const mapSrc = getMapSrc(office)
   const directionsUrl = getDirectionsUrl(office)
+  const fullAddress = [office.address.line1, office.address.line2, office.address.line3, office.address.line4].join(
+    ', '
+  )
+
+  async function copyAddress() {
+    try {
+      await navigator.clipboard.writeText(fullAddress)
+      setAddressCopied(true)
+      setTimeout(() => setAddressCopied(false), 2000)
+    } catch (err) {
+      console.error('Clipboard write failed:', err)
+    }
+  }
 
   return (
-    <div className="relative z-10 grid grid-cols-1 gap-8 px-6 pb-8 pt-9 text-left sm:grid-cols-5 sm:gap-10 sm:px-8 sm:pb-10">
-      <div className="flex flex-col justify-center sm:col-span-2">
-        <div className="flex items-center gap-2">
-          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-[var(--brand)]/10 text-[var(--brand-dark)]">
-            <Building2 className="h-4.5 w-4.5" />
+    <div
+      className={`relative flex flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm ${
+        wide ? 'lg:flex-row' : ''
+      }`}
+    >
+      {/* Identity + details */}
+      <div className={`flex flex-col gap-4 p-6 ${wide ? 'lg:w-[42%] lg:justify-center' : ''}`}>
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex items-center gap-2.5">
+            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[var(--brand)]/10 text-[var(--brand-dark)]">
+              {/* Sourced from /public/csba-icon.png — served at the site root */}
+              <img src="/csba-icon.png" alt="CSBA" className="h-5 w-5 object-contain" />
+            </span>
+            <div>
+              <h3 className="font-display text-lg font-extrabold leading-tight text-[var(--ink-dark)]">
+                {office.label}
+              </h3>
+              <p className="text-xs font-medium text-slate-400">CSBA branch office</p>
+            </div>
+          </div>
+          <span className="shrink-0 rounded-full bg-[var(--brand)] px-3 py-1 text-sm font-bold tabular-nums text-white shadow-sm">
+            {count} check{count === 1 ? '' : 's'}
           </span>
-          <h3 className="font-display text-xl font-extrabold text-[var(--ink-dark)]">{office.label}</h3>
         </div>
-        <p className="mt-4 text-[15px] font-medium leading-relaxed text-slate-600">
-          {office.address.line1}
-          <br />
-          {office.address.line2}
-          <br />
-          {office.address.line3}
-          <br />
-          {office.address.line4}
-        </p>
 
-        <a
-          href={directionsUrl}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="group mt-6 inline-flex w-fit items-center justify-center gap-2 rounded-xl bg-[var(--accent)] px-6 py-3.5 text-sm font-semibold text-white shadow-lg shadow-[var(--accent)]/30 transition-all hover:-translate-y-0.5 hover:bg-[var(--accent-dark)] hover:shadow-[var(--accent)]/50"
-        >
-          <Navigation className="h-4 w-4" />
-          Get directions
-          <ExternalLink className="h-3.5 w-3.5 opacity-70 transition-transform group-hover:translate-x-0.5" />
-        </a>
+        <p className="text-sm font-medium leading-relaxed text-slate-600">{fullAddress}</p>
+
+        <div className="flex flex-wrap gap-4 text-xs font-semibold text-slate-500">
+          <span className="inline-flex items-center gap-1.5">
+            <Clock className="h-3.5 w-3.5 text-[var(--brand)]" />
+            {office.hours || 'Contact CSBA for hours'}
+          </span>
+          <span className="inline-flex items-center gap-1.5">
+            <Phone className="h-3.5 w-3.5 text-[var(--brand)]" />
+            {office.phone || 'Contact CSBA for phone support'}
+          </span>
+        </div>
+
+        <div className="rounded-xl border border-slate-100 bg-slate-50 px-4 py-3">
+          <p className="mb-2 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+            <FileCheck className="h-3.5 w-3.5" /> What to bring
+          </p>
+          <ul className="flex flex-col gap-2.5">
+            {PICKUP_REQUIREMENTS.map((req) => {
+              const ReqIcon = req.icon === 'id' ? CreditCard : FileSignature
+              return (
+                <li key={req.text} className="flex flex-col gap-1">
+                  <div className="flex items-center gap-2 text-xs font-medium text-slate-600">
+                    <ReqIcon className="h-3.5 w-3.5 shrink-0 text-[var(--brand-dark)]" />
+                    {req.text}
+                  </div>
+                  {/* Subtle hint: accepted ID types, tucked under the main
+                      line rather than as separate checklist rows */}
+                  {req.examples && (
+                    <p className="pl-[1.375rem] text-[11px] font-medium text-slate-400">
+                      {req.examples.join(' · ')}
+                    </p>
+                  )}
+                </li>
+              )
+            })}
+          </ul>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <a
+            href={directionsUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="group/btn inline-flex items-center justify-center gap-2 rounded-xl bg-[var(--accent)] px-5 py-3 text-sm font-semibold text-white shadow-md shadow-[var(--accent)]/30 transition-all hover:-translate-y-0.5 hover:bg-[var(--accent-dark)] hover:shadow-[var(--accent)]/50"
+          >
+            <Navigation className="h-4 w-4" />
+            Get directions
+            <ExternalLink className="h-3.5 w-3.5 opacity-70 transition-transform group-hover/btn:translate-x-0.5" />
+          </a>
+          <button
+            type="button"
+            onClick={copyAddress}
+            className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-500 transition-colors hover:border-[var(--brand-light)] hover:text-[var(--brand-dark)]"
+          >
+            {addressCopied ? <Check className="h-4 w-4 text-[var(--brand)]" /> : <Copy className="h-4 w-4" />}
+            {addressCopied ? 'Copied' : 'Copy address'}
+          </button>
+        </div>
       </div>
 
-      <div className="sm:col-span-3">
-        {/* View switcher — Street view tab only renders when the office has
-            a real panorama configured, so we never show a broken embed. */}
-        <div className="mb-3 inline-flex rounded-lg bg-slate-100 p-1">
+      {/* Interactive map / street view */}
+      <div className={`flex flex-col p-6 pt-0 ${wide ? 'lg:w-[58%] lg:justify-center lg:pt-6' : ''}`}>
+        <div className="mb-3 inline-flex w-fit rounded-lg bg-slate-100 p-1">
           {hasStreetView && (
             <button
               type="button"
               onClick={() => setMapView('street')}
               aria-pressed={mapView === 'street'}
-              className={`rounded-md px-4 py-2 text-xs font-semibold uppercase tracking-wide transition-colors ${
+              className={`inline-flex items-center gap-1.5 rounded-md px-3.5 py-1.5 text-xs font-semibold uppercase tracking-wide transition-colors ${
                 mapView === 'street'
                   ? 'bg-white text-[var(--brand-dark)] shadow-sm'
                   : 'text-slate-500 hover:text-[var(--ink)]'
               }`}
             >
-              Street view
+              <Navigation className="h-3 w-3" /> Street
             </button>
           )}
           <button
             type="button"
             onClick={() => setMapView('map')}
             aria-pressed={mapView === 'map'}
-            className={`rounded-md px-4 py-2 text-xs font-semibold uppercase tracking-wide transition-colors ${
+            className={`inline-flex items-center gap-1.5 rounded-md px-3.5 py-1.5 text-xs font-semibold uppercase tracking-wide transition-colors ${
               mapView === 'map'
                 ? 'bg-white text-[var(--brand-dark)] shadow-sm'
                 : 'text-slate-500 hover:text-[var(--ink)]'
             }`}
           >
-            Map
+            <MapIcon className="h-3 w-3" /> Map
           </button>
         </div>
 
-        <div className="map-frame-wrap relative w-full overflow-hidden rounded-2xl border border-slate-200 shadow-md">
+        <div className="relative aspect-[4/3] w-full overflow-hidden rounded-2xl border border-slate-200 shadow-md sm:aspect-[16/10]">
           <iframe
             key={`${office.label}-${mapView}`}
             title={mapView === 'street' ? `Street view of CSBA ${office.label}` : `Map location of CSBA ${office.label}`}
@@ -945,13 +1112,12 @@ function OfficeDetails({ office }) {
             allowFullScreen
           />
           <div className="pointer-events-none absolute inset-0 rounded-2xl ring-1 ring-inset ring-black/5"></div>
-
           <div className="pointer-events-none absolute left-3 top-3 flex items-center gap-1.5 rounded-full bg-white/90 px-3 py-1.5 text-[11px] font-semibold text-[var(--brand-dark)] shadow-sm backdrop-blur">
             <span className="relative flex h-2 w-2">
               <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[var(--brand)] opacity-60"></span>
               <span className="relative inline-flex h-2 w-2 rounded-full bg-[var(--brand)]"></span>
             </span>
-            {mapView === 'street' ? 'Street view — actual building' : 'Exact location — no other pins'}
+            {mapView === 'street' ? 'Actual building' : 'Exact pin, no clutter'}
           </div>
         </div>
       </div>
