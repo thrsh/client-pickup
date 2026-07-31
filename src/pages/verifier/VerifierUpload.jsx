@@ -39,7 +39,11 @@ import { logAuditEvent } from '../../lib/adminAuditApi'
 // Client Ref No / Pickup Branch / Account Number become mandatory for every
 // upload — mappingComplete, the red-asterisk markers, and the missing-value
 // flags all read from FIELD_DEFS[...].required, so this is the ONLY line
-// that needs to change to make that switch.
+// that needs to change to make that switch. It does NOT affect the payee
+// columns below — payee has its own conditional requirement (company OR
+// individual name) handled separately by `payeeMappingValid` and the
+// per-row `missingPayee*` flags, since it can't be expressed as a single
+// required/optional flag per field.
 //
 // CORE_FIELDS vs EXTRA_FIELDS is a SEPARATE split from required/optional —
 // it controls table STRUCTURE (which dedicated columns exist), not
@@ -51,7 +55,17 @@ import { logAuditEvent } from '../../lib/adminAuditApi'
 const EXTRA_FIELDS_REQUIRED = false
 
 const FIELD_DEFS = [
-  { key: 'payee', label: 'Payee', required: true },
+  // Payee is no longer a single free-text column. It's resolved from
+  // EITHER a company name OR an individual's first/middle/last name — a
+  // row must supply one or the other. None of these four carry
+  // `required: true` here (that flag only drives the plain "map this one
+  // column" logic used by REQUIRED_FIELDS below); the real conditional
+  // rule — company OR (first AND last) — lives in `payeeMappingValid`
+  // (mapping-time) and the per-row `missingPayee*` flags (data-time).
+  { key: 'payee_company', label: 'Payee Company', required: false },
+  { key: 'payee_first_name', label: 'Payee First Name', required: false },
+  { key: 'payee_middle_name', label: 'Payee Middle Name', required: false },
+  { key: 'payee_last_name', label: 'Payee Last Name', required: false },
   { key: 'payor', label: 'Payor', required: true },
   { key: 'check_no', label: 'Check No', required: true },
   { key: 'check_date', label: 'Check Date', required: true },
@@ -59,25 +73,43 @@ const FIELD_DEFS = [
   { key: 'client_ref_no', label: 'Client Ref. No', required: EXTRA_FIELDS_REQUIRED },
   { key: 'pickup_branch', label: 'Pickup Branch', required: EXTRA_FIELDS_REQUIRED },
   { key: 'account_number', label: 'Account Number', required: EXTRA_FIELDS_REQUIRED },
+  // 2307 (BIR withholding certificate) attachment flag. Always optional,
+  // but strictly normalized down to a single 'Y' or 'N' regardless of the
+  // case or wording ("yes"/"no") used in the source file.
+  { key: 'form_2307_attached', label: '2307 Attached (Y/N)', required: false },
 ]
 const FIELD_DEFS_BY_KEY = Object.fromEntries(FIELD_DEFS.map((f) => [f.key, f]))
 
-const CORE_FIELD_KEYS = ['payee', 'payor', 'check_no', 'check_date', 'amount']
+const CORE_FIELD_KEYS = [
+  'payee_company',
+  'payee_first_name',
+  'payee_middle_name',
+  'payee_last_name',
+  'payor',
+  'check_no',
+  'check_date',
+  'amount',
+]
 const CORE_FIELDS = FIELD_DEFS.filter((f) => CORE_FIELD_KEYS.includes(f.key))
 const EXTRA_FIELDS = FIELD_DEFS.filter((f) => !CORE_FIELD_KEYS.includes(f.key))
 
 // Used ONLY for "map N required fields to continue" messaging and the
-// mappingComplete gate — never for table layout (see note above).
+// mappingComplete gate — never for table layout (see note above). Payee
+// is deliberately excluded (see FIELD_DEFS comment) and checked via
+// `payeeMappingValid` instead.
 const REQUIRED_FIELDS = FIELD_DEFS.filter((f) => f.required)
 
 const CLIENT_REF_MAX_LENGTH = 12
 const ACCOUNT_NUMBER_MAX_LENGTH = 12
 const PICKUP_BRANCH_MAX_LENGTH = 100
+const PAYEE_NAME_PART_MAX_LENGTH = 60
+const COMPANY_NAME_MAX_LENGTH = 150
 
-// Include, Row, Bank + every configured field column — computed instead of
-// hardcoded so it can never drift out of sync with the actual <th> count,
-// including if more optional fields are added later.
-const PREVIEW_COLSPAN = CORE_FIELDS.length + EXTRA_FIELDS.length + 3
+// Include, Row, Bank, the resolved Payee column, and every configured
+// field column — computed instead of hardcoded so it can never drift out
+// of sync with the actual <th> count, including if more optional fields
+// are added later.
+const PREVIEW_COLSPAN = CORE_FIELDS.length + EXTRA_FIELDS.length + 4
 
 // Default bank list — extend/edit as needed, or swap this for a Supabase
 // lookup (e.g. a `banks` table) later without touching anything else,
@@ -126,7 +158,13 @@ const IMPORT_CHUNK_SIZE = 500
 // by the breakdown panel, the per-cell tooltips, and the flagged-rows CSV
 // export so the wording never drifts between the three.
 const FLAG_LABELS = {
-  missingPayee: 'Missing payee',
+  missingPayee: 'Missing payee (no company or individual name provided)',
+  missingPayeeFirstName: 'Missing payee first name (required when no company is given)',
+  missingPayeeLastName: 'Missing payee last name (required when no company is given)',
+  invalidPayeeFirstName: 'Payee first name must be letters only (no numbers, periods, or commas)',
+  invalidPayeeMiddleName: 'Payee middle name must be letters only (no numbers, periods, or commas)',
+  invalidPayeeLastName: 'Payee last name must be letters only (no numbers, periods, or commas)',
+  bothPayeeProvided: 'Both a company and an individual name were given — the company name will be used',
   missingPayor: 'Missing payor',
   missingCheckNo: 'Missing check no.',
   invalidAmount: 'Invalid or zero amount',
@@ -141,6 +179,7 @@ const FLAG_LABELS = {
   invalidAccountNumber: 'Account number must be digits only (max 12 characters)',
   missingPickupBranch: 'Missing pickup branch',
   pickupBranchFormat: 'Pickup branch format looks unusual (expected e.g. "CSBA - Parqal")',
+  invalidForm2307Attached: '2307 Attached must be Y or N',
 }
 
 // Builds the composite key duplicate detection is scoped to. A row is only
@@ -149,7 +188,9 @@ const FLAG_LABELS = {
 // payee, a different date, etc.) and it's a distinct, allowed row, even if
 // everything else lines up. (Ref no./account number are NOT part of this
 // key today — add them here later if duplicates should also be scoped by
-// those fields.)
+// those fields.) `payee` here is always the RESOLVED name (company, or
+// joined individual name) — never the raw split columns — so duplicate
+// detection stays correct regardless of which payee format a row used.
 function fullRowKey(bank, checkNo, payee, payor, checkDate) {
   return [bank, checkNo, payee, payor, checkDate]
     .map((v) => String(v ?? '').trim().toLowerCase())
@@ -159,14 +200,18 @@ function fullRowKey(bank, checkNo, payee, payor, checkDate) {
 // best-effort auto-detection of column headers
 function guessColumn(headers, field) {
   const patterns = {
-    payee: /^payee$/i,
-    payor: /^payor|payer$/i,
+    payee_company: /payee.?company|company.?name|^payee$/i,
+    payee_first_name: /payee.?first|first.?name|given.?name/i,
+    payee_middle_name: /payee.?middle|middle.?name/i,
+    payee_last_name: /payee.?last|last.?name|surname/i,
+    payor: /payor|payer/i,
     check_no: /check.?no|check.?number/i,
     check_date: /check.?date|date/i,
     amount: /amount|amt/i,
     client_ref_no: /client.?ref|ref.?no|reference/i,
     pickup_branch: /pickup.?branch|branch/i,
     account_number: /account.?(no|number|num)/i,
+    form_2307_attached: /2307|attached/i,
   }
   const idx = headers.findIndex((h) => patterns[field].test(String(h).trim()))
   return idx >= 0 ? headers[idx] : ''
@@ -264,11 +309,60 @@ function normalizePickupBranch(raw, maxLength) {
   return { value, present: true, formatOk: PICKUP_BRANCH_FORMAT_RE.test(value) }
 }
 
+// Individual name parts (first/middle/last) must be LETTERS ONLY — no
+// digits, periods, or commas. A single space is still allowed so a
+// legitimately two-word name part ("Mary Jane") isn't rejected, but
+// nothing else (hyphens, apostrophes, etc.) passes — the spec here is
+// deliberately strict. Blank is always valid: middle name is optional
+// even for an individual payee, and a company payee doesn't need any of
+// these three filled in at all.
+function normalizeIndividualNamePart(raw, maxLength = PAYEE_NAME_PART_MAX_LENGTH) {
+  const value = normalizeText(raw).slice(0, maxLength)
+  if (!value) return { value: '', present: false, valid: true }
+  const valid = /^[A-Za-z]+(?: [A-Za-z]+)*$/.test(value)
+  return { value, present: true, valid }
+}
+
+// Company name is free text — punctuation like "Inc.", "&", "," is normal
+// and expected in a legal company name — so it only gets the generic
+// whitespace-collapsing normalization, never the letters-only check
+// applied to individual name parts.
+function normalizeCompanyName(raw, maxLength = COMPANY_NAME_MAX_LENGTH) {
+  const value = normalizeText(raw).slice(0, maxLength)
+  return { value, present: value.length > 0 }
+}
+
+// Accepts y/n or yes/no in any case, with surrounding whitespace, and
+// collapses all of that down to a single canonical 'Y' or 'N' so the
+// column only ever shows one of those two values. Anything unrecognized
+// (blank, "N/A", a stray typo, etc.) is left alone and caught by the
+// invalidForm2307Attached flag instead of being silently guessed at.
+function normalizeYesNo(raw) {
+  const trimmed = String(raw ?? '').trim()
+  if (!trimmed) return { value: '', present: false, valid: true }
+  const lower = trimmed.toLowerCase()
+  let normalized = null
+  if (lower === 'y' || lower === 'yes') normalized = 'Y'
+  else if (lower === 'n' || lower === 'no') normalized = 'N'
+  return { value: normalized ?? trimmed, present: true, valid: normalized !== null }
+}
+
+// The single source of truth for "what payee name actually gets saved."
+// Company takes priority when BOTH a company and an individual name were
+// supplied (the `bothPayeeProvided` flag surfaces this combination for
+// review rather than silently dropping the individual name). Otherwise
+// the individual's name parts are joined in first/middle/last order,
+// skipping whichever parts are blank.
+function resolvePayeeName({ company, first, middle, last }) {
+  if (company) return company
+  return [first, middle, last].filter(Boolean).join(' ')
+}
+
 function downloadTemplate() {
   const csvContent = [
-    'Payee,Payor,Check No,Check Date,Amount,Client Ref No,Pickup Branch,Account Number',
-    'Jane Doe,Acme Corp,00123,2024-01-15,250.00,123456789012,CSBA - Parqal,000123456789',
-    'John Smith,Acme Corp,00124,2024-02-03,1050.75,,,',
+    'Payee Company,Payee First Name,Payee Middle Name,Payee Last Name,Payor,Check No,Check Date,Amount,Client Ref No,Pickup Branch,Account Number,2307 Attached',
+    'Acme Corp,,,,Acme Corp,00123,2024-01-15,250.00,123456789012,CSBA - Parqal,000123456789,Y',
+    ',Jane,Marie,Doe,Acme Corp,00124,2024-02-03,1050.75,,,,N',
   ].join('\n')
   const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' })
   const url = URL.createObjectURL(blob)
@@ -287,7 +381,8 @@ function downloadTemplate() {
 function downloadFlaggedRows(rows, fileNameBase) {
   if (rows.length === 0) return
   const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`
-  const header = 'Row,Bank,Payee,Payor,Check No,Check Date,Amount,Client Ref No,Pickup Branch,Account Number,Issues'
+  const header =
+    'Row,Bank,Payee (Resolved),Payee Company,Payee First Name,Payee Middle Name,Payee Last Name,Payor,Check No,Check Date,Amount,Client Ref No,Pickup Branch,Account Number,2307 Attached,Issues'
   const lines = rows.map((r) => {
     const issues = Object.entries(FLAG_LABELS)
       .filter(([key]) => r.flags[key])
@@ -297,6 +392,10 @@ function downloadFlaggedRows(rows, fileNameBase) {
       r.rowNumber,
       esc(r.bank),
       esc(r.payee),
+      esc(r.payee_company),
+      esc(r.payee_first_name),
+      esc(r.payee_middle_name),
+      esc(r.payee_last_name),
       esc(r.payor),
       esc(r.check_no),
       esc(r.check_date || ''),
@@ -304,6 +403,7 @@ function downloadFlaggedRows(rows, fileNameBase) {
       esc(r.client_ref_no || ''),
       esc(r.pickup_branch || ''),
       esc(r.account_number || ''),
+      esc(r.form_2307_attached || ''),
       esc(issues),
     ].join(',')
   })
@@ -358,7 +458,15 @@ export default function AdminUpload() {
   const { push } = useToast()
 
   const hasFile = headers.length > 0
-  const mappingComplete = REQUIRED_FIELDS.every(({ key }) => mapping[key])
+
+  // The payee columns are a conditional pair rather than plain required
+  // fields: an admin must map EITHER Payee Company, OR both Payee First
+  // Name and Payee Last Name (middle name is always optional, for both a
+  // company and an individual). That can't be expressed as a single
+  // FIELD_DEFS `required: true` flag, so it's checked here and folded into
+  // mappingComplete alongside the ordinary required fields.
+  const payeeMappingValid = !!mapping.payee_company || (!!mapping.payee_first_name && !!mapping.payee_last_name)
+  const mappingComplete = REQUIRED_FIELDS.every(({ key }) => mapping[key]) && payeeMappingValid
 
   // Resolves the dropdown + free-text "Other" combo down to a single,
   // trimmed bank name every other piece of state can depend on.
@@ -372,15 +480,18 @@ export default function AdminUpload() {
 
   // ---- Normalization + validation pipeline --------------------------------
   // Every row is normalized once here (trimmed text, parsed currency,
-  // standardized dates, and the selected bank) and tagged with every
-  // applicable validation flag. Everything downstream — the KPI cards, the
-  // preview table, the CSV export, and the actual import — reads from this
-  // single source of truth so normalization can never drift between what's
-  // shown and what's saved.
+  // standardized dates, the resolved payee name, and the selected bank)
+  // and tagged with every applicable validation flag. Everything
+  // downstream — the KPI cards, the preview table, the CSV export, and
+  // the actual import — reads from this single source of truth so
+  // normalization can never drift between what's shown and what's saved.
   const normalizedRows = useMemo(() => {
     if (!mappingComplete || !bankValid || rawRows.length === 0) return []
 
-    const payeeIdx = headers.indexOf(mapping.payee)
+    const payeeCompanyIdx = mapping.payee_company ? headers.indexOf(mapping.payee_company) : -1
+    const payeeFirstNameIdx = mapping.payee_first_name ? headers.indexOf(mapping.payee_first_name) : -1
+    const payeeMiddleNameIdx = mapping.payee_middle_name ? headers.indexOf(mapping.payee_middle_name) : -1
+    const payeeLastNameIdx = mapping.payee_last_name ? headers.indexOf(mapping.payee_last_name) : -1
     const payorIdx = headers.indexOf(mapping.payor)
     const checkNoIdx = headers.indexOf(mapping.check_no)
     const dateIdx = headers.indexOf(mapping.check_date)
@@ -390,6 +501,7 @@ export default function AdminUpload() {
     const clientRefIdx = mapping.client_ref_no ? headers.indexOf(mapping.client_ref_no) : -1
     const pickupBranchIdx = mapping.pickup_branch ? headers.indexOf(mapping.pickup_branch) : -1
     const accountNumberIdx = mapping.account_number ? headers.indexOf(mapping.account_number) : -1
+    const form2307Idx = mapping.form_2307_attached ? headers.indexOf(mapping.form_2307_attached) : -1
 
     const draft = rawRows.map((row, i) => {
       const rawAmount = normalizeAmountValue(row[amountIdx])
@@ -402,11 +514,44 @@ export default function AdminUpload() {
         pickupBranchIdx >= 0 ? row[pickupBranchIdx] : '',
         PICKUP_BRANCH_MAX_LENGTH,
       )
+
+      // ---- Payee: company OR individual, resolved intelligently -------
+      const company = normalizeCompanyName(payeeCompanyIdx >= 0 ? row[payeeCompanyIdx] : '')
+      const firstName = normalizeIndividualNamePart(payeeFirstNameIdx >= 0 ? row[payeeFirstNameIdx] : '')
+      const middleName = normalizeIndividualNamePart(payeeMiddleNameIdx >= 0 ? row[payeeMiddleNameIdx] : '')
+      const lastName = normalizeIndividualNamePart(payeeLastNameIdx >= 0 ? row[payeeLastNameIdx] : '')
+      const payeeType = company.present
+        ? 'company'
+        : firstName.present || lastName.present
+        ? 'individual'
+        : 'none'
+      const resolvedPayee = resolvePayeeName({
+        company: company.value,
+        first: firstName.value,
+        middle: middleName.value,
+        last: lastName.value,
+      })
+
+      const form2307 = normalizeYesNo(form2307Idx >= 0 ? row[form2307Idx] : '')
+
       return {
         index: i,
         rowNumber: i + 2, // +2 accounts for the header row occupying row 1
         bank: bankValue,
-        payee: normalizeText(row[payeeIdx]),
+        // Resolved value — what actually gets saved as `payee`.
+        payee: resolvedPayee,
+        payee_company: company.value,
+        payee_first_name: firstName.value,
+        payee_middle_name: middleName.value,
+        payee_last_name: lastName.value,
+        payeeType,
+        payeeCompanyPresent: company.present,
+        payeeFirstNamePresent: firstName.present,
+        payeeFirstNameValid: firstName.valid,
+        payeeMiddleNamePresent: middleName.present,
+        payeeMiddleNameValid: middleName.valid,
+        payeeLastNamePresent: lastName.present,
+        payeeLastNameValid: lastName.valid,
         payor: normalizeText(row[payorIdx]),
         check_no: normalizeCheckNo(row[checkNoIdx]),
         check_date: normalizeDate(row[dateIdx]),
@@ -421,6 +566,9 @@ export default function AdminUpload() {
         pickup_branch: pickupBranch.value,
         pickupBranchPresent: pickupBranch.present,
         pickupBranchFormatOk: pickupBranch.formatOk,
+        form_2307_attached: form2307.value,
+        form2307Present: form2307.present,
+        form2307Valid: form2307.valid,
       }
     })
 
@@ -428,7 +576,9 @@ export default function AdminUpload() {
     // payor, AND check date to match — a row is only flagged if another
     // row in the file is identical across all five. Any single field
     // being different (a different payor, a different date, etc.) makes
-    // it a distinct row, not a duplicate.
+    // it a distinct row, not a duplicate. `payee` here is always the
+    // resolved name, so it stays correct whether a row used a company or
+    // an individual name.
     const rowCounts = new Map()
     draft.forEach((r) => {
       if (!r.check_no) return
@@ -441,7 +591,18 @@ export default function AdminUpload() {
 
     return draft.map((r) => {
       const flags = {
-        missingPayee: !r.payee,
+        // A completely blank payee (no company, no individual name at
+        // all) gets just this one flag — the more specific
+        // missingPayeeFirstName/LastName flags below only fire once the
+        // row has committed to the "individual" path (i.e. at least one
+        // of first/last was given) but left the other blank.
+        missingPayee: r.payeeType === 'none',
+        missingPayeeFirstName: r.payeeType === 'individual' && !r.payeeFirstNamePresent,
+        missingPayeeLastName: r.payeeType === 'individual' && !r.payeeLastNamePresent,
+        invalidPayeeFirstName: r.payeeFirstNamePresent && !r.payeeFirstNameValid,
+        invalidPayeeMiddleName: r.payeeMiddleNamePresent && !r.payeeMiddleNameValid,
+        invalidPayeeLastName: r.payeeLastNamePresent && !r.payeeLastNameValid,
+        bothPayeeProvided: r.payeeCompanyPresent && (r.payeeFirstNamePresent || r.payeeLastNamePresent),
         missingPayor: !r.payor,
         missingCheckNo: !r.check_no,
         invalidAmount: r.amountInvalid || r.amount === 0,
@@ -457,6 +618,7 @@ export default function AdminUpload() {
         invalidAccountNumber: r.accountNumberPresent && !r.accountNumberValid,
         missingPickupBranch: FIELD_DEFS_BY_KEY.pickup_branch.required && !r.pickupBranchPresent,
         pickupBranchFormat: r.pickupBranchPresent && !r.pickupBranchFormatOk,
+        invalidForm2307Attached: r.form2307Present && !r.form2307Valid,
       }
       const hasIssue = Object.values(flags).some(Boolean)
       return { ...r, flags, hasIssue }
@@ -796,13 +958,19 @@ export default function AdminUpload() {
     setSaving(true)
     setImportProgress(0)
 
-    // Rows already carry their normalized values (including bank) from the
-    // pipeline above, so the saved data always matches exactly what the
-    // preview showed.
+    // Rows already carry their normalized values (including the resolved
+    // payee name and bank) from the pipeline above, so the saved data
+    // always matches exactly what the preview showed. Both the resolved
+    // `payee` (kept for backward compatibility / search / duplicate
+    // checks) and the raw split columns are saved, so nothing is lost.
     const preparedRows = includedRows.map((r) => ({
       row_number: r.rowNumber,
       bank: r.bank,
       payee: r.payee,
+      payee_company: r.payee_company || null,
+      payee_first_name: r.payee_first_name || null,
+      payee_middle_name: r.payee_middle_name || null,
+      payee_last_name: r.payee_last_name || null,
       payor: r.payor,
       check_no: r.check_no,
       check_date: r.check_date,
@@ -810,6 +978,7 @@ export default function AdminUpload() {
       client_ref_no: r.client_ref_no || null,
       pickup_branch: r.pickup_branch || null,
       account_number: r.account_number || null,
+      form_2307_attached: r.form_2307_attached || null,
     }))
 
     try {
@@ -884,9 +1053,11 @@ export default function AdminUpload() {
         <h1 className="font-display text-2xl font-semibold text-ink-900">Upload a file</h1>
         <p className="mt-1 text-sm text-ink-400">
           Select the source bank, then import a CSV or Excel file (up to {formatFileSize(MAX_FILE_SIZE_BYTES)},{' '}
-          {MAX_ROWS.toLocaleString()} rows max) with Payee, Payor, Check No, Check Date, and Amount columns. A row is
-          only treated as a duplicate if its bank, payee, payor, check no., and check date all match another row
-          exactly — change any one of those and it's a distinct row.
+          {MAX_ROWS.toLocaleString()} rows max) with Payor, Check No, Check Date, and Amount columns. For the
+          payee, map either a Payee Company column, or Payee First/Middle/Last Name columns for an individual —
+          whichever one is filled in for a row is what gets saved. A row is only treated as a duplicate if its
+          bank, payee, payor, check no., and check date all match another row exactly — change any one of those
+          and it's a distinct row.
         </p>
       </div>
 
@@ -1101,10 +1272,20 @@ export default function AdminUpload() {
                   </div>
 
                   {!mappingComplete && (
-                    <p className="mt-3 flex items-center gap-1.5 text-xs font-medium text-orange-600">
-                      <AlertTriangle className="h-3.5 w-3.5" /> Map all {REQUIRED_FIELDS.length} required field
-                      {REQUIRED_FIELDS.length === 1 ? '' : 's'} to continue.
-                    </p>
+                    <div className="mt-3 space-y-1">
+                      {!REQUIRED_FIELDS.every(({ key }) => mapping[key]) && (
+                        <p className="flex items-center gap-1.5 text-xs font-medium text-orange-600">
+                          <AlertTriangle className="h-3.5 w-3.5" /> Map all {REQUIRED_FIELDS.length} required
+                          field{REQUIRED_FIELDS.length === 1 ? '' : 's'} to continue.
+                        </p>
+                      )}
+                      {!payeeMappingValid && (
+                        <p className="flex items-center gap-1.5 text-xs font-medium text-orange-600">
+                          <AlertTriangle className="h-3.5 w-3.5" /> Map either Payee Company, or both Payee
+                          First Name and Payee Last Name, to identify the payee.
+                        </p>
+                      )}
+                    </div>
                   )}
 
                   {/* KPI summary row — same visual language as the checks
@@ -1283,6 +1464,7 @@ export default function AdminUpload() {
                           <th className="px-3 py-2 font-medium">Include</th>
                           <th className="px-3 py-2 font-medium">Row</th>
                           <th className="px-3 py-2 font-medium">Bank</th>
+                          <th className="px-3 py-2 font-medium">Payee (Resolved)</th>
                           {CORE_FIELDS.map(({ key, label }) => (
                             <th key={key} className="px-3 py-2 font-medium">
                               {key === 'check_no' ? (
@@ -1374,9 +1556,53 @@ export default function AdminUpload() {
                               <td className="px-3 py-2 font-mono text-ink-300">{r.rowNumber}</td>
                               <td className="px-3 py-2 text-ink-700">{r.bank}</td>
 
+                              {/* Resolved payee — what actually gets saved
+                                  as `payee`: the company name when given,
+                                  otherwise the joined first/middle/last.
+                                  Shown up front so an admin can sanity-
+                                  check the combination at a glance instead
+                                  of cross-referencing four columns. */}
                               <PreviewCell
                                 value={r.payee}
                                 missing={r.flags.missingPayee}
+                                invalid={r.flags.bothPayeeProvided}
+                                tooltip={
+                                  r.flags.bothPayeeProvided
+                                    ? 'Both a company and an individual name were given — using the company name'
+                                    : undefined
+                                }
+                              />
+
+                              <PreviewCell value={r.payee_company} missing={false} />
+                              <PreviewCell
+                                value={r.payee_first_name}
+                                missing={r.flags.missingPayeeFirstName}
+                                invalid={r.flags.invalidPayeeFirstName}
+                                tooltip={
+                                  r.flags.invalidPayeeFirstName
+                                    ? 'Letters only — no numbers, periods, or commas'
+                                    : undefined
+                                }
+                              />
+                              <PreviewCell
+                                value={r.payee_middle_name}
+                                missing={false}
+                                invalid={r.flags.invalidPayeeMiddleName}
+                                tooltip={
+                                  r.flags.invalidPayeeMiddleName
+                                    ? 'Letters only — no numbers, periods, or commas'
+                                    : undefined
+                                }
+                              />
+                              <PreviewCell
+                                value={r.payee_last_name}
+                                missing={r.flags.missingPayeeLastName}
+                                invalid={r.flags.invalidPayeeLastName}
+                                tooltip={
+                                  r.flags.invalidPayeeLastName
+                                    ? 'Letters only — no numbers, periods, or commas'
+                                    : undefined
+                                }
                               />
                               <PreviewCell
                                 value={r.payor}
@@ -1457,6 +1683,12 @@ export default function AdminUpload() {
                                     : undefined
                                 }
                                 mono
+                              />
+                              <PreviewCell
+                                value={r.form_2307_attached}
+                                missing={false}
+                                invalid={r.flags.invalidForm2307Attached}
+                                tooltip={r.flags.invalidForm2307Attached ? 'Must be Y or N' : undefined}
                               />
                             </tr>
                           )

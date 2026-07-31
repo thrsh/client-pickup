@@ -4,13 +4,14 @@
 // active-state treatment) so the two areas of the app feel like one product.
 import React from 'react'
 import { NavLink, Outlet } from 'react-router-dom'
-import { LayoutGrid, ShieldCheck, History } from 'lucide-react'
+import { LayoutGrid, ShieldCheck, History, UserCog } from 'lucide-react'
 import { cn } from '../lib/utils'
 
 const links = [
   { to: '/approver', label: 'Overview', icon: LayoutGrid, end: true },
   { to: '/approver/pending', label: 'Pending approvals', icon: ShieldCheck },
   { to: '/approver/history', label: 'Decision history', icon: History },
+  { to: '/approver/account', label: 'Account', icon: UserCog },
 ]
 
 export default function ApproverLayout() {

@@ -1,10 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
-  Landmark,
   CircleCheckBig,
   Clock3,
-  Wallet,
   Stamp,
   RefreshCw,
   ArrowUpRight,
@@ -18,14 +16,17 @@ import {
   TrendingUp,
   TrendingDown,
   ChevronRight,
+  Gauge,
 } from 'lucide-react'
 import { supabase } from '../../lib/supabaseClient'
 import { Card, CardContent } from '../../components/ui/card'
 import { formatCurrency, formatDate, cn } from '../../lib/utils'
 
-const DAY_MS = 86400000
-const EXPIRING_SOON_MINUTES = 15
+const MINUTE_MS = 60_000
+const DAY_MS = 24 * 60 * MINUTE_MS
 const TREND_DAYS = 14
+const RECENT_LIMIT = 6
+const ACTIVE_RESERVATIONS_LIMIT = 200
 
 const PERIOD_OPTIONS = [
   { value: '24h', label: '24h', longLabel: 'last 24 hours', days: 1 },
@@ -35,21 +36,35 @@ const PERIOD_OPTIONS = [
 ]
 
 const AGING_BUCKETS = [
-  { key: '0-7', label: '0–7 days', test: (d) => d <= 7, tone: 'neutral' },
-  { key: '8-14', label: '8–14 days', test: (d) => d > 7 && d <= 14, tone: 'neutral' },
-  { key: '15-30', label: '15–30 days', test: (d) => d > 14 && d <= 30, tone: 'watch' },
-  { key: '31-60', label: '31–60 days', test: (d) => d > 30 && d <= 60, tone: 'risk' },
-  { key: '60+', label: '60+ days', test: (d) => d > 60, tone: 'critical' },
+  { key: '0-7', label: '0–7 days', tone: 'neutral', maxDays: 7 },
+  { key: '8-14', label: '8–14 days', tone: 'neutral', maxDays: 14 },
+  { key: '15-30', label: '15–30 days', tone: 'watch', maxDays: 30 },
+  { key: '31-60', label: '31–60 days', tone: 'risk', maxDays: 60 },
+  { key: '60+', label: '60+ days', tone: 'critical', maxDays: Infinity },
 ]
 
-// Human-readable label used in error/debug output so a failed query is
-// traceable to exactly which fetch broke, instead of one generic message.
+const URGENCY_BUCKETS = [
+  { key: '0-15', label: '≤ 15m', tone: 'critical', maxMinutes: 15 },
+  { key: '15-30', label: '15–30m', tone: 'risk', maxMinutes: 30 },
+  { key: '30-60', label: '30–60m', tone: 'watch', maxMinutes: 60 },
+  { key: '60-120', label: '1–2h', tone: 'neutral', maxMinutes: 120 },
+  { key: '120-240', label: '2–4h', tone: 'neutral', maxMinutes: 240 },
+]
+
+const TONE_BAR_CLASS = {
+  neutral: 'bg-ink-300',
+  watch: 'bg-ledger-amber/50',
+  risk: 'bg-ledger-amber',
+  critical: 'bg-red-400',
+}
+
 const QUERY_LABELS = {
   snapshot: 'Awaiting-pickup snapshot (checks: available/reserved)',
   period: 'Picked-up checks for selected period',
   prevPeriod: 'Picked-up count for prior period (for delta badge)',
   trend: `Picked-up checks, last ${TREND_DAYS} days (trend)`,
   reservations: 'Active reservations',
+  turnaround: 'Reservation turnaround (reserved → picked up)',
   recent: 'Recent pickups',
 }
 
@@ -60,13 +75,11 @@ export default function AdminDashboard() {
   const [previousPeriodCount, setPreviousPeriodCount] = useState(0)
   const [trendPicked, setTrendPicked] = useState([])
   const [activeReservations, setActiveReservations] = useState([])
+  const [turnaroundReservations, setTurnaroundReservations] = useState([])
   const [recent, setRecent] = useState([])
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState('')
-  // Per-query errors, so a single failing query surfaces exactly which one
-  // broke instead of a single vague banner (or, worse, nothing at all if the
-  // query merely returned zero rows due to RLS rather than throwing).
   const [queryErrors, setQueryErrors] = useState([])
   const [lastUpdated, setLastUpdated] = useState(null)
   const [now, setNow] = useState(Date.now())
@@ -82,25 +95,12 @@ export default function AdminDashboard() {
     }
   }, [])
 
-  // IMPORTANT: on a hard refresh, supabase-js needs a moment to rehydrate
-  // the session from storage. Firing queries before that finishes means
-  // they run as an anonymous/unauthenticated request — Row Level Security
-  // then silently returns zero rows for every query (no error thrown), and
-  // the dashboard just looks "broken" with nothing to show for why. We wait
-  // for getSession() to resolve at least once before running any query.
   useEffect(() => {
     let cancelled = false
     supabase.auth.getSession().then(({ data, error: sessionError }) => {
       if (cancelled) return
-      if (sessionError) {
-        console.error('[AdminDashboard] Failed to read auth session:', sessionError)
-      }
-      if (!data?.session) {
-        console.warn(
-          '[AdminDashboard] No active Supabase session found. Queries will run unauthenticated and RLS will likely return zero rows.'
-        )
-        setNoSessionWarning(true)
-      }
+      if (sessionError) console.error('[AdminDashboard] Failed to read auth session:', sessionError)
+      if (!data?.session) setNoSessionWarning(true)
       setSessionReady(true)
     })
     return () => {
@@ -115,7 +115,7 @@ export default function AdminDashboard() {
   }, [period, sessionReady])
 
   useEffect(() => {
-    const tick = setInterval(() => setNow(Date.now()), 30000)
+    const tick = setInterval(() => setNow(Date.now()), 30_000)
     return () => clearInterval(tick)
   }, [])
 
@@ -130,10 +130,10 @@ export default function AdminDashboard() {
       const periodStartIso =
         activeOption.days != null ? new Date(Date.now() - activeOption.days * DAY_MS).toISOString() : null
       const prevStartIso =
-        activeOption.days != null
-          ? new Date(Date.now() - activeOption.days * 2 * DAY_MS).toISOString()
-          : null
+        activeOption.days != null ? new Date(Date.now() - activeOption.days * 2 * DAY_MS).toISOString() : null
       const trendStartIso = new Date(Date.now() - TREND_DAYS * DAY_MS).toISOString()
+
+      const keys = ['snapshot', 'period', 'prevPeriod', 'trend', 'reservations', 'turnaround', 'recent']
 
       try {
         const queries = [
@@ -166,30 +166,32 @@ export default function AdminDashboard() {
             .eq('status', 'picked_up')
             .gte('picked_up_at', trendStartIso),
 
-          // Explicit FK hint (checks!checks_reservation_id_fkey) rather than
-          // the bare `checks(id, amount)` shorthand. If Postgres/PostgREST
-          // ever sees more than one plausible relationship between these
-          // two tables, the bare form throws "Could not embed because more
-          // than one relationship was found" and this whole query fails —
-          // naming the constraint explicitly removes that ambiguity.
           supabase
             .from('pickup_reservations')
             .select('id, collector_name, reserved_at, expires_at, checks!checks_reservation_id_fkey(id, amount)')
             .eq('status', 'reserved')
             .order('expires_at', { ascending: true })
-            .limit(200),
+            .limit(ACTIVE_RESERVATIONS_LIMIT),
+
+          (() => {
+            let q = supabase
+              .from('pickup_reservations')
+              .select('id, reserved_at, picked_up_at, checks!checks_reservation_id_fkey(id)')
+              .eq('status', 'picked_up')
+              .not('picked_up_at', 'is', null)
+            if (periodStartIso) q = q.gte('picked_up_at', periodStartIso)
+            return q
+          })(),
 
           supabase
             .from('checks')
             .select('id, payee, check_no, amount, picked_up_by, picked_up_at')
             .eq('status', 'picked_up')
             .order('picked_up_at', { ascending: false })
-            .limit(6),
+            .limit(RECENT_LIMIT),
         ]
 
-        const keys = ['snapshot', 'period', 'prevPeriod', 'trend', 'reservations', 'recent']
         const results = await Promise.all(queries)
-
         if (!isMountedRef.current) return
 
         const errs = []
@@ -201,14 +203,15 @@ export default function AdminDashboard() {
           }
         })
 
-        const [snapshotRes, periodRes, prevRes, trendRes, reservationsRes, recentRes] = results
+        const [snapshotRes, periodRes, prevRes, trendRes, reservationsRes, turnaroundRes, recentRes] = results
 
         setSnapshotChecks(Array.isArray(snapshotRes?.data) ? snapshotRes.data : [])
         setPeriodPicked(Array.isArray(periodRes?.data) ? periodRes.data : [])
         setPreviousPeriodCount(prevRes?.count || 0)
         setTrendPicked(Array.isArray(trendRes?.data) ? trendRes.data : [])
         setActiveReservations(Array.isArray(reservationsRes?.data) ? reservationsRes.data : [])
-        setRecent(recentRes?.data || [])
+        setTurnaroundReservations(Array.isArray(turnaroundRes?.data) ? turnaroundRes.data : [])
+        setRecent(Array.isArray(recentRes?.data) ? recentRes.data : [])
         setLastUpdated(new Date())
 
         if (errs.length > 0) {
@@ -224,12 +227,7 @@ export default function AdminDashboard() {
           (reservationsRes?.data || []).length === 0 &&
           (recentRes?.data || []).length === 0
         ) {
-          // No errors, but every single query came back empty — this is the
-          // classic silent-RLS symptom. Flag it distinctly from "no error,
-          // just a genuinely quiet register" so it doesn't get missed.
-          console.warn(
-            '[AdminDashboard] Every query succeeded but returned zero rows. If the `checks`/`pickup_reservations` tables are not actually empty, check RLS SELECT policies for the current user role.'
-          )
+          console.warn('[AdminDashboard] All queries returned zero rows — check RLS SELECT policies.')
         }
       } catch (err) {
         if (!isMountedRef.current) return
@@ -245,8 +243,6 @@ export default function AdminDashboard() {
     [period]
   )
 
-  // ---- Derived stats ----------------------------------------------------
-
   const available = useMemo(() => snapshotChecks.filter((c) => c.status === 'available'), [snapshotChecks])
   const reserved = useMemo(() => snapshotChecks.filter((c) => c.status === 'reserved'), [snapshotChecks])
 
@@ -255,30 +251,28 @@ export default function AdminDashboard() {
 
   const pickedCount = periodPicked.length
   const pickedAmount = useMemo(() => sumAmount(periodPicked), [periodPicked])
-  const pickedDelta = useMemo(
-    () => computeDelta(pickedCount, previousPeriodCount),
-    [pickedCount, previousPeriodCount]
-  )
+  const pickedDelta = useMemo(() => computeDelta(pickedCount, previousPeriodCount), [pickedCount, previousPeriodCount])
 
   const reservationStats = useMemo(() => {
-    const withTotals = activeReservations.map((r) => ({
+    return activeReservations.map((r) => ({
       ...r,
-      total: sumAmount(r.checks || []),
+      total: sumAmount(r.checks),
       checkCount: (r.checks || []).length,
-      minutesLeft: r.expires_at ? Math.max(0, Math.round((new Date(r.expires_at).getTime() - now) / 60000)) : null,
+      minutesLeft: r.expires_at ? Math.max(0, Math.round((new Date(r.expires_at).getTime() - now) / MINUTE_MS)) : null,
     }))
-    const expiringSoon = withTotals.filter(
-      (r) => r.minutesLeft !== null && r.minutesLeft <= EXPIRING_SOON_MINUTES
-    ).length
-    return { list: withTotals, expiringSoon }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeReservations, now])
+
+  const urgency = useMemo(() => computeUrgency(reservationStats), [reservationStats])
 
   const aging = useMemo(() => computeAging(available.concat(reserved)), [available, reserved])
 
   const trend = useMemo(() => buildTrend(trendPicked, TREND_DAYS), [trendPicked])
 
   const topCollectors = useMemo(() => buildTopCollectors(periodPicked, 5), [periodPicked])
+
+  const turnaround = useMemo(() => computeTurnaround(turnaroundReservations), [turnaroundReservations])
+
+  const releaseRate = useMemo(() => computeReleaseRate(turnaround), [turnaround])
 
   const activePeriodOption = PERIOD_OPTIONS.find((o) => o.value === period) || PERIOD_OPTIONS[1]
 
@@ -321,9 +315,8 @@ export default function AdminDashboard() {
         <div className="mb-5 flex items-start gap-2 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-800">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
           <span>
-            No active Supabase session was detected when this page loaded. If you're logged in and still
-            see this, your session may not have finished restoring — try refreshing. If it persists, the
-            auth cookie/token may not be reaching the Supabase client.
+            No active Supabase session was detected when this page loaded. Try refreshing; if it persists,
+            the auth token may not be reaching the Supabase client.
           </span>
         </div>
       )}
@@ -363,7 +356,7 @@ export default function AdminDashboard() {
             </span>
           </span>
           <Link
-            to="/admin/checks"
+            to="/verifier/checks"
             className="flex shrink-0 items-center gap-1 text-xs font-medium text-ledger-stampDark hover:underline"
           >
             Review register
@@ -377,14 +370,14 @@ export default function AdminDashboard() {
         <PeriodSelector value={period} onChange={setPeriod} />
       </div>
 
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
         <KpiCard
           icon={Clock3}
           label="Awaiting pickup"
           value={loading ? null : available.length}
           secondary={loading ? null : formatCurrency(availableAmount)}
           accent="stamp"
-          to="/admin/checks"
+          to="/verifier/checks"
         />
         <KpiCard
           icon={Layers}
@@ -392,7 +385,7 @@ export default function AdminDashboard() {
           value={loading ? null : reserved.length}
           secondary={loading ? null : formatCurrency(reservedAmount)}
           accent="amber"
-          to="/admin/pickups"
+          to="/verifier/pickups"
         />
         <KpiCard
           icon={CircleCheckBig}
@@ -404,11 +397,24 @@ export default function AdminDashboard() {
         />
         <KpiCard
           icon={Timer}
-          label="Expiring ≤ 15m"
-          value={loading ? null : reservationStats.expiringSoon}
+          label="Expiring ≤ 4h"
+          value={loading ? null : urgency.totalWithin4h}
           secondary={loading ? null : `${activeReservations.length} active hold${activeReservations.length === 1 ? '' : 's'}`}
-          accent={!loading && reservationStats.expiringSoon > 0 ? 'critical' : 'ink'}
-          to="/admin/pickups"
+          accent={!loading && urgency.buckets[0].count > 0 ? 'critical' : 'ink'}
+          to="/verifier/pickups"
+        />
+        <KpiCard
+          icon={Gauge}
+          label="Release rate"
+          value={loading ? null : releaseRate.checkCount}
+          secondary={
+            loading
+              ? null
+              : releaseRate.checkCount > 0
+              ? `${formatDuration(releaseRate.totalMinutes)} / ${releaseRate.checkCount} checks`
+              : 'No releases yet'
+          }
+          accent="ink"
         />
       </div>
 
@@ -418,7 +424,12 @@ export default function AdminDashboard() {
       </div>
 
       <div className="mt-5 grid grid-cols-1 gap-5 xl:grid-cols-2">
-        <ActiveReservationsCard loading={loading} reservations={reservationStats.list.slice(0, 6)} />
+        <UrgencyCard loading={loading} urgency={urgency} totalActive={activeReservations.length} />
+        <TurnaroundCard loading={loading} turnaround={turnaround} periodLabel={activePeriodOption.longLabel} />
+      </div>
+
+      <div className="mt-5 grid grid-cols-1 gap-5 xl:grid-cols-2">
+        <ActiveReservationsCard loading={loading} reservations={reservationStats.slice(0, 6)} />
         <TopCollectorsCard loading={loading} collectors={topCollectors} periodLabel={activePeriodOption.longLabel} />
       </div>
 
@@ -428,7 +439,7 @@ export default function AdminDashboard() {
         title="Recent pickups"
         right={
           <Link
-            to="/admin/checks"
+            to="/verifier/checks"
             className="group flex items-center gap-1 text-xs font-medium text-ledger-stampDark hover:underline"
           >
             View register
@@ -452,17 +463,19 @@ export default function AdminDashboard() {
   )
 }
 
-// ---- Data helpers ---------------------------------------------------------
-
 function sumAmount(rows) {
-  return (rows || []).reduce((s, r) => s + Number(r.amount || 0), 0)
+  if (!Array.isArray(rows)) return 0
+  return rows.reduce((sum, row) => {
+    const amount = Number(row?.amount)
+    return sum + (Number.isFinite(amount) ? amount : 0)
+  }, 0)
 }
 
 function ageInDays(check) {
   const raw = check.created_at || check.check_date
   if (!raw) return null
   const ms = Date.now() - new Date(raw).getTime()
-  if (Number.isNaN(ms)) return null
+  if (!Number.isFinite(ms)) return null
   return Math.max(0, Math.floor(ms / DAY_MS))
 }
 
@@ -470,16 +483,17 @@ function computeAging(checks) {
   const buckets = AGING_BUCKETS.map((b) => ({ ...b, count: 0, amount: 0 }))
   let oldest = null
 
-  checks.forEach((c) => {
-    const days = ageInDays(c)
+  checks.forEach((check) => {
+    const days = ageInDays(check)
     if (days === null) return
-    const bucket = buckets.find((b) => b.test(days))
-    if (bucket) {
-      bucket.count += 1
-      bucket.amount += Number(c.amount || 0)
-    }
+
+    const amount = Number(check.amount) || 0
+    const bucket = buckets.find((b) => days <= b.maxDays) || buckets[buckets.length - 1]
+    bucket.count += 1
+    bucket.amount += amount
+
     if (!oldest || days > oldest.days) {
-      oldest = { days, payee: c.payee, checkNo: c.check_no }
+      oldest = { days, payee: check.payee, checkNo: check.check_no }
     }
   })
 
@@ -487,18 +501,105 @@ function computeAging(checks) {
   const riskCount = riskBuckets.reduce((s, b) => s + b.count, 0)
   const riskAmount = riskBuckets.reduce((s, b) => s + b.amount, 0)
   const maxAmount = Math.max(1, ...buckets.map((b) => b.amount))
-  const totalCount = checks.length
-  const totalAmount = sumAmount(checks)
 
-  return { buckets, oldest, riskCount, riskAmount, maxAmount, totalCount, totalAmount }
+  return {
+    buckets,
+    oldest,
+    riskCount,
+    riskAmount,
+    maxAmount,
+    totalCount: checks.length,
+    totalAmount: sumAmount(checks),
+  }
+}
+
+function computeUrgency(reservationsWithMinutes) {
+  const buckets = URGENCY_BUCKETS.map((b) => ({ ...b, count: 0, amount: 0 }))
+  let totalWithin4h = 0
+  let prevMax = -Infinity
+
+  for (const bucket of buckets) {
+    const matches = reservationsWithMinutes.filter(
+      (r) => r.minutesLeft !== null && r.minutesLeft > prevMax && r.minutesLeft <= bucket.maxMinutes
+    )
+    bucket.count = matches.length
+    bucket.amount = sumAmount(matches.map((r) => ({ amount: r.total })))
+    totalWithin4h += bucket.count
+    prevMax = bucket.maxMinutes
+  }
+
+  const maxAmount = Math.max(1, ...buckets.map((b) => b.amount))
+  return { buckets, totalWithin4h, maxAmount }
+}
+
+function computeTurnaround(reservations) {
+  const entries = reservations
+    .map((r) => {
+      if (!r.reserved_at || !r.picked_up_at) return null
+      const diffMs = new Date(r.picked_up_at).getTime() - new Date(r.reserved_at).getTime()
+      if (!Number.isFinite(diffMs) || diffMs < 0) return null
+      const checkCount = Array.isArray(r.checks) && r.checks.length > 0 ? r.checks.length : 1
+      return { minutes: diffMs / MINUTE_MS, checkCount }
+    })
+    .filter((v) => v !== null)
+
+  if (entries.length === 0) {
+    return {
+      count: 0,
+      avgMinutes: null,
+      medianMinutes: null,
+      maxMinutes: null,
+      totalMinutes: 0,
+      totalChecks: 0,
+    }
+  }
+
+  const minutes = entries.map((e) => e.minutes)
+  const sorted = [...minutes].sort((a, b) => a - b)
+  const mid = Math.floor(sorted.length / 2)
+  const median = sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]
+  const totalMinutes = sorted.reduce((sum, v) => sum + v, 0)
+  const totalChecks = entries.reduce((sum, e) => sum + e.checkCount, 0)
+
+  return {
+    count: sorted.length,
+    avgMinutes: totalMinutes / sorted.length,
+    medianMinutes: median,
+    maxMinutes: sorted[sorted.length - 1],
+    totalMinutes,
+    totalChecks,
+  }
+}
+
+function computeReleaseRate(turnaround) {
+  if (!turnaround || turnaround.count === 0) {
+    return { checkCount: 0, totalMinutes: 0, minutesPerCheck: null }
+  }
+  const checkCount = turnaround.totalChecks || turnaround.count
+  const minutesPerCheck = checkCount > 0 ? turnaround.totalMinutes / checkCount : null
+  return { checkCount, totalMinutes: turnaround.totalMinutes, minutesPerCheck }
+}
+
+function formatDuration(totalMinutes) {
+  if (totalMinutes === null || totalMinutes === undefined || !Number.isFinite(totalMinutes)) return '—'
+  const minutes = Math.round(totalMinutes)
+  if (minutes < 60) return `${minutes}m`
+
+  const hours = Math.floor(minutes / 60)
+  const remMinutes = minutes % 60
+  if (hours < 24) return remMinutes > 0 ? `${hours}h ${remMinutes}m` : `${hours}h`
+
+  const days = Math.floor(hours / 24)
+  const remHours = hours % 24
+  return remHours > 0 ? `${days}d ${remHours}h` : `${days}d`
 }
 
 function buildTrend(picked, days) {
-  const byDate = new Map()
+  const countByDate = new Map()
   picked.forEach((c) => {
     if (!c.picked_up_at) return
     const key = new Date(c.picked_up_at).toISOString().slice(0, 10)
-    byDate.set(key, (byDate.get(key) || 0) + 1)
+    countByDate.set(key, (countByDate.get(key) || 0) + 1)
   })
 
   const out = []
@@ -508,40 +609,41 @@ function buildTrend(picked, days) {
     out.push({
       date: key,
       label: d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
-      count: byDate.get(key) || 0,
+      count: countByDate.get(key) || 0,
     })
   }
   return out
 }
 
 function buildTopCollectors(picked, limit) {
-  const map = new Map()
+  const byCollector = new Map()
   picked.forEach((c) => {
     const name = c.picked_up_by || 'Unknown collector'
-    const entry = map.get(name) || { name, count: 0, amount: 0 }
+    const entry = byCollector.get(name) || { name, count: 0, amount: 0 }
     entry.count += 1
-    entry.amount += Number(c.amount || 0)
-    map.set(name, entry)
+    entry.amount += Number(c.amount) || 0
+    byCollector.set(name, entry)
   })
-  return [...map.values()].sort((a, b) => b.amount - a.amount).slice(0, limit)
+  return [...byCollector.values()].sort((a, b) => b.amount - a.amount).slice(0, limit)
 }
 
 function computeDelta(curr, prev) {
-  if (!prev) {
-    if (!curr) return null
-    return { pct: null, direction: 'up', isNew: true }
-  }
+  if (!prev) return curr ? { pct: null, direction: 'up', isNew: true } : null
   const pct = Math.round(((curr - prev) / prev) * 100)
   return { pct, direction: pct >= 0 ? 'up' : 'down', isNew: false }
 }
 
 function initials(name) {
   if (!name) return '?'
-  const parts = name.trim().split(/\s+/).slice(0, 2)
-  return parts.map((p) => p[0]?.toUpperCase() || '').join('') || '?'
+  return (
+    name
+      .trim()
+      .split(/\s+/)
+      .slice(0, 2)
+      .map((p) => p[0]?.toUpperCase() || '')
+      .join('') || '?'
+  )
 }
-
-// ---- Presentational pieces -------------------------------------------------
 
 function PeriodSelector({ value, onChange }) {
   return (
@@ -617,23 +719,15 @@ function KpiCard({ icon: Icon, label, value, secondary, loading, accent, delta, 
                     delta.direction === 'up' ? 'text-ledger-stampDark' : 'text-ink-400'
                   )}
                 >
-                  {delta.direction === 'up' ? (
-                    <TrendingUp className="h-3 w-3" />
-                  ) : (
-                    <TrendingDown className="h-3 w-3" />
-                  )}
+                  {delta.direction === 'up' ? <TrendingUp className="h-3 w-3" /> : <TrendingDown className="h-3 w-3" />}
                   {Math.abs(delta.pct)}%
                 </span>
               )}
-              {delta && delta.isNew && (
-                <span className="text-[11px] font-medium text-ledger-stampDark">new</span>
-              )}
+              {delta && delta.isNew && <span className="text-[11px] font-medium text-ledger-stampDark">new</span>}
             </div>
           )}
           <p className="truncate text-xs text-ink-400">{label}</p>
-          {!isLoading && secondary && (
-            <p className="mt-0.5 truncate font-mono text-xs text-ink-500">{secondary}</p>
-          )}
+          {!isLoading && secondary && <p className="mt-0.5 truncate font-mono text-xs text-ink-500">{secondary}</p>}
         </div>
       </div>
     </CardContent>
@@ -649,13 +743,29 @@ function KpiCard({ icon: Icon, label, value, secondary, loading, accent, delta, 
   return <Card>{content}</Card>
 }
 
+function BucketBreakdown({ buckets, maxAmount }) {
+  return (
+    <div className="space-y-2.5">
+      {buckets.map((b) => (
+        <div key={b.key} className="flex items-center gap-3">
+          <span className="w-16 shrink-0 font-mono text-[11px] text-ink-400">{b.label}</span>
+          <div className="h-2 flex-1 overflow-hidden rounded-full bg-ink-50">
+            <div
+              className={cn('h-full rounded-full', TONE_BAR_CLASS[b.tone] || TONE_BAR_CLASS.neutral)}
+              style={{ width: `${b.amount > 0 ? Math.max(4, (b.amount / maxAmount) * 100) : 0}%` }}
+            />
+          </div>
+          <span className="w-8 shrink-0 text-right font-mono text-xs text-ink-600">{b.count}</span>
+          <span className="w-20 shrink-0 text-right font-mono text-xs text-ink-400">{formatCurrency(b.amount)}</span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function AgingCard({ loading, aging }) {
   return (
-    <SectionCard
-      icon={Hourglass}
-      title="Aging register"
-      subtitle="How long checks have been waiting, since they were added."
-    >
+    <SectionCard icon={Hourglass} title="Aging register" subtitle="How long checks have been waiting, since they were added.">
       {loading ? (
         <div className="space-y-2.5">
           {Array.from({ length: 5 }).map((_, i) => (
@@ -666,33 +776,7 @@ function AgingCard({ loading, aging }) {
         <p className="py-6 text-center text-sm text-ink-400">Nothing awaiting pickup right now.</p>
       ) : (
         <>
-          <div className="space-y-2.5">
-            {aging.buckets.map((b) => (
-              <div key={b.key} className="flex items-center gap-3">
-                <span className="w-16 shrink-0 font-mono text-[11px] text-ink-400">{b.label}</span>
-                <div className="h-2 flex-1 overflow-hidden rounded-full bg-ink-50">
-                  <div
-                    className={cn(
-                      'h-full rounded-full',
-                      b.tone === 'critical'
-                        ? 'bg-red-400'
-                        : b.tone === 'risk'
-                        ? 'bg-ledger-amber'
-                        : b.tone === 'watch'
-                        ? 'bg-ledger-amber/50'
-                        : 'bg-ink-300'
-                    )}
-                    style={{ width: `${b.amount > 0 ? Math.max(4, (b.amount / aging.maxAmount) * 100) : 0}%` }}
-                  />
-                </div>
-                <span className="w-8 shrink-0 text-right font-mono text-xs text-ink-600">{b.count}</span>
-                <span className="w-20 shrink-0 text-right font-mono text-xs text-ink-400">
-                  {formatCurrency(b.amount)}
-                </span>
-              </div>
-            ))}
-          </div>
-
+          <BucketBreakdown buckets={aging.buckets} maxAmount={aging.maxAmount} />
           <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-dashed border-ink-100 pt-3 text-xs">
             <span className="text-ink-400">
               {aging.totalCount} checks · {formatCurrency(aging.totalAmount)} total
@@ -711,16 +795,37 @@ function AgingCard({ loading, aging }) {
   )
 }
 
+function UrgencyCard({ loading, urgency, totalActive }) {
+  return (
+    <SectionCard icon={Timer} title="Reservation urgency" subtitle="Active holds by time remaining, up to 4 hours out.">
+      {loading ? (
+        <div className="space-y-2.5">
+          {Array.from({ length: 5 }).map((_, i) => (
+            <div key={i} className="h-6 animate-pulse rounded bg-ink-50" />
+          ))}
+        </div>
+      ) : totalActive === 0 ? (
+        <p className="py-6 text-center text-sm text-ink-400">No active reservations right now.</p>
+      ) : (
+        <>
+          <BucketBreakdown buckets={urgency.buckets} maxAmount={urgency.maxAmount} />
+          <div className="mt-4 flex items-center justify-between border-t border-dashed border-ink-100 pt-3 text-xs text-ink-400">
+            <span>
+              {urgency.totalWithin4h} of {totalActive} active hold{totalActive === 1 ? '' : 's'} expire within 4 hours
+            </span>
+          </div>
+        </>
+      )}
+    </SectionCard>
+  )
+}
+
 function TrendCard({ loading, trend }) {
   const max = Math.max(1, ...trend.map((d) => d.count))
   const total = trend.reduce((s, d) => s + d.count, 0)
 
   return (
-    <SectionCard
-      icon={BarChart3}
-      title="Pickup activity"
-      subtitle={`Checks picked up per day, last ${TREND_DAYS} days.`}
-    >
+    <SectionCard icon={BarChart3} title="Pickup activity" subtitle={`Checks picked up per day, last ${TREND_DAYS} days.`}>
       {loading ? (
         <div className="h-32 animate-pulse rounded bg-ink-50" />
       ) : (
@@ -734,7 +839,7 @@ function TrendCard({ loading, trend }) {
                     style={{ height: `${d.count > 0 ? Math.max(6, (d.count / max) * 100) : 0}%` }}
                   />
                 </div>
-                <span className="font-mono text-[9px] text-ink-300">{d.label.split(' ')[1]}</span>
+                <span className="whitespace-nowrap font-mono text-[9px] text-ink-300">{d.label}</span>
               </div>
             ))}
           </div>
@@ -747,6 +852,43 @@ function TrendCard({ loading, trend }) {
   )
 }
 
+function TurnaroundCard({ loading, turnaround, periodLabel }) {
+  return (
+    <SectionCard icon={Gauge} title="Reservation turnaround" subtitle={`Time from reservation to pickup, ${periodLabel}.`}>
+      {loading ? (
+        <div className="grid grid-cols-3 gap-3">
+          {Array.from({ length: 3 }).map((_, i) => (
+            <div key={i} className="h-16 animate-pulse rounded bg-ink-50" />
+          ))}
+        </div>
+      ) : turnaround.count === 0 ? (
+        <p className="py-6 text-center text-sm text-ink-400">No completed pickups in this period yet.</p>
+      ) : (
+        <div className="grid grid-cols-3 gap-3">
+          <TurnaroundStat label="Median" value={formatDuration(turnaround.medianMinutes)} />
+          <TurnaroundStat label="Average" value={formatDuration(turnaround.avgMinutes)} />
+          <TurnaroundStat label="Slowest" value={formatDuration(turnaround.maxMinutes)} />
+        </div>
+      )}
+      {!loading && turnaround.count > 0 && (
+        <p className="mt-3 text-xs text-ink-400">
+          Based on <span className="font-medium text-ink-700">{turnaround.count}</span> completed pickup
+          {turnaround.count === 1 ? '' : 's'}
+        </p>
+      )}
+    </SectionCard>
+  )
+}
+
+function TurnaroundStat({ label, value }) {
+  return (
+    <div className="rounded-md border border-dashed border-ink-100 bg-ink-50/50 px-3 py-3 text-center">
+      <p className="font-display text-lg font-semibold text-ink-900">{value}</p>
+      <p className="mt-0.5 font-mono text-[10px] uppercase tracking-wide text-ink-400">{label}</p>
+    </div>
+  )
+}
+
 function ActiveReservationsCard({ loading, reservations }) {
   return (
     <SectionCard
@@ -755,7 +897,7 @@ function ActiveReservationsCard({ loading, reservations }) {
       subtitle="Orders currently on hold for collectors."
       right={
         <Link
-          to="/admin/pickups"
+          to="/verifier/pickups"
           className="group flex items-center gap-1 text-xs font-medium text-ledger-stampDark hover:underline"
         >
           View all
@@ -770,7 +912,7 @@ function ActiveReservationsCard({ loading, reservations }) {
       ) : (
         <div className="divide-y divide-dashed divide-ink-100">
           {reservations.map((r) => {
-            const urgent = r.minutesLeft !== null && r.minutesLeft <= EXPIRING_SOON_MINUTES
+            const urgent = r.minutesLeft !== null && r.minutesLeft <= URGENCY_BUCKETS[0].maxMinutes
             return (
               <div key={r.id} className="flex items-center gap-3 py-3 text-sm">
                 <span
@@ -782,19 +924,12 @@ function ActiveReservationsCard({ loading, reservations }) {
                   {initials(r.collector_name)}
                 </span>
                 <div className="min-w-0 flex-1">
-                  <p className="truncate font-medium text-ink-800">
-                    {r.collector_name || 'Unknown collector'}
-                  </p>
+                  <p className="truncate font-medium text-ink-800">{r.collector_name || 'Unknown collector'}</p>
                   <p className="truncate font-mono text-xs text-ink-300">
                     {r.checkCount} check{r.checkCount === 1 ? '' : 's'} · {formatCurrency(r.total)}
                   </p>
                 </div>
-                <span
-                  className={cn(
-                    'shrink-0 font-mono text-xs font-medium',
-                    urgent ? 'text-red-600' : 'text-ink-500'
-                  )}
-                >
+                <span className={cn('shrink-0 font-mono text-xs font-medium', urgent ? 'text-red-600' : 'text-ink-500')}>
                   {r.minutesLeft === null ? '—' : `${r.minutesLeft}m left`}
                 </span>
               </div>
@@ -829,9 +964,7 @@ function TopCollectorsCard({ loading, collectors, periodLabel }) {
                   {c.count} check{c.count === 1 ? '' : 's'}
                 </p>
               </div>
-              <span className="shrink-0 font-mono text-sm font-medium text-ink-800">
-                {formatCurrency(c.amount)}
-              </span>
+              <span className="shrink-0 font-mono text-sm font-medium text-ink-800">{formatCurrency(c.amount)}</span>
             </div>
           ))}
         </div>
@@ -858,9 +991,7 @@ function RecentRow({ record }) {
 
       <div className="shrink-0 text-right">
         <p className="font-mono font-medium text-ink-800">{formatCurrency(record.amount)}</p>
-        <p className="text-xs text-ink-300">
-          {record.picked_up_at ? formatDate(record.picked_up_at) : '—'}
-        </p>
+        <p className="text-xs text-ink-300">{record.picked_up_at ? formatDate(record.picked_up_at) : '—'}</p>
       </div>
     </div>
   )

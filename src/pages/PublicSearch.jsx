@@ -60,6 +60,28 @@ function getBankLogoUrl(name) {
   return BANK_LOGOS[name] || null
 }
 
+// Short, space-efficient display names for bank breakdown chips (mobile
+// cards get crowded fast with full legal names like "Rizal Commercial
+// Banking Corporation (RCBC)"). Falls back to the full name for any bank
+// not explicitly mapped, so adding a bank to BANKS never breaks this.
+const BANK_SHORT_NAMES = {
+  'BDO Unibank': 'BDO',
+  'Bank of the Philippine Islands (BPI)': 'BPI',
+  Metrobank: 'Metrobank',
+  'Land Bank of the Philippines': 'Landbank',
+  'Philippine National Bank (PNB)': 'PNB',
+  'China Banking Corporation (Chinabank)': 'Chinabank',
+  'Rizal Commercial Banking Corporation (RCBC)': 'RCBC',
+  'Security Bank': 'Security Bank',
+  'UnionBank of the Philippines': 'UnionBank',
+  'EastWest Bank': 'EastWest',
+  'Philippine Savings Bank (PSBank)': 'PSBank',
+}
+
+function getBankShortName(name) {
+  return BANK_SHORT_NAMES[name] || name
+}
+
 // ---------------------------------------------------------------------------
 // Name normalization — mirrors the SQL generated columns `payee_normalized`
 // and `payor_normalized` on public.checks EXACTLY:
@@ -194,6 +216,11 @@ export default function PublicSearch() {
   const [matchedCount, setMatchedCount] = useState(0)
   // Per-branch counts for the current query, e.g. { 'CSBA - PARQAL': 3, 'CSBA - BGC': 1 }
   const [branchCounts, setBranchCounts] = useState({})
+  // Per-branch, per-bank counts for the current query, e.g.
+  // { 'CSBA - PARQAL': { 'BDO Unibank': 2, 'Land Bank of the Philippines': 4 } }
+  // Only meaningful (and only rendered) when no single bank is selected —
+  // that's the "which bank did each check come from" breakdown.
+  const [branchBankCounts, setBranchBankCounts] = useState({})
   const [loading, setLoading] = useState(false)
   const [hasSearched, setHasSearched] = useState(false)
  const [matchedNames, setMatchedNames] = useState(null) // { payee, payor } from DB, or null   ← add this
@@ -279,49 +306,39 @@ export default function PublicSearch() {
   // "Inc"/"Inc."/"Corp"/etc, while a genuinely different or misspelled name
   // does not — which is exactly the behavior that was requested.
   //
-  // count: 'exact', head: true means Postgres returns only a row count,
-  // never the row bodies — the cheapest possible query for this UI, which
-  // only ever needs numbers, not the underlying records.
-  function buildBaseQuery(bankValue, payeeNormalized, payorNormalized) {
+  // Bank is OPTIONAL: when left blank, results span every bank, and the UI
+  // surfaces a per-branch bank breakdown so the person can still see where
+  // each check actually came from.
+  //
+  // A safety cap on rows returned — plenty of headroom for legitimate
+  // pickup volumes while bounding payload size/cost if a query is
+  // unexpectedly broad.
+  const MAX_MATCHED_ROWS = 1000
+
+  function buildMatchQuery(bankValue, payeeNormalized, payorNormalized) {
     let req = supabase
       .from('checks')
-      .select('id', { count: 'exact', head: true })
+      .select('bank, pickup_branch, payee, payor')
       .eq('status', 'available')
-      .eq('bank', bankValue)
+      .eq('payee_normalized', payeeNormalized)
+      .eq('payor_normalized', payorNormalized)
+      .limit(MAX_MATCHED_ROWS)
 
-    if (payeeNormalized) req = req.eq('payee_normalized', payeeNormalized)
-    if (payorNormalized) req = req.eq('payor_normalized', payorNormalized)
+    if (bankValue) req = req.eq('bank', bankValue)
 
     return req
   }
-  // Fetches the actual, DB-stored payee/payor text for the current match —
-// used to display the canonical name in results instead of whatever the
-// user happened to type into the search box. Since the match is on the
-// normalized columns, multiple rows could theoretically have slightly
-// different raw punctuation; we just take the first one as representative.
-async function fetchMatchedNames(bankValue, payeeNormalized, payorNormalized) {
-  const { data, error } = await supabase
-    .from('checks')
-    .select('payee, payor')
-    .eq('status', 'available')
-    .eq('bank', bankValue)
-    .eq('payee_normalized', payeeNormalized)
-    .eq('payor_normalized', payorNormalized)
-    .limit(1)
-    .maybeSingle()
-
-  if (error || !data) return null
-  return { payee: data.payee, payor: data.payor }
-}
 
   async function fetchMatchCount(bankTerm, payeeTerm, payorTerm) {
-    const bankValue = bankTerm.trim()
+    const bankValue = bankTerm.trim() // optional — '' means "any bank"
     const payeeNormalized = normalizeCompanyName(payeeTerm)
     const payorNormalized = normalizeCompanyName(payorTerm)
 
-    if (!bankValue || !payeeNormalized || !payorNormalized) {
+    if (!payeeNormalized || !payorNormalized) {
       setMatchedCount(0)
       setBranchCounts({})
+      setBranchBankCounts({})
+      setMatchedNames(null)
       setLoading(false)
       return
     }
@@ -329,38 +346,41 @@ async function fetchMatchedNames(bankValue, payeeNormalized, payorNormalized) {
     const thisRequestId = ++requestIdRef.current
     setLoading(true)
 
-  try {
-  const branchKeys = Object.keys(OFFICES)
-  const [totalResult, namesResult, ...branchResults] = await Promise.all([
-    buildBaseQuery(bankValue, payeeNormalized, payorNormalized),
-    fetchMatchedNames(bankValue, payeeNormalized, payorNormalized),
-    ...branchKeys.map((key) =>
-      buildBaseQuery(bankValue, payeeNormalized, payorNormalized).eq(BRANCH_FIELD, key)
-    ),
-  ])
+    try {
+      const { data, error } = await buildMatchQuery(bankValue, payeeNormalized, payorNormalized)
 
-  if (thisRequestId !== requestIdRef.current) return
+      if (thisRequestId !== requestIdRef.current) return
+      if (error) throw error
 
-  if (totalResult.error) throw totalResult.error
+      const rows = data || []
 
-  const nextBranchCounts = {}
-  branchKeys.forEach((key, idx) => {
-    const result = branchResults[idx]
-    if (!result.error) {
-      nextBranchCounts[key] = result.count || 0
-    }
-  })
+      // Group once, client-side, into both the per-branch totals and the
+      // per-branch per-bank breakdown — a single round trip instead of one
+      // query per branch (or per branch-and-bank combination).
+      const nextBranchCounts = {}
+      const nextBranchBankCounts = {}
+      for (const row of rows) {
+        const branchKey = row[BRANCH_FIELD]
+        nextBranchCounts[branchKey] = (nextBranchCounts[branchKey] || 0) + 1
 
-  setMatchedCount(totalResult.count || 0)
-  setBranchCounts(nextBranchCounts)
-  setMatchedNames(namesResult) // null when no match — falls back to query text below
-} catch (err) {
-  if (thisRequestId !== requestIdRef.current) return
-  console.error('Failed to fetch check matches:', err)
-  setMatchedCount(0)
-  setBranchCounts({})
-  setMatchedNames(null)
-} finally {
+        if (!nextBranchBankCounts[branchKey]) nextBranchBankCounts[branchKey] = {}
+        nextBranchBankCounts[branchKey][row.bank] = (nextBranchBankCounts[branchKey][row.bank] || 0) + 1
+      }
+
+      setMatchedCount(rows.length)
+      setBranchCounts(nextBranchCounts)
+      setBranchBankCounts(nextBranchBankCounts)
+      // Canonical DB-stored spelling for display, falling back to the typed
+      // query text below when there's no match.
+      setMatchedNames(rows[0] ? { payee: rows[0].payee, payor: rows[0].payor } : null)
+    } catch (err) {
+      if (thisRequestId !== requestIdRef.current) return
+      console.error('Failed to fetch check matches:', err)
+      setMatchedCount(0)
+      setBranchCounts({})
+      setBranchBankCounts({})
+      setMatchedNames(null)
+    } finally {
       if (thisRequestId === requestIdRef.current) {
         setLoading(false)
       }
@@ -410,7 +430,8 @@ async function fetchMatchedNames(bankValue, payeeNormalized, payorNormalized) {
   }
 
   function handleSearch() {
-    if (!bank.trim() || !payeeQuery.trim() || !payorQuery.trim()) return
+    // Bank is optional — only payee and payor are required to search.
+    if (!payeeQuery.trim() || !payorQuery.trim()) return
     setShowPayeeSuggestions(false)
     setShowPayorSuggestions(false)
     setHasSearched(true)
@@ -458,11 +479,13 @@ async function fetchMatchedNames(bankValue, payeeNormalized, payorNormalized) {
     setShowPayorSuggestions(false)
     setMatchedCount(0)
   setBranchCounts({})
+  setBranchBankCounts({})
   setMatchedNames(null)
   setHasSearched(false)
   }
 
-  const hasQueryText = !!(bank.trim() && payeeQuery.trim() && payorQuery.trim())
+  // Bank is optional: only payee and payor gate whether a search can run.
+  const hasQueryText = !!(payeeQuery.trim() && payorQuery.trim())
   const filledCount = [bank, payeeQuery, payorQuery].filter((v) => v.trim().length > 0).length
 
   return (
@@ -498,10 +521,17 @@ async function fetchMatchedNames(bankValue, payeeNormalized, payorNormalized) {
               </div>
 
               <div className="grid grid-cols-1 divide-y divide-slate-200 sm:grid-cols-3 sm:divide-x sm:divide-y-0">
-                <SlipField index="01" icon={Landmark} label="Bank" filled={Boolean(bank)}>
+                <SlipField
+                  index="01"
+                  icon={Landmark}
+                  label="Bank"
+                  filled={Boolean(bank)}
+                  caption="Optional — leave blank to search every bank"
+                >
                   <BankDropdown
                     value={bank}
                     options={BANKS}
+                    placeholder="All banks (optional)"
                     onChange={(next) => {
                       setBank(next)
                       // Auto-advance to Payee once a bank is picked — saves a
@@ -638,7 +668,7 @@ async function fetchMatchedNames(bankValue, payeeNormalized, payorNormalized) {
                     type="button"
                     onClick={handleSearch}
                     disabled={!hasQueryText || loading}
-                    title={!hasQueryText ? 'Select a bank and enter both payee and payor to search' : undefined}
+                    title={!hasQueryText ? 'Enter both payee and payor to search' : undefined}
                     className="group inline-flex flex-1 items-center justify-center gap-2 rounded-md bg-[var(--brand)] px-4 py-2.5 text-sm font-semibold text-white transition-all duration-150 hover:bg-[var(--brand-dark)] active:scale-[0.97] disabled:pointer-events-none disabled:opacity-40 sm:flex-none sm:py-2"
                   >
                     {loading ? (
@@ -670,6 +700,7 @@ async function fetchMatchedNames(bankValue, payeeNormalized, payorNormalized) {
   loading={loading}
   count={matchedCount}
   branchCounts={branchCounts}
+  branchBankCounts={branchBankCounts}
   bank={bank}
   payee={matchedNames?.payee || payeeQuery}
   payor={matchedNames?.payor || payorQuery}
@@ -953,6 +984,28 @@ function BankDropdown({ value, options, onChange, placeholder = 'Select bank...'
             <p className="px-2.5 pb-1.5 pt-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-400">
               Choose a bank
             </p>
+            <button
+              type="button"
+              role="option"
+              aria-selected={!value}
+              onMouseEnter={() => setActiveIndex(-1)}
+              onClick={() => {
+                onChange('')
+                setOpen(false)
+              }}
+              className={`flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2.5 text-left text-sm transition-colors ${
+                !value ? 'bg-[var(--brand)]/10 text-[var(--brand-dark)] font-semibold' : 'text-[var(--ink)] font-medium'
+              }`}
+            >
+              <span
+                aria-hidden="true"
+                className="flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-md bg-slate-100 text-slate-400"
+              >
+                <Building2 className="h-4 w-4" />
+              </span>
+              <span className="min-w-0 flex-1 truncate">All banks</span>
+              {!value && <Check className="h-4 w-4 shrink-0 text-[var(--brand)]" />}
+            </button>
             {options.map((opt, i) => {
               const isSelected = opt === value
               const isActive = i === activeIndex
@@ -1271,7 +1324,7 @@ function useCopySummary(text) {
   return { copied, copy }
 }
 
-function ManifestCountCard({ loading, count, branchCounts, bank, payee, payor, onEditSearch }) {
+function ManifestCountCard({ loading, count, branchCounts, branchBankCounts, bank, payee, payor, onEditSearch }) {
   const displayCount = useCountUp(count, !loading)
 
   // Which branches actually have matching checks, ranked by count — this
@@ -1288,13 +1341,27 @@ function ManifestCountCard({ loading, count, branchCounts, bank, payee, payor, o
     count - activeBranchKeys.reduce((sum, key) => sum + (branchCounts[key] || 0), 0)
   )
 
+  // Only meaningful when no specific bank was chosen — otherwise every
+  // matched check is from that one bank by definition, so there's nothing
+  // to break down.
+  const showBankBreakdown = !bank
+  const distinctBankCount = showBankBreakdown
+    ? new Set(Object.values(branchBankCounts).flatMap((counts) => Object.keys(counts))).size
+    : 0
+
   const summaryText = [
-    `CSBA check pickup — ${bank}`,
+    `CSBA check pickup — ${bank || 'All banks'}`,
     `Payee: ${payee} · Payor: ${payor}`,
     `${count} check${count === 1 ? '' : 's'} ready for pickup`,
-    ...activeBranchKeys.map(
-      (key) => `• ${OFFICES[key].label}: ${branchCounts[key]} check${branchCounts[key] === 1 ? '' : 's'}`
-    ),
+    ...activeBranchKeys.map((key) => {
+      const branchTotal = branchCounts[key] || 0
+      const bankEntries = Object.entries(branchBankCounts[key] || {}).sort((a, b) => b[1] - a[1])
+      const bankDetail =
+        showBankBreakdown && bankEntries.length > 1
+          ? ` (${bankEntries.map(([b, c]) => `${getBankShortName(b)} ${c}`).join(', ')})`
+          : ''
+      return `• ${OFFICES[key].label}: ${branchTotal} check${branchTotal === 1 ? '' : 's'}${bankDetail}`
+    }),
   ].join('\n')
   const { copied, copy: copySummary } = useCopySummary(summaryText)
 
@@ -1375,9 +1442,17 @@ function ManifestCountCard({ loading, count, branchCounts, bank, payee, payor, o
               check{count === 1 ? '' : 's'} ready
             </span>
           </div>
-          <div className="mt-1 flex items-center gap-1.5 text-xs font-medium text-slate-400">
-            <Clock className="h-3.5 w-3.5" />
-            Queried {new Date().toLocaleString()}
+          <div className="mt-1 flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-xs font-medium text-slate-400 lg:justify-start">
+            <span className="inline-flex items-center gap-1.5">
+              <Clock className="h-3.5 w-3.5" />
+              Queried {new Date().toLocaleString()}
+            </span>
+            {showBankBreakdown && distinctBankCount > 1 && (
+              <span className="inline-flex items-center gap-1.5 text-[var(--brand-dark)]">
+                <Landmark className="h-3.5 w-3.5" />
+                Across {distinctBankCount} banks
+              </span>
+            )}
           </div>
         </div>
 
@@ -1390,12 +1465,13 @@ function ManifestCountCard({ loading, count, branchCounts, bank, payee, payor, o
           <div className="flex flex-col gap-3">
             <QueryChip
               label="Bank"
-              value={bank}
-              logo={bank}
+              value={bank || 'All banks'}
+              logo={bank || null}
+              icon={Building2}
               size="lg"
               full
               truncate
-              sizeClass={sizeForLength(bank.length, ['text-2xl', 'text-xl', 'text-lg'])}
+              sizeClass={sizeForLength((bank || 'All banks').length, ['text-2xl', 'text-xl', 'text-lg'])}
             />
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <QueryChip
@@ -1467,6 +1543,8 @@ function ManifestCountCard({ loading, count, branchCounts, bank, payee, payor, o
                 key={key}
                 office={OFFICES[key]}
                 count={branchCounts[key]}
+                bankCounts={branchBankCounts[key] || {}}
+                showBankBreakdown={showBankBreakdown}
                 wide={activeBranchKeys.length === 1}
                 delay={i * 90}
               />
@@ -1503,6 +1581,10 @@ function ManifestCountCard({ loading, count, branchCounts, bank, payee, payor, o
 // `sizeClass`, when supplied by the caller, overrides the chip's own
 // length-based size calculation — this is how Payee and Payor are made to
 // always share one size (whichever of the two is longer decides both).
+//
+// `icon`, when supplied and `logo` is falsy, renders as a neutral fallback
+// glyph (e.g. a generic bank building for the "All banks" state) instead of
+// leaving an empty gap where a logo would normally sit.
 function sizeForLength(len, tiers = ['text-lg', 'text-base', 'text-sm']) {
   const [big, mid, small] = tiers
   if (len > 34) return small
@@ -1510,7 +1592,7 @@ function sizeForLength(len, tiers = ['text-lg', 'text-base', 'text-sm']) {
   return big
 }
 
-function QueryChip({ label, value, full, size = 'md', logo, truncate, sizeClass }) {
+function QueryChip({ label, value, full, size = 'md', logo, icon: Icon, truncate, sizeClass }) {
   const logoSize = size === 'lg' ? 40 : 28
   const valueSizeClass = sizeClass || (truncate ? sizeForLength((value || '').length) : 'text-lg')
 
@@ -1518,7 +1600,17 @@ function QueryChip({ label, value, full, size = 'md', logo, truncate, sizeClass 
     <div className={`flex min-w-0 flex-col items-start ${full ? 'w-full' : ''}`}>
       <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">{label}</span>
       <div className="mt-1 flex min-w-0 w-full items-center gap-2">
-        {logo && <BankAvatar name={logo} size={logoSize} />}
+        {logo ? (
+          <BankAvatar name={logo} size={logoSize} />
+        ) : Icon ? (
+          <span
+            aria-hidden="true"
+            style={{ height: logoSize, width: logoSize }}
+            className="flex shrink-0 items-center justify-center rounded-md bg-slate-100 text-slate-400"
+          >
+            <Icon className="h-4 w-4" />
+          </span>
+        ) : null}
         <span
           title={value || undefined}
           className={`block min-w-0 flex-1 truncate text-left font-bold uppercase tracking-wide text-[var(--ink-dark)] ${valueSizeClass}`}
@@ -1530,12 +1622,57 @@ function QueryChip({ label, value, full, size = 'md', logo, truncate, sizeClass 
   )
 }
 
+// Compact "which bank did this come from" breakdown for a single branch
+// card. Kept deliberately terse for mobile: bank rows are sorted by volume,
+// only the top 3 show by default, and anything beyond that collapses behind
+// a "+N more" toggle instead of pushing the card taller for every visitor.
+function BankBreakdown({ counts }) {
+  const [expanded, setExpanded] = useState(false)
+  const entries = Object.entries(counts).sort((a, b) => b[1] - a[1])
+
+  if (entries.length === 0) return null
+
+  const VISIBLE_LIMIT = 3
+  const visible = expanded ? entries : entries.slice(0, VISIBLE_LIMIT)
+  const hiddenCount = entries.length - visible.length
+
+  return (
+    <div className="rounded-xl border border-slate-100 bg-slate-50 px-3 py-2.5">
+      <p className="mb-2 flex items-center gap-1.5 text-[10.5px] font-semibold uppercase tracking-wide text-slate-400">
+        <Landmark className="h-3 w-3" /> Checks by bank
+      </p>
+      <ul className="flex flex-col gap-1.5">
+        {visible.map(([bankName, bankCount]) => (
+          <li key={bankName} className="flex items-center gap-2" title={bankName}>
+            <BankAvatar name={bankName} size={20} />
+            <span className="min-w-0 flex-1 truncate text-xs font-medium text-slate-600">
+              {getBankShortName(bankName)}
+            </span>
+            <span className="shrink-0 rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[11px] font-bold tabular-nums text-[var(--brand-dark)]">
+              {bankCount}
+            </span>
+          </li>
+        ))}
+      </ul>
+      {hiddenCount > 0 && (
+        <button
+          type="button"
+          onClick={() => setExpanded(true)}
+          className="mt-1.5 text-[11px] font-semibold text-[var(--brand)] transition-colors hover:text-[var(--brand-dark)]"
+        >
+          +{hiddenCount} more bank{hiddenCount === 1 ? '' : 's'}
+        </button>
+      )}
+    </div>
+  )
+}
+
 // A single pickup location: identity + count, address, hours/phone (with a
 // safe generic fallback when not yet confirmed), a standard requirements
 // checklist, directions/copy actions, and an interactive map/street-view
 // toggle. Used once per matched branch inside the grid above, so multiple
 // locations are always visible together rather than switched between.
-function LocationCard({ office, count, wide, delay = 0 }) {
+function LocationCard({ office, count, bankCounts, showBankBreakdown, wide, delay = 0 }) {
   const streetViewSrc = getStreetViewSrc(office)
   const hasStreetView = Boolean(streetViewSrc)
   const [mapView, setMapView] = useState(hasStreetView ? 'street' : 'map')
@@ -1600,6 +1737,10 @@ function LocationCard({ office, count, wide, delay = 0 }) {
             {office.phone || 'Contact CSBA for phone support'}
           </span>
         </div>
+
+        {/* Which bank(s) each check at this branch actually came from — only
+            rendered when the search wasn't already scoped to one bank. */}
+        {showBankBreakdown && <BankBreakdown counts={bankCounts} />}
 
         <div className="rounded-xl border border-slate-100 bg-slate-50 px-4 py-3">
           <p className="mb-2 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
@@ -1733,7 +1874,7 @@ function PromptState({ ready }) {
       <p className="mt-3 max-w-sm text-base font-medium text-slate-500">
         {ready
           ? 'Tap "View available checks" above to see what\u2019s ready for pickup.'
-          : 'Select a bank and enter the payee and payor details above to locate items available for pickup at the depot.'}
+          : 'Enter the payee and payor printed on the check above to locate items available for pickup at the depot. Bank is optional — leave it blank to search every bank at once.'}
       </p>
     </div>
   )

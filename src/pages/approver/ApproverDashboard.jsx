@@ -60,7 +60,7 @@ import { useProfile, hasRole } from '../../context/ProfileContext'
 
 const DAY_MS = 86400000
 const HOUR_MS = 3600000
-const URGENT_WAIT_HOURS = 24
+const URGENT_WAIT_HOURS = 1
 const TREND_DAYS = 14
 const SLA_TARGET_HOURS = 24
 const ALLOWED_ROLES = ['approver', 'admin']

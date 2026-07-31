@@ -11,6 +11,7 @@ import {
   ChevronsLeft,
   ChevronsRight,
   ChevronRight,
+  UserCog,
 } from 'lucide-react'
 
 const NAV_ITEMS = [
@@ -18,6 +19,7 @@ const NAV_ITEMS = [
   { to: '/admin/audit', label: 'Activity logs', icon: ScrollText },
   { to: '/admin/users', label: 'Manage users', icon: Users },
   { to: '/admin/reports', label: 'Reports', icon: FileBarChart2 },
+  { to: '/admin/account', label: 'Account', icon: UserCog },
 ]
 
 const PAGE_TITLES = {
@@ -25,6 +27,7 @@ const PAGE_TITLES = {
   '/admin/audit': 'Activity logs',
   '/admin/users': 'Manage users',
   '/admin/reports': 'Reports',
+  '/admin/account': 'Account',
 }
 
 const SIDEBAR_STORAGE_KEY = 'admin.sidebar.collapsed'

@@ -1,3 +1,9 @@
+// src/components/VerifierLayout.jsx
+//
+// NOTE: in the code you pasted, this component's links all point to
+// /verifier/... routes but the function was named `AdminLayout`. Renamed
+// here to `VerifierLayout` to match what it actually renders — update your
+// import in the router accordingly (see message for the one-line diff).
 import React from 'react'
 import { NavLink, Outlet } from 'react-router-dom'
 import {
@@ -7,6 +13,7 @@ import {
   Clock,
   BarChart3,
   QrCode,
+  UserCog,
 } from 'lucide-react'
 import { cn } from '../lib/utils'
 
@@ -17,12 +24,12 @@ const links = [
   { to: '/verifier/pickups', label: 'Pending pickups', icon: Clock },
   { to: '/verifier/reports', label: 'Reports', icon: BarChart3 },
   { to: '/verifier/qr', label: 'QR code', icon: QrCode },
+  { to: '/verifier/account', label: 'Account', icon: UserCog },
 ]
 
-export default function AdminLayout() {
+export default function VerifierLayout() {
   return (
-   <div className="flex gap-8 px-4 py-8 sm:px-6 lg:px-8 xl:px-10">
-      
+    <div className="flex gap-8 px-4 py-8 sm:px-6 lg:px-8 xl:px-10">
       {/* Desktop Sidebar */}
       <aside className="hidden w-56 shrink-0 md:block">
         <nav className="sticky top-28 flex flex-col gap-1.5">
@@ -31,7 +38,7 @@ export default function AdminLayout() {
               Administration
             </h2>
           </div>
-          
+
           {links.map(({ to, label, icon: Icon, end }) => (
             <NavLink
               key={to}
@@ -91,7 +98,7 @@ export default function AdminLayout() {
             </NavLink>
           ))}
         </nav>
-        
+
         {/* Page Content */}
         <div className="rounded-xl">
           <Outlet />

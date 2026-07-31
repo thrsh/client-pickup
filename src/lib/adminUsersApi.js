@@ -27,12 +27,12 @@ export function listUsers({ page = 1, perPage = 50 } = {}) {
   return invoke('list', { page, perPage })
 }
 
-export function createUser({ email, firstName, lastName, role, password }) {
-  return invoke('create', { email, firstName, lastName, role, password })
+export function createUser({ email, firstName, lastName, role, branch, password }) {
+  return invoke('create', { email, firstName, lastName, role, branch, password })
 }
 
-export function updateUser({ id, email, firstName, lastName, role }) {
-  return invoke('update', { id, email, firstName, lastName, role })
+export function updateUser({ id, email, firstName, lastName, role, branch }) {
+  return invoke('update', { id, email, firstName, lastName, role, branch })
 }
 
 export function deactivateUser(id) {

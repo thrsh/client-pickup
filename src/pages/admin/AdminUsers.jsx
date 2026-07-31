@@ -23,7 +23,6 @@ import {
   CheckCircle2,
   AlertTriangle,
   XCircle,
-  Info,
   ArrowUpDown,
   ChevronUp,
   ChevronDown,
@@ -39,6 +38,7 @@ import {
   Circle,
   AlertCircle,
   UserCog,
+  Building2,
 } from 'lucide-react'
 import { Button } from '../../components/ui/button'
 import { Input } from '../../components/ui/input'
@@ -66,6 +66,17 @@ const ROLE_OPTIONS = [
 
 const ROLE_FILTER_OPTIONS = [{ value: 'all', label: 'All roles' }, ...ROLE_OPTIONS]
 
+// Branch assignment. "all_branches" is a real assignment (the user has
+// access across every branch) — distinct from the filter's "all" sentinel
+// below, which just means "don't filter."
+const BRANCH_OPTIONS = [
+  { value: 'csba_parqal', label: 'CSBA - Parqal' },
+  { value: 'csba_bgc', label: 'CSBA - BGC' },
+  { value: 'all_branches', label: 'All Branches' },
+]
+
+const BRANCH_FILTER_OPTIONS = [{ value: 'all', label: 'All branches' }, ...BRANCH_OPTIONS]
+
 const STATUS_FILTER_OPTIONS = [
   { value: 'all', label: 'All statuses' },
   { value: 'active', label: 'Active' },
@@ -89,11 +100,19 @@ const ROLE_BADGE_STYLE = {
   approver: 'bg-amber-100 text-amber-800',
 }
 
-// Small local copy of icon/tone metadata for sign-in presence — kept as a
-// thin UI lookup here (icons + Tailwind classes), while the underlying
-// status strings and labels come from adminAuditApi.js's
-// SESSION_STATUS_LABELS/getSessionStatusLabel so both pages describe the
-// same four states identically.
+const BRANCH_BADGE_STYLE = {
+  csba_parqal: 'bg-indigo-100 text-indigo-800',
+  csba_bgc: 'bg-cyan-100 text-cyan-800',
+  all_branches: 'bg-purple-100 text-purple-800',
+}
+
+function branchLabel(value) {
+  return BRANCH_OPTIONS.find((b) => b.value === value)?.label || 'Unassigned'
+}
+
+// Icon/tone metadata for sign-in presence — the underlying status strings
+// and labels come from adminAuditApi.js's SESSION_STATUS_LABELS so both
+// pages describe the same four states identically.
 const SESSION_STATUS_UI = {
   online: { icon: Radio, tone: 'text-green-700 bg-green-50', pulse: true },
   offline: { icon: Circle, tone: 'text-gray-600 bg-gray-100', pulse: false },
@@ -121,6 +140,7 @@ const AVATAR_PALETTE = [
 
 const PAGE_SIZE = 10
 const SESSIONS_REFRESH_MS = 30 * 1000 // matches AdminAuditTrail's User Sessions tab cadence
+const BANNER_DURATION_MS = 4000
 
 function splitName(fullName = '') {
   const parts = fullName.trim().split(/\s+/).filter(Boolean)
@@ -149,8 +169,7 @@ function formatRelativeTime(iso) {
   if (!iso) return 'Never'
   const date = new Date(iso)
   if (Number.isNaN(date.getTime())) return 'Never'
-  const diffMs = Date.now() - date.getTime()
-  const diffSec = Math.round(diffMs / 1000)
+  const diffSec = Math.round((Date.now() - date.getTime()) / 1000)
   const diffMin = Math.round(diffSec / 60)
   const diffHr = Math.round(diffMin / 60)
   const diffDay = Math.round(diffHr / 24)
@@ -188,6 +207,12 @@ function formatDuration(ms) {
   return parts.slice(0, 2).join(' ') || '<1m'
 }
 
+function extractErrorMessage(err, fallback) {
+  if (!err) return fallback
+  if (typeof err === 'string') return err
+  return err.message || fallback
+}
+
 function useDebouncedValue(value, delay) {
   const [debounced, setDebounced] = useState(value)
   useEffect(() => {
@@ -197,15 +222,10 @@ function useDebouncedValue(value, delay) {
   return debounced
 }
 
-// ----------------------------------------------------------------------------
-// Module-level stale-while-revalidate cache. This is what actually removes
-// the ~1s blank/skeleton wait on every visit: the first load in a browser
-// session still has to pay real network latency, but every subsequent
-// mount of this page (switching tabs, navigating away and back) renders the
-// last known-good data immediately from this cache, then silently
-// refetches in the background to catch up on anything that changed. Module
-// scope (not component state) so it survives unmount/remount of the page.
-// ----------------------------------------------------------------------------
+// Module-level stale-while-revalidate cache so switching tabs or navigating
+// back to this page renders the last known-good data immediately, then
+// silently refetches in the background. Module scope (not component state)
+// so it survives unmount/remount of the page.
 let usersCache = null // { data, ts }
 let sessionsCache = null // { data, ts }
 const CACHE_TTL_MS = 60 * 1000
@@ -214,12 +234,9 @@ function isCacheFresh(cache) {
   return Boolean(cache) && Date.now() - cache.ts < CACHE_TTL_MS
 }
 
-// ----------------------------------------------------------------------------
-// Robust, tokenized, case-insensitive search — every space-separated word
-// in the query must appear somewhere in the row, so "juan verifier" matches
-// a user named Juan with role verifier regardless of field order, the same
-// matching behavior used by the audit trail tables.
-// ----------------------------------------------------------------------------
+// Tokenized, case-insensitive search — every space-separated word in the
+// query must appear somewhere in the row, so "juan verifier" matches a
+// user named Juan with role verifier regardless of field order.
 function normalizeSearchTokens(term) {
   return String(term || '')
     .toLowerCase()
@@ -249,6 +266,7 @@ function userSearchHaystack(u) {
     u.full_name,
     u.email,
     u.role,
+    branchLabel(u.branch),
     u.banned ? 'deactivated' : 'active',
     sessionStatusLabel(u.session?.status),
     u.session?.lastLogin ? formatAbsoluteTime(u.session.lastLogin) : null,
@@ -256,10 +274,7 @@ function userSearchHaystack(u) {
 }
 
 // Generic, locale-aware, null-safe comparator shared by every sortable
-// column — numeric getters compare numerically, everything else falls back
-// to case-insensitive/locale-aware string comparison, and missing values
-// always sort last regardless of direction (so "never signed in" doesn't
-// jump to the top just because ascending order was picked).
+// column. Missing values always sort last regardless of direction.
 function compareBy(getter, dir) {
   const mult = dir === 'asc' ? 1 : -1
   return (a, b) => {
@@ -277,11 +292,11 @@ function compareBy(getter, dir) {
 
 const SESSION_SORT_ORDER = { online: 0, stale: 1, offline: 2, never_logged_in: 3 }
 
-// Client-side getters for every sortable column, used with compareBy above.
 const USER_SORT_GETTERS = {
   name: (u) => (u.full_name || u.email || '').toLowerCase() || null,
   email: (u) => (u.email || '').toLowerCase() || null,
   role: (u) => (u.role || '').toLowerCase() || null,
+  branch: (u) => branchLabel(u.branch).toLowerCase(),
   status: (u) => (u.banned ? 1 : 0),
   session: (u) => SESSION_SORT_ORDER[u.session?.status] ?? SESSION_SORT_ORDER.never_logged_in,
   lastLogin: (u) => (u.session?.lastLogin ? new Date(u.session.lastLogin).getTime() : null),
@@ -293,6 +308,7 @@ const EMPTY_FORM = {
   firstName: '',
   lastName: '',
   role: 'approver',
+  branch: '',
   password: '',
 }
 
@@ -349,7 +365,7 @@ function BannerToast({ banner, onDismiss }) {
       </button>
       <div
         className={`absolute bottom-0 left-0 h-0.5 ${style.bar} transition-all ease-linear`}
-        style={{ width: shrink ? '0%' : '100%', transitionDuration: '4000ms' }}
+        style={{ width: shrink ? '0%' : '100%', transitionDuration: `${BANNER_DURATION_MS}ms` }}
       />
     </div>
   )
@@ -397,6 +413,19 @@ function SessionStatusBadge({ status, size = 'normal' }) {
   )
 }
 
+function BranchBadge({ branch, size = 'normal' }) {
+  const padding = size === 'small' ? 'px-1.5 py-0.5 text-[10px]' : 'px-2 py-1 text-xs'
+  if (!branch) {
+    return <span className={`inline-flex items-center gap-1 rounded-full bg-gray-50 font-medium text-gray-400 ${padding}`}>Unassigned</span>
+  }
+  return (
+    <span className={`inline-flex items-center gap-1 rounded-full font-medium ${padding} ${BRANCH_BADGE_STYLE[branch] || 'bg-gray-100 text-gray-700'}`}>
+      <Building2 className="h-3 w-3" />
+      {branchLabel(branch)}
+    </span>
+  )
+}
+
 function SkeletonRows({ count = 5 }) {
   return (
     <>
@@ -418,6 +447,9 @@ function SkeletonRows({ count = 5 }) {
             <div className="h-5 w-16 rounded-full bg-gray-200" />
           </td>
           <td className="px-4 py-3">
+            <div className="h-5 w-24 rounded-full bg-gray-200" />
+          </td>
+          <td className="px-4 py-3">
             <div className="h-5 w-20 rounded-full bg-gray-200" />
           </td>
           <td className="px-4 py-3">
@@ -437,9 +469,7 @@ function SkeletonRows({ count = 5 }) {
 
 // Memoized desktop row: only re-renders when this user's own data,
 // selection state, or the (stable, useCallback-wrapped) action handlers
-// change — an unrelated state update elsewhere on the page (search
-// keystroke, banner toast animation, another row's checkbox) no longer
-// forces every row on the page to reconcile.
+// change.
 const UserRow = React.memo(function UserRow({ user, selected, onToggleSelect, onEdit, onReset, onViewActivity, onToggleStatus, onCopyEmail }) {
   return (
     <tr className="group transition-colors hover:bg-gray-50">
@@ -479,6 +509,9 @@ const UserRow = React.memo(function UserRow({ user, selected, onToggleSelect, on
       </td>
       <td className="px-4 py-3">
         <Badge className={ROLE_BADGE_STYLE[user.role] || ''}>{user.role}</Badge>
+      </td>
+      <td className="px-4 py-3">
+        <BranchBadge branch={user.branch} />
       </td>
       <td className="px-4 py-3">
         {user.banned ? (
@@ -548,6 +581,7 @@ const UserCardMobile = React.memo(function UserCardMobile({ user, selected, onTo
           <p className="truncate text-xs text-gray-500">{user.email}</p>
           <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
             <Badge className={ROLE_BADGE_STYLE[user.role] || ''}>{user.role}</Badge>
+            <BranchBadge branch={user.branch} size="small" />
             {user.banned ? (
               <Badge className="bg-red-100 text-red-800">Deactivated</Badge>
             ) : (
@@ -594,9 +628,7 @@ const UserCardMobile = React.memo(function UserCardMobile({ user, selected, onTo
 export default function AdminUsers() {
   const [users, setUsers] = useState(() => (isCacheFresh(usersCache) ? usersCache.data : []))
   const [sessions, setSessions] = useState(() => (isCacheFresh(sessionsCache) ? sessionsCache.data : []))
-  // If we already have fresh cached data, skip the loading/skeleton state
-  // entirely — the page renders real data on the very first paint instead
-  // of waiting on the network again.
+  // If we already have fresh cached data, skip the skeleton entirely.
   const [loading, setLoading] = useState(() => !isCacheFresh(usersCache))
   const [loadError, setLoadError] = useState('')
   const fetchControllerRef = useRef(null)
@@ -605,6 +637,7 @@ export default function AdminUsers() {
   const [search, setSearch] = useState('')
   const debouncedSearch = useDebouncedValue(search, 250)
   const [roleFilter, setRoleFilter] = useState('all')
+  const [branchFilter, setBranchFilter] = useState('all')
   const [statusFilter, setStatusFilter] = useState('all')
   const [sessionFilter, setSessionFilter] = useState('all')
   const [sortKey, setSortKey] = useState('name')
@@ -626,24 +659,24 @@ export default function AdminUsers() {
   // confirmTarget: { mode: 'single' | 'bulk', action: 'deactivate' | 'reactivate', users: [] }
   const [confirmTarget, setConfirmTarget] = useState(null)
   const [confirmBusy, setConfirmBusy] = useState(false)
+  const [confirmError, setConfirmError] = useState('')
   const [ackChecked, setAckChecked] = useState(false)
 
-  // Password reset confirmation
   const [resetTarget, setResetTarget] = useState(null)
   const [resetBusy, setResetBusy] = useState(false)
+  const [resetError, setResetError] = useState('')
 
-  // Bulk role change
   const [roleChangeOpen, setRoleChangeOpen] = useState(false)
   const [roleChangeValue, setRoleChangeValue] = useState('verifier')
   const [roleChangeBusy, setRoleChangeBusy] = useState(false)
+  const [roleChangeError, setRoleChangeError] = useState('')
 
-  // Inline activity drawer — opened from the History/Activity buttons below.
   const [drawerUserId, setDrawerUserId] = useState(null)
 
   const showBanner = useCallback((type, message) => {
     if (bannerTimeoutRef.current) window.clearTimeout(bannerTimeoutRef.current)
     setBanner({ id: Date.now(), type, message })
-    bannerTimeoutRef.current = window.setTimeout(() => setBanner(null), 4000)
+    bannerTimeoutRef.current = window.setTimeout(() => setBanner(null), BANNER_DURATION_MS)
   }, [])
 
   useEffect(() => () => {
@@ -652,8 +685,8 @@ export default function AdminUsers() {
     sessionsControllerRef.current?.abort()
   }, [])
 
-  // `silent` skips the loading/skeleton flash — used when we already have
-  // fresh cached data on screen and just want to quietly confirm/refresh it.
+  // `silent` skips the loading/skeleton flash — used when fresh cached data
+  // is already on screen and we just want to quietly confirm/refresh it.
   const fetchUsers = useCallback(async (opts = {}) => {
     const controller = new AbortController()
     fetchControllerRef.current?.abort()
@@ -664,26 +697,23 @@ export default function AdminUsers() {
       setLoadError('')
     }
     try {
-      // NOTE: capped at 100 users, filtered/sorted client-side below — same
-      // pattern the audit trail had before it moved to server-side paging.
-      // If your org can exceed 100 accounts, this needs the same treatment
-      // (push search/role/status/sort into listUsers()).
+      // Capped at 100 users, filtered/sorted client-side below. If your org
+      // can exceed 100 accounts, push search/role/branch/status/sort into
+      // listUsers() server-side instead.
       const { users: rows } = await listUsers({ page: 1, perPage: 100, signal: controller.signal })
       setUsers(rows)
       usersCache = { data: rows, ts: Date.now() }
       setLoadError('')
     } catch (err) {
-      if (err.name !== 'AbortError') setLoadError(err.message || 'Could not load users')
+      if (err.name !== 'AbortError') setLoadError(extractErrorMessage(err, 'Could not load users. Please try again.'))
     } finally {
       if (!controller.signal.aborted) setLoading(false)
     }
   }, [])
 
   // Session data (accurate login/logout/online status) is fetched
-  // separately from listUserSessions — same audit_log-backed source the
-  // AdminAuditTrail "User sessions" tab uses. Failure here degrades
-  // gracefully: users list still loads, sign-in columns just show "—"
-  // rather than blocking the whole page.
+  // separately from listUserSessions. Failure here degrades gracefully:
+  // the user list still loads, sign-in columns just show "—".
   const fetchSessions = useCallback(async (opts = {}) => {
     const controller = new AbortController()
     sessionsControllerRef.current?.abort()
@@ -695,24 +725,21 @@ export default function AdminUsers() {
       sessionsCache = { data: rows, ts: Date.now() }
     } catch (err) {
       if (!isAbortError(err)) {
-        // Non-fatal — leave whatever session data we already have in place
-        // rather than blanking it on a transient failure.
+        // Non-fatal — keep whatever session data is already in place.
       }
     }
   }, [])
 
   useEffect(() => {
-    // Both requests fire together (not awaited sequentially), so total wait
-    // is bounded by whichever is slower, not their sum. When we already
-    // have fresh cached users on screen, fetch quietly in the background
-    // instead of flashing the skeleton again.
+    // Both requests fire together so total wait is bounded by whichever is
+    // slower, not their sum.
     fetchUsers({ silent: isCacheFresh(usersCache) })
     fetchSessions()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fetchUsers, fetchSessions])
 
-  // Keeps "Online now" trustworthy without requiring a manual refresh —
-  // same 30s cadence as AdminAuditTrail's User Sessions tab.
+  // Keeps "Online now" trustworthy without a manual refresh — same 30s
+  // cadence as AdminAuditTrail's User Sessions tab.
   useEffect(() => {
     const interval = setInterval(() => {
       fetchSessions({ forceRefresh: true })
@@ -724,16 +751,12 @@ export default function AdminUsers() {
     await Promise.all([fetchUsers(), fetchSessions({ forceRefresh: true })])
   }
 
-  // Reset to page 1 whenever filters or sort change.
   useEffect(() => {
     setPage(1)
-  }, [debouncedSearch, roleFilter, statusFilter, sessionFilter, sortKey, sortDir])
+  }, [debouncedSearch, roleFilter, branchFilter, statusFilter, sessionFilter, sortKey, sortDir])
 
-  // Merge session data into each user by id — profiles.id and auth user id
-  // are the same value, so this is a direct key match. This merged array is
-  // what every downstream computation (stats, filters, sort, export) reads
-  // from, so "last login" and "online" never come from two different
-  // places again.
+  // Merge session data into each user by id (profiles.id === auth user id),
+  // so "last login" and "online" always come from one place.
   const usersWithSessions = useMemo(() => {
     const sessionById = new Map(sessions.map((s) => [s.id, s]))
     return users.map((u) => ({
@@ -745,11 +768,14 @@ export default function AdminUsers() {
   const stats = useMemo(() => {
     const total = usersWithSessions.length
     const active = usersWithSessions.filter((u) => !u.banned).length
-    const deactivated = total - active
-    const verifiers = usersWithSessions.filter((u) => u.role === 'verifier').length
-    const approvers = usersWithSessions.filter((u) => u.role === 'approver').length
-    const online = usersWithSessions.filter((u) => u.session?.status === 'online').length
-    return { total, active, deactivated, verifiers, approvers, online }
+    return {
+      total,
+      active,
+      deactivated: total - active,
+      verifiers: usersWithSessions.filter((u) => u.role === 'verifier').length,
+      approvers: usersWithSessions.filter((u) => u.role === 'approver').length,
+      online: usersWithSessions.filter((u) => u.session?.status === 'online').length,
+    }
   }, [usersWithSessions])
 
   const searchTokens = useMemo(() => normalizeSearchTokens(debouncedSearch), [debouncedSearch])
@@ -760,6 +786,7 @@ export default function AdminUsers() {
       rows = rows.filter((u) => rowMatchesTokens(userSearchHaystack(u), searchTokens))
     }
     if (roleFilter !== 'all') rows = rows.filter((u) => u.role === roleFilter)
+    if (branchFilter !== 'all') rows = rows.filter((u) => u.branch === branchFilter)
     if (statusFilter !== 'all') {
       rows = rows.filter((u) => (statusFilter === 'active' ? !u.banned : u.banned))
     }
@@ -767,12 +794,10 @@ export default function AdminUsers() {
       rows = rows.filter((u) => (u.session?.status || 'never_logged_in') === sessionFilter)
     }
     return rows
-  }, [usersWithSessions, searchTokens, roleFilter, statusFilter, sessionFilter])
+  }, [usersWithSessions, searchTokens, roleFilter, branchFilter, statusFilter, sessionFilter])
 
-  // Drop any selections that no longer match the active filters, so a bulk
-  // action can never silently apply to a user who's been filtered out of
-  // view. Keyed on filteredUsers (search/role/status/session), not on sort
-  // — reordering the same visible set shouldn't clear a selection.
+  // Drop selections that no longer match the active filters, so a bulk
+  // action can never silently apply to a user filtered out of view.
   useEffect(() => {
     setSelectedIds((prev) => {
       if (prev.size === 0) return prev
@@ -799,11 +824,12 @@ export default function AdminUsers() {
   )
 
   const hasActiveFilters =
-    Boolean(search.trim()) || roleFilter !== 'all' || statusFilter !== 'all' || sessionFilter !== 'all'
+    Boolean(search.trim()) || roleFilter !== 'all' || branchFilter !== 'all' || statusFilter !== 'all' || sessionFilter !== 'all'
 
   function resetFilters() {
     setSearch('')
     setRoleFilter('all')
+    setBranchFilter('all')
     setStatusFilter('all')
     setSessionFilter('all')
   }
@@ -867,29 +893,33 @@ export default function AdminUsers() {
       firstName,
       lastName,
       role: user.role,
+      branch: user.branch || '',
       password: '',
     })
     setFormError('')
     setFormOpen(true)
   }, [])
 
+  function validateForm() {
+    if (!form.email.trim()) return 'Email is required.'
+    if (!/^\S+@\S+\.\S+$/.test(form.email.trim())) return 'Enter a valid email address.'
+    if (!form.firstName.trim()) return 'First name is required.'
+    if (!form.branch) return 'Branch is required.'
+    if (formMode === 'create' && form.password && form.password.length < 8) {
+      return 'Temporary password must be at least 8 characters.'
+    }
+    return ''
+  }
+
   async function handleSubmit(e) {
     e.preventDefault()
+    const validationError = validateForm()
+    if (validationError) {
+      setFormError(validationError)
+      return
+    }
+
     setFormError('')
-
-    if (!form.email.trim()) {
-      setFormError('Email is required.')
-      return
-    }
-    if (!form.firstName.trim()) {
-      setFormError('First name is required.')
-      return
-    }
-    if (formMode === 'create' && form.password && form.password.length < 8) {
-      setFormError('Temporary password must be at least 8 characters.')
-      return
-    }
-
     setSaving(true)
     try {
       if (formMode === 'create') {
@@ -898,9 +928,10 @@ export default function AdminUsers() {
           firstName: form.firstName.trim(),
           lastName: form.lastName.trim(),
           role: form.role,
+          branch: form.branch,
           password: form.password || undefined,
         })
-        showBanner('success', `${form.email} was created.`)
+        showBanner('success', `${form.email} was created in ${branchLabel(form.branch)}.`)
       } else {
         await updateUser({
           id: form.id,
@@ -908,13 +939,14 @@ export default function AdminUsers() {
           firstName: form.firstName.trim(),
           lastName: form.lastName.trim(),
           role: form.role,
+          branch: form.branch,
         })
         showBanner('success', 'User updated.')
       }
       setFormOpen(false)
       await fetchUsers()
     } catch (err) {
-      setFormError(err.message || 'Something went wrong.')
+      setFormError(extractErrorMessage(err, 'Something went wrong. Please try again.'))
     } finally {
       setSaving(false)
     }
@@ -927,6 +959,7 @@ export default function AdminUsers() {
       action: user.banned ? 'reactivate' : 'deactivate',
       users: [user],
     })
+    setConfirmError('')
     setAckChecked(false)
   }, [])
 
@@ -934,39 +967,59 @@ export default function AdminUsers() {
     const targets = action === 'deactivate' ? selectedActive : selectedDeactivated
     if (targets.length === 0) return
     setConfirmTarget({ mode: 'bulk', action, users: targets })
+    setConfirmError('')
     setAckChecked(false)
   }
 
   async function handleConfirmToggle() {
     if (!confirmTarget) return
     setConfirmBusy(true)
+    setConfirmError('')
     const { action, users: targets } = confirmTarget
     try {
-      await Promise.all(
+      const results = await Promise.allSettled(
         targets.map((u) => (action === 'reactivate' ? reactivateUser(u.id) : deactivateUser(u.id)))
       )
-      if (targets.length === 1) {
+      const failed = results
+        .map((r, i) => ({ r, user: targets[i] }))
+        .filter(({ r }) => r.status === 'rejected')
+
+      const succeededCount = targets.length - failed.length
+
+      if (succeededCount > 0) {
         showBanner(
           'success',
-          action === 'reactivate' ? `${targets[0].email} reactivated.` : `${targets[0].email} deactivated.`
-        )
-      } else {
-        showBanner(
-          'success',
-          action === 'reactivate'
-            ? `${targets.length} accounts reactivated.`
-            : `${targets.length} accounts deactivated.`
+          succeededCount === 1
+            ? `${action === 'reactivate' ? targets[0].email + ' reactivated.' : targets[0].email + ' deactivated.'}`
+            : `${succeededCount} account${succeededCount > 1 ? 's' : ''} ${action === 'reactivate' ? 'reactivated' : 'deactivated'}.`
         )
       }
-      setSelectedIds((prev) => {
-        const next = new Set(prev)
-        targets.forEach((u) => next.delete(u.id))
-        return next
-      })
-      setConfirmTarget(null)
+
+      if (failed.length > 0) {
+        const names = failed.map(({ user }) => user.email).join(', ')
+        setConfirmError(`Failed for: ${names}. Please try again.`)
+        showBanner('error', `${failed.length} account${failed.length > 1 ? 's' : ''} could not be updated.`)
+      }
+
+      if (failed.length === 0) {
+        setSelectedIds((prev) => {
+          const next = new Set(prev)
+          targets.forEach((u) => next.delete(u.id))
+          return next
+        })
+        setConfirmTarget(null)
+      } else {
+        // Keep the dialog open, scoped to the accounts that still need
+        // retrying, so the user isn't forced to re-select them manually.
+        setConfirmTarget((prev) => ({
+          ...prev,
+          users: failed.map(({ user }) => user),
+        }))
+      }
       await fetchUsers()
     } catch (err) {
-      showBanner('error', err.message || 'Action failed.')
+      setConfirmError(extractErrorMessage(err, 'Action failed. Please try again.'))
+      showBanner('error', extractErrorMessage(err, 'Action failed.'))
     } finally {
       setConfirmBusy(false)
     }
@@ -974,17 +1027,19 @@ export default function AdminUsers() {
 
   const openResetConfirm = useCallback((user) => {
     setResetTarget(user)
+    setResetError('')
   }, [])
 
   async function handleConfirmReset() {
     if (!resetTarget) return
     setResetBusy(true)
+    setResetError('')
     try {
       await sendPasswordReset(resetTarget.email)
       showBanner('success', `Password reset email sent to ${resetTarget.email}.`)
       setResetTarget(null)
     } catch (err) {
-      showBanner('error', err.message || 'Could not send reset email.')
+      setResetError(extractErrorMessage(err, 'Could not send reset email. Please try again.'))
     } finally {
       setResetBusy(false)
     }
@@ -992,24 +1047,24 @@ export default function AdminUsers() {
 
   // ---- Bulk role change ----
   function openRoleChangeDialog() {
-    // Default to the majority role among the current selection, so the
-    // common case (everyone selected already shares a role, or you're
-    // promoting a mixed group to one role) needs the fewest clicks.
+    // Default to the majority role among the current selection.
     const counts = selectedUsers.reduce((acc, u) => {
       acc[u.role] = (acc[u.role] || 0) + 1
       return acc
     }, {})
     const majority = Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0]
     setRoleChangeValue(majority || 'verifier')
+    setRoleChangeError('')
     setRoleChangeOpen(true)
   }
 
   async function handleConfirmRoleChange() {
     if (selectedUsers.length === 0) return
     setRoleChangeBusy(true)
+    setRoleChangeError('')
     try {
       // Only touch accounts that don't already have the target role — an
-      // audit trail full of "role_changed: verifier -> verifier" no-op
+      // audit trail full of no-op "role_changed: verifier -> verifier"
       // entries would be noise, not signal.
       const targets = selectedUsers.filter((u) => u.role !== roleChangeValue)
       if (targets.length === 0) {
@@ -1025,6 +1080,7 @@ export default function AdminUsers() {
             email: u.email,
             ...splitName(u.full_name),
             role: roleChangeValue,
+            branch: u.branch,
           })
         )
       )
@@ -1047,7 +1103,7 @@ export default function AdminUsers() {
       setSelectedIds(new Set())
       await fetchUsers()
     } catch (err) {
-      showBanner('error', err.message || 'Could not change roles.')
+      setRoleChangeError(extractErrorMessage(err, 'Could not change roles. Please try again.'))
     } finally {
       setRoleChangeBusy(false)
     }
@@ -1066,9 +1122,6 @@ export default function AdminUsers() {
     }
   }, [showBanner])
 
-  // A single toggle handler used by both the row and card components for
-  // the deactivate/reactivate action — routes to the existing single
-  // confirmation flow.
   const handleToggleStatus = openSingleConfirm
 
   // ---- Export ----
@@ -1077,13 +1130,14 @@ export default function AdminUsers() {
   // behavior of the audit trail's exports.
   function buildUsersExportRows() {
     const header = [
-      'Name', 'Email', 'Role', 'Account status', 'Sign-in status',
+      'Name', 'Email', 'Role', 'Branch', 'Account status', 'Sign-in status',
       'Last login', 'Last logout', 'Session duration', 'Account created',
     ]
     const rows = sortedUsers.map((u) => [
       u.full_name || '',
       u.email || '',
       u.role || '',
+      branchLabel(u.branch),
       u.banned ? 'Deactivated' : 'Active',
       u.session?.status === 'online' ? 'Online' :
         u.session?.status === 'stale' ? 'Session expired' :
@@ -1171,7 +1225,7 @@ export default function AdminUsers() {
           <Input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search by name, email, or role"
+            placeholder="Search by name, email, role, or branch"
             className="pl-9"
           />
           {search && (
@@ -1188,6 +1242,13 @@ export default function AdminUsers() {
         <div className="flex flex-wrap gap-2.5">
           <Select value={roleFilter} onChange={(e) => setRoleFilter(e.target.value)} className="flex-1 sm:w-36">
             {ROLE_FILTER_OPTIONS.map((opt) => (
+              <option key={opt.value} value={opt.value}>
+                {opt.label}
+              </option>
+            ))}
+          </Select>
+          <Select value={branchFilter} onChange={(e) => setBranchFilter(e.target.value)} className="flex-1 sm:w-44">
+            {BRANCH_FILTER_OPTIONS.map((opt) => (
               <option key={opt.value} value={opt.value}>
                 {opt.label}
               </option>
@@ -1286,6 +1347,9 @@ export default function AdminUsers() {
                   <SortButton label="Role" sortKey="role" activeKey={sortKey} direction={sortDir} onSort={handleSort} />
                 </th>
                 <th className="px-4 py-3">
+                  <SortButton label="Branch" sortKey="branch" activeKey={sortKey} direction={sortDir} onSort={handleSort} />
+                </th>
+                <th className="px-4 py-3">
                   <SortButton label="Status" sortKey="status" activeKey={sortKey} direction={sortDir} onSort={handleSort} />
                 </th>
                 <th className="px-4 py-3">
@@ -1304,13 +1368,17 @@ export default function AdminUsers() {
                 <SkeletonRows />
               ) : loadError ? (
                 <tr>
-                  <td colSpan={8} className="px-4 py-8 text-center text-sm text-red-600">
-                    {loadError}
+                  <td colSpan={9} className="px-4 py-8 text-center">
+                    <p className="mb-2 text-sm text-red-600">{loadError}</p>
+                    <Button variant="outline" size="sm" onClick={() => fetchUsers()}>
+                      <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
+                      Retry
+                    </Button>
                   </td>
                 </tr>
               ) : pagedUsers.length === 0 ? (
                 <tr>
-                  <td colSpan={8} className="px-4 py-12 text-center">
+                  <td colSpan={9} className="px-4 py-12 text-center">
                     <UsersIcon className="mx-auto mb-2 h-8 w-8 text-gray-300" />
                     <p className="text-sm font-medium text-gray-600">No users found</p>
                     <p className="mt-0.5 text-xs text-gray-400">
@@ -1358,7 +1426,13 @@ export default function AdminUsers() {
             </Card>
           ))
         ) : loadError ? (
-          <Card className="px-4 py-8 text-center text-sm text-red-600">{loadError}</Card>
+          <Card className="px-4 py-8 text-center">
+            <p className="mb-2 text-sm text-red-600">{loadError}</p>
+            <Button variant="outline" size="sm" onClick={() => fetchUsers()}>
+              <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
+              Retry
+            </Button>
+          </Card>
         ) : pagedUsers.length === 0 ? (
           <Card className="px-4 py-10 text-center">
             <UsersIcon className="mx-auto mb-2 h-8 w-8 text-gray-300" />
@@ -1423,7 +1497,7 @@ export default function AdminUsers() {
       {/* Create / Edit dialog */}
       <Dialog
         open={formOpen}
-        onClose={() => setFormOpen(false)}
+        onClose={() => (saving ? null : setFormOpen(false))}
         title={formMode === 'create' ? 'New user' : 'Edit user'}
       >
         <form onSubmit={handleSubmit} className="space-y-3">
@@ -1464,21 +1538,40 @@ export default function AdminUsers() {
             </div>
           )}
 
-          <div>
-            <label className="mb-1 block text-xs font-medium text-gray-600">Role</label>
-            <Select value={form.role} onChange={(e) => setForm((f) => ({ ...f, role: e.target.value }))}>
-              {ROLE_OPTIONS.map((opt) => (
-                <option key={opt.value} value={opt.value}>
-                  {opt.label}
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="mb-1 block text-xs font-medium text-gray-600">Role</label>
+              <Select value={form.role} onChange={(e) => setForm((f) => ({ ...f, role: e.target.value }))}>
+                {ROLE_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </Select>
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-gray-600">Branch</label>
+              <Select
+                value={form.branch}
+                onChange={(e) => setForm((f) => ({ ...f, branch: e.target.value }))}
+                required
+              >
+                <option value="" disabled>
+                  Select a branch
                 </option>
-              ))}
-            </Select>
-            <p className="mt-1 text-xs text-gray-400">
-              {form.role === 'verifier'
-                ? 'Verifiers review and prepare checks before they move to approval.'
-                : 'Approvers give final sign-off on checks submitted for approval.'}
-            </p>
+                {BRANCH_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </Select>
+            </div>
           </div>
+          <p className="text-xs text-gray-400">
+            {form.role === 'verifier'
+              ? 'Verifiers review and prepare checks before they move to approval.'
+              : 'Approvers give final sign-off on checks submitted for approval.'}
+          </p>
 
           {formMode === 'create' && (
             <div>
@@ -1588,6 +1681,13 @@ export default function AdminUsers() {
                 I understand access will be revoked immediately.
               </label>
             )}
+
+            {confirmError && (
+              <div className="mt-3 flex items-start gap-2 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
+                {confirmError}
+              </div>
+            )}
           </div>
         </div>
 
@@ -1637,6 +1737,13 @@ export default function AdminUsers() {
                 </option>
               ))}
             </Select>
+
+            {roleChangeError && (
+              <div className="mt-3 flex items-start gap-2 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
+                {roleChangeError}
+              </div>
+            )}
           </div>
         </div>
 
@@ -1661,11 +1768,19 @@ export default function AdminUsers() {
           <div className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full bg-blue-50 text-blue-600">
             <KeyRound className="h-4.5 w-4.5" />
           </div>
-          <p className="text-sm text-gray-600">
-            A password reset link will be emailed to{' '}
-            <span className="font-medium text-gray-800">{resetTarget?.email}</span>. Their current password stays
-            valid until they complete the reset.
-          </p>
+          <div className="min-w-0 flex-1">
+            <p className="text-sm text-gray-600">
+              A password reset link will be emailed to{' '}
+              <span className="font-medium text-gray-800">{resetTarget?.email}</span>. Their current password stays
+              valid until they complete the reset.
+            </p>
+            {resetError && (
+              <div className="mt-3 flex items-start gap-2 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
+                {resetError}
+              </div>
+            )}
+          </div>
         </div>
         <div className="mt-4 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
           <Button variant="ghost" onClick={() => setResetTarget(null)} disabled={resetBusy}>

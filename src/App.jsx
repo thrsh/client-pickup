@@ -20,14 +20,17 @@ import VerifierChecks from './pages/verifier/VerifierChecks'
 import VerifierPickups from './pages/verifier/VerifierPickups'
 import VerifierReports from './pages/verifier/VerifierReports'
 import VerifierQR from './pages/verifier/VerifierQR'
+import VerifierAccount from './pages/verifier/VerifierAccount'
 import ApproverDashboard from './pages/approver/ApproverDashboard'
 import ApproverHome from './pages/approver/ApproverHome'
 import ApproverHistory from './pages/approver/ApproverHistory'
+import ApproverAccount from './pages/approver/ApproverAccount'
 
 import AdminDashboard from './pages/admin/AdminDashboard'
 import AdminUsers from './pages/admin/AdminUsers'
 import AdminAuditTrail from './pages/admin/AdminAuditTrail'
 import AdminReports from './pages/admin/AdminReports'
+import AdminAccount from './pages/admin/AdminAccount'
 
 export default function App() {
   const { user } = useAuth()
@@ -84,11 +87,12 @@ export default function App() {
               <Route path="pickups" element={<VerifierPickups />} />
               <Route path="reports" element={<VerifierReports />} />
               <Route path="qr" element={<VerifierQR />} />
+              <Route path="account" element={<VerifierAccount />} />
             </Route>
 
             {/* Admin tier — oversees verifiers/approvers. Dashboard, activity
-                logs (audit trail), user management, and reports all live
-                under AdminLayout's nav. */}
+                logs (audit trail), user management, reports, and account
+                settings all live under AdminLayout's nav. */}
             <Route
               path="/admin"
               element={
@@ -103,6 +107,7 @@ export default function App() {
               <Route path="audit" element={<AdminAuditTrail />} />
               <Route path="users" element={<AdminUsers />} />
               <Route path="reports" element={<AdminReports />} />
+              <Route path="account" element={<AdminAccount />} />
             </Route>
 
             <Route
@@ -123,6 +128,7 @@ export default function App() {
               <Route index element={<ApproverDashboard />} />
               <Route path="pending" element={<ApproverHome />} />
               <Route path="history" element={<ApproverHistory />} />
+              <Route path="account" element={<ApproverAccount />} />
             </Route>
 
             <Route path="*" element={<PublicSearch />} />

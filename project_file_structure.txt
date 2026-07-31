@@ -56,6 +56,8 @@
 .git\objects\0b\9de861f8f71c7ab8736024019384afbd8d8ce6
 .git\objects\0d\
 .git\objects\0d\80849568e45b7ae1a6a0e3f602c9d2eb87141b
+.git\objects\0e\
+.git\objects\0e\98939ff5c65463b90ab381b10d78ab91c68684
 .git\objects\0f\
 .git\objects\0f\2376570c74a8fedaded091b0fcbb2639c2b4a5
 .git\objects\0f\dc5b20923d70b6d5e6fe4028f7268f39b8577b
@@ -74,6 +76,8 @@
 .git\objects\17\e8a385d1ad61ad5dd2153529a2dd5b2de51299
 .git\objects\1b\
 .git\objects\1b\0b3801e507dcd260cce190056543d6c2b0128e
+.git\objects\1c\
+.git\objects\1c\f489ce6cee198730eedaafede9831964fc070b
 .git\objects\1d\
 .git\objects\1d\362d359ee73565f566c67a4e82ee4b49c3db93
 .git\objects\21\
@@ -95,6 +99,10 @@
 .git\objects\2b\
 .git\objects\2b\05e39cb1b5cabee698b0a365de5745424d76e5
 .git\objects\2b\5eaa94207903f6e8a722692c6de3aab05b4ce1
+.git\objects\2d\
+.git\objects\2d\9737500af22fd09472e36eeea10eeef13396a0
+.git\objects\30\
+.git\objects\30\ca4d6bea3cfbf022865fe7bddf7f3140d727b1
 .git\objects\31\
 .git\objects\31\d498baa28d5810fc8a838d2da31e267928baa8
 .git\objects\32\
@@ -105,10 +113,12 @@
 .git\objects\37\
 .git\objects\37\d948b7743de22ddf876c5cba70f4064b4e845a
 .git\objects\38\
+.git\objects\38\077a176677f40943681e362b243538ee707728
 .git\objects\38\eec83b9b999dad30582e19c65242e36ad13cfa
 .git\objects\39\
 .git\objects\39\0f19de468c065f033bd4ee1a3aed20597691e1
 .git\objects\3a\
+.git\objects\3a\ab206fc31937667da59fe53a1a10a916d85d34
 .git\objects\3a\bfba2c4767b3baddd36bb67bf67aaf59259d36
 .git\objects\3f\
 .git\objects\3f\017fa66cf3e3efb80afc7614075a8b0500a795
@@ -125,6 +135,8 @@
 .git\objects\4a\cab459ca83464b39f5eaa0070b4941d37ddb70
 .git\objects\4b\
 .git\objects\4b\51d162e661b9a28e6985d5de3d2b269c99f3d5
+.git\objects\4c\
+.git\objects\4c\753eb37da47cb4b5be983ae7dc405fa734ff08
 .git\objects\50\
 .git\objects\50\b9e392d4fa6a760057288dfe25bf936439535c
 .git\objects\51\
@@ -135,6 +147,8 @@
 .git\objects\56\
 .git\objects\56\1c91b6dfd4d18e495ebe86be1b8eea2523bac8
 .git\objects\56\9cc2ce18f14aabc7507dee6334087609ff0bfe
+.git\objects\59\
+.git\objects\59\aa354089e47847d5013ea1731512a3f370e5a8
 .git\objects\5a\
 .git\objects\5a\e617ba8cd6776d7439a74df341eb489f181317
 .git\objects\5b\
@@ -150,6 +164,7 @@
 .git\objects\5f\3c069b5210b08c5d11fc42d9d853fecd198be9
 .git\objects\5f\3cea3fdda1e43bf7d05491532b3f19b3dd16af
 .git\objects\60\
+.git\objects\60\2b20110c05324c8b0ed70fc67a2cc0f29e8380
 .git\objects\60\7841ebaf0016510973cabb3775b5791832ad75
 .git\objects\63\
 .git\objects\63\ba0493868ee52e34c76a00fc98d3f06f8c4264
@@ -172,6 +187,8 @@
 .git\objects\6d\ac89f25a5b6b416182984e4de902847f2ebab3
 .git\objects\6e\
 .git\objects\6e\d9926b7e01940360ccc7d1ffb57a0f9e695552
+.git\objects\70\
+.git\objects\70\2a4994887f0c6e6267b53d49f96be7f77b4105
 .git\objects\75\
 .git\objects\75\b63c38cd2301872b70ade180d9c82fb0b4c324
 .git\objects\76\
@@ -186,6 +203,7 @@
 .git\objects\79\e39301baa45cf8406fb30898ac1e8d817e69ba
 .git\objects\79\f4af9305292a9ae0149a6a6588774fbf9a40fc
 .git\objects\7b\
+.git\objects\7b\ad9050d88743420f27af90c43dc217e0c79aa5
 .git\objects\7b\ed2db7f2c65cd0837d5706c8b268c2c29d8738
 .git\objects\7c\
 .git\objects\7c\f84f867c2047c6c3ff670987d4403263e927cc
@@ -204,8 +222,11 @@
 .git\objects\85\9af3c25f2dd8334359a87ff972634d70594279
 .git\objects\86\
 .git\objects\86\9d19bf6554e6b7a33597d7b1b068f44f7bd3bd
+.git\objects\89\
+.git\objects\89\9e52556ae0076bac9496dc9c64846426f2746e
 .git\objects\8c\
 .git\objects\8c\09f1074d0f231ee4eebcc307f06dead08c06ef
+.git\objects\8c\f942bdd8cf307d59ae6aace5c67e52167794db
 .git\objects\8d\
 .git\objects\8d\3488a8cda1e42db8884d9400427d7227ca4226
 .git\objects\8f\
@@ -224,6 +245,8 @@
 .git\objects\97\ceea46ad390c1e3adc6978c5c767ac21da59d4
 .git\objects\97\f408b14f924a191619814b607e44553509940d
 .git\objects\97\fe828bba26acebb18cf1f6cc76b1e156354c02
+.git\objects\98\
+.git\objects\98\8cf6a84b3f8e3ad994429e7338bc016f0c3d3b
 .git\objects\99\
 .git\objects\99\38902779419b75afb11fdeda916a557fff403a
 .git\objects\99\4d2415e40044c65fc29d23debd91f10bccc43d
@@ -274,6 +297,7 @@
 .git\objects\b5\
 .git\objects\b5\03e7ff225dc00ac4db0e4c252cfbdcf94d27db
 .git\objects\b6\
+.git\objects\b6\2bf146bde8729189f28376ad9e1f0890669697
 .git\objects\b6\a5850ff4f73e11721dc8f0168a92da556e3b6d
 .git\objects\b7\
 .git\objects\b7\41a8cbd392f5a0cf5acbd10d7df5b0b2670666
@@ -303,6 +327,7 @@
 .git\objects\cd\
 .git\objects\cd\0c3caf9679afb3bf3d738f0ffd600a0b6e71bb
 .git\objects\cd\14986b992fafa9210450005483793ed5f21848
+.git\objects\cd\befec8da7b86f00fb2cbf317b7ce482dad3540
 .git\objects\cd\cd109c79c95a1ceb984dc43bbbfcaa26501bcb
 .git\objects\ce\
 .git\objects\ce\62018f2ec4169710695ba9ac562a053520e50b
@@ -336,6 +361,7 @@
 .git\objects\e6\97e5bdcde8676c8228b687b602f38e3c0e9410
 .git\objects\e7\
 .git\objects\e7\2ad47babd0240a8ac7df880cbf6acced321f8c
+.git\objects\e7\e03aa5b43bfe72e2b0e00ee66def49990675b9
 .git\objects\e9\
 .git\objects\e9\97f3492baf3cd112b5e1a1290ec29323d06b72
 .git\objects\eb\
@@ -375,8 +401,11 @@
 .git\objects\fa\c388d083d6aa2fdc0db8c5f944b12b0124746e
 .git\objects\fc\
 .git\objects\fc\279117913dcb73dd30fb314653e7ed1ee101ed
+.git\objects\fd\
+.git\objects\fd\376e4b2f567e9998c2615c3ee40cf102703224
 .git\objects\ff\
 .git\objects\ff\627776c212570dfd85134484735e732d49dcef
+.git\objects\ff\944430fe6c97751cb446ad31a84f0f627b9724
 .git\objects\info\
 .git\objects\pack\
 .git\objects\pack\pack-2fa6cd7acc0989d1c08a063c84f25666491da4b7.idx
@@ -403,7 +432,9 @@ public\bdo_logo.png
 public\bpi_logo.png
 public\chinabank_logo.png
 public\csba-icon.png
+public\eastwest_logo.webp
 public\landbank_logo.png
+public\logo.png
 public\metrobank_logo.png
 public\pnb_logo.svg
 public\psbank_logo.svg
@@ -445,6 +476,7 @@ src\lib\adminUserInsightsApi.js
 src\lib\adminUsersApi.js
 src\lib\banks.js
 src\lib\exportUtils.jsx
+src\lib\staleChecks.js
 src\lib\supabaseClient.js
 src\lib\utils.js
 src\main.jsx
@@ -462,6 +494,7 @@ src\pages\Login.jsx
 src\pages\PublicSearch.jsx
 src\pages\PublicSearch1.jsx
 src\pages\verifier\
+src\pages\verifier\StaleWatchPanel.jsx
 src\pages\verifier\VerifierChecks.jsx
 src\pages\verifier\VerifierDashboard.jsx
 src\pages\verifier\VerifierPickups.jsx

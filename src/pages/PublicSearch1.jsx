@@ -1,28 +1,9 @@
-import React, { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
-  Search,
-  X,
-  MapPin,
-  ArrowRight,
-  ChevronDown,
-  Clock,
-  Navigation,
-  Frown,
-  Sparkles,
-  Landmark,
-  Package,
-  Truck,
-  Loader2,
-  CheckCircle2,
-  Check,
-  Building2,
-  Route,
-  Phone,
-  Copy,
-  AlertCircle,
-  ShieldCheck,
-  CreditCard,
+  Search, X, MapPin, ArrowRight, ChevronDown, Clock, Navigation, Frown, Sparkles,
+  Landmark, Package, Truck, Loader2, CheckCircle2, Check, Building2, Route, Phone,
+  Copy, AlertCircle, ShieldCheck, CreditCard, Info, Banknote, Download,
 } from 'lucide-react'
 import { supabase } from '../lib/supabaseClient'
 import { Input } from '../components/ui/input'
@@ -62,13 +43,37 @@ const BANK_LOGOS = {
 function getBankLogoUrl(name) {
   return BANK_LOGOS[name] || null
 }
+const QUEUE_BRANCH_PREFIX = {
+  'CSBA - PARQAL': 'PQ',
+  'CSBA - BGC': 'BGC',
+}
+
+function formatQueueCode(branchKey, number) {
+  const prefix = QUEUE_BRANCH_PREFIX[branchKey] || 'Q'
+  return `${prefix}-${String(number).padStart(3, '0')}`
+}
+// Fallback label for rows whose `bank` column is null/empty — should be rare
+// (every check should have an issuing bank), but the UI stays honest about
+// it instead of silently dropping those rows from a breakdown.
+const UNKNOWN_BANK_LABEL = 'Unspecified bank'
 
 // ---------------------------------------------------------------------------
 // Name normalization — identical to the client-facing search page and to the
 // DB's own `payee_normalized` / `payor_normalized` generated columns.
 // ---------------------------------------------------------------------------
 const CORP_SUFFIX_RE = /\s+(inc|incorporated|corp|corporation|llc|ltd|limited)$/
-
+// Deterministic decorative bars for the ticket's "barcode" strip — purely
+// cosmetic, but stable per code so it doesn't flicker on re-render.
+function ticketBarcodeBars(seed) {
+  let h = 0
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0
+  const bars = []
+  for (let i = 0; i < 32; i++) {
+    h = (h * 1103515245 + 12345) >>> 0
+    bars.push(4 + (h % 14))
+  }
+  return bars
+}
 function normalizeCompanyName(raw) {
   if (!raw) return ''
   let s = raw.trim().toLowerCase()
@@ -112,7 +117,6 @@ function validateCollectorName(raw) {
 // that the client page shows, since a collector already knows how to get
 // around and doesn't need a photographic walkthrough — just the facts.
 // ---------------------------------------------------------------------------
-const BRANCH_FIELD = 'pickup_branch'
 const OFFICE_HOURS = 'Mon–Thu 8:00 AM–7:00 PM · Fri 8:00 AM–7:30 PM'
 
 const OFFICES = {
@@ -150,25 +154,57 @@ function getDirectionsUrl(office) {
   return `https://www.google.com/maps/dir/?api=1&destination=${office.lat},${office.lng}`
 }
 
+// Turns the flat rows returned by the match query into a per-branch summary:
+// how many checks are at each branch, and — since a bank filter is now
+// optional — which bank(s) those checks are drawn from and in what
+// quantities. This is the single source of truth every downstream view
+// (branch cards, the confirm modal, the success manifest) reads from.
+function aggregateByBranch(rows) {
+  const summary = {}
+  for (const row of rows) {
+    const branchKey = row.pickup_branch
+    if (!branchKey) continue
+    if (!summary[branchKey]) summary[branchKey] = { total: 0, banks: {} }
+    summary[branchKey].total += 1
+    const bankName = row.bank || UNKNOWN_BANK_LABEL
+    summary[branchKey].banks[bankName] = (summary[branchKey].banks[bankName] || 0) + 1
+  }
+  return summary
+}
+
 // Both CSBA offices, always in a fixed, predictable order (highest count
 // first) — pickup locations are physical facts about the org, not something
 // that should disappear from the UI just because a search matched zero
 // checks there. Every branch card downstream renders from this list.
-function getOrderedBranches(branchCounts = {}) {
+function getOrderedBranches(branchBreakdown = {}) {
   return Object.keys(OFFICES)
-    .map((key) => ({ key, office: OFFICES[key], count: branchCounts[key] || 0 }))
+    .map((key) => ({
+      key,
+      office: OFFICES[key],
+      count: branchBreakdown[key]?.total || 0,
+      banks: branchBreakdown[key]?.banks || {},
+    }))
     .sort((a, b) => b.count - a.count)
 }
 
+function sortedBankEntries(banks = {}) {
+  return Object.entries(banks).sort((a, b) => b[1] - a[1])
+}
+
 export default function CollectorSearch() {
-  const [bank, setBank] = useState('')
+  const [bank, setBank] = useState('') // '' = search across every bank
 
   const [payeeQuery, setPayeeQuery] = useState('')
   const [payorQuery, setPayorQuery] = useState('')
   const [matchedCount, setMatchedCount] = useState(0)
-  const [matchedIds, setMatchedIds] = useState([])
-  // Per-branch counts for the current query, e.g. { 'CSBA - PARQAL': 3, 'CSBA - BGC': 1 }
-  const [branchCounts, setBranchCounts] = useState({})
+  const [matchedRows, setMatchedRows] = useState([]) // [{ id, pickup_branch, bank }]
+  // Per-branch summary for the current query:
+  // { 'CSBA - PARQAL': { total: 3, banks: { 'BDO Unibank': 2, Metrobank: 1 } }, ... }
+  const [branchBreakdown, setBranchBreakdown] = useState({})
+  // Which branch the collector has chosen to reserve/collect from. Required
+  // whenever a query matches more than one branch — a reservation can only
+  // ever be created against a single pickup location, never "all of them."
+  const [selectedBranch, setSelectedBranch] = useState(null)
   const [loading, setLoading] = useState(false)
   const [hasSearched, setHasSearched] = useState(false)
 
@@ -186,7 +222,13 @@ export default function CollectorSearch() {
   const [reserving, setReserving] = useState(false)
   const [reserveError, setReserveError] = useState('')
   const [successInfo, setSuccessInfo] = useState(null)
-
+const [queueInfo, setQueueInfo] = useState(null) // { number, date, branch } | null
+const [queueError, setQueueError] = useState('')
+const [assigningQueue, setAssigningQueue] = useState(false)
+// Client-side guard: prevents a duplicate call (e.g. a retried effect)
+// from requesting a second queue number for the same reservation. The
+// server-side function is itself idempotent too — this is belt-and-suspenders.
+const queueAssignedForRef = useRef(null)
   const searchSectionRef = useRef(null)
   const resultsRef = useRef(null)
 
@@ -233,9 +275,11 @@ export default function CollectorSearch() {
   }, [])
 
   // A field changing after a search has run means that search no longer
-  // describes the current query — drop back out of "results shown" state.
+  // describes the current query — drop back out of "results shown" state,
+  // and any branch the collector had picked no longer applies either.
   useEffect(() => {
     setHasSearched(false)
+    setSelectedBranch(null)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bank, payeeQuery, payorQuery])
 
@@ -243,47 +287,39 @@ export default function CollectorSearch() {
   // Search logic
   // ---------------------------------------------------------------------
   // Matches on the normalized columns (exact equality), same as the client
-  // page — and additionally fetches actual row ids (not just a count),
-  // since the collector needs those ids to create a reservation.
+  // page. Bank is optional now: when left blank, checks from every bank are
+  // matched, and each row's own `bank` column is what drives the per-branch
+  // breakdown below. Rows are ordered deterministically (branch, then bank)
+  // so that if a query ever matches more than MAX_RESERVE_BATCH checks, the
+  // truncated slice shown to the collector is at least stable and
+  // predictable rather than arbitrary.
   function buildMatchQuery(bankValue, payeeNormalized, payorNormalized) {
     let req = supabase
       .from('checks')
-      .select('id', { count: 'exact' })
+      .select('id, pickup_branch, bank', { count: 'exact' })
       .eq('status', 'available')
-      .eq('bank', bankValue)
+      .eq('payee_normalized', payeeNormalized)
+      .eq('payor_normalized', payorNormalized)
+      .order('pickup_branch', { ascending: true })
+      .order('bank', { ascending: true })
       .limit(MAX_RESERVE_BATCH)
 
-    if (payeeNormalized) req = req.eq('payee_normalized', payeeNormalized)
-    if (payorNormalized) req = req.eq('payor_normalized', payorNormalized)
-
-    return req
-  }
-
-  // Cheap, count-only companion query (head: true — no row bodies returned)
-  // used per-branch to build the location breakdown, exactly like the
-  // client page's buildBaseQuery.
-  function buildBranchCountQuery(bankValue, payeeNormalized, payorNormalized) {
-    let req = supabase
-      .from('checks')
-      .select('id', { count: 'exact', head: true })
-      .eq('status', 'available')
-      .eq('bank', bankValue)
-
-    if (payeeNormalized) req = req.eq('payee_normalized', payeeNormalized)
-    if (payorNormalized) req = req.eq('payor_normalized', payorNormalized)
+    if (bankValue) req = req.eq('bank', bankValue)
 
     return req
   }
 
   async function fetchMatchCount(bankTerm, payeeTerm, payorTerm) {
-    const bankValue = bankTerm.trim()
+    const bankValue = (bankTerm || '').trim()
     const payeeNormalized = normalizeCompanyName(payeeTerm)
     const payorNormalized = normalizeCompanyName(payorTerm)
 
-    if (!bankValue || !payeeNormalized || !payorNormalized) {
+    // Bank is optional — only payee and payor are required to run a search.
+    if (!payeeNormalized || !payorNormalized) {
       setMatchedCount(0)
-      setMatchedIds([])
-      setBranchCounts({})
+      setMatchedRows([])
+      setBranchBreakdown({})
+      setSelectedBranch(null)
       setLoading(false)
       return
     }
@@ -297,34 +333,30 @@ export default function CollectorSearch() {
       // if it fails for some transient reason.
       await supabase.rpc('reclaim_expired_reservations')
 
-      const branchKeys = Object.keys(OFFICES)
-      const [matchResult, ...branchResults] = await Promise.all([
-        buildMatchQuery(bankValue, payeeNormalized, payorNormalized),
-        ...branchKeys.map((key) =>
-          buildBranchCountQuery(bankValue, payeeNormalized, payorNormalized).eq(BRANCH_FIELD, key)
-        ),
-      ])
+      const result = await buildMatchQuery(bankValue, payeeNormalized, payorNormalized)
 
       if (thisRequestId !== requestIdRef.current) return
-      if (matchResult.error) throw matchResult.error
+      if (result.error) throw result.error
 
-      const nextBranchCounts = {}
-      branchKeys.forEach((key, idx) => {
-        const result = branchResults[idx]
-        if (!result.error) {
-          nextBranchCounts[key] = result.count || 0
-        }
-      })
+      const rows = result.data || []
+      const breakdown = aggregateByBranch(rows)
 
-      setMatchedIds((matchResult.data || []).map((r) => r.id))
-      setMatchedCount(matchResult.count || 0)
-      setBranchCounts(nextBranchCounts)
+      setMatchedRows(rows)
+      setMatchedCount(result.count || 0)
+      setBranchBreakdown(breakdown)
+
+      // Auto-select when there's only one *known* branch to choose from —
+      // nothing for the collector to decide. Otherwise leave it unset so
+      // the multi-location UI forces an explicit choice before reserving.
+      const qualifyingBranches = Object.keys(OFFICES).filter((key) => (breakdown[key]?.total || 0) > 0)
+      setSelectedBranch(qualifyingBranches.length === 1 ? qualifyingBranches[0] : null)
     } catch (err) {
       if (thisRequestId !== requestIdRef.current) return
       console.error('Failed to fetch check matches:', err)
       setMatchedCount(0)
-      setMatchedIds([])
-      setBranchCounts({})
+      setMatchedRows([])
+      setBranchBreakdown({})
+      setSelectedBranch(null)
     } finally {
       if (thisRequestId === requestIdRef.current) {
         setLoading(false)
@@ -369,7 +401,8 @@ export default function CollectorSearch() {
   }
 
   function handleSearch() {
-    if (!bank.trim() || !payeeQuery.trim() || !payorQuery.trim()) return
+    // Bank is optional — only payee and payor gate the search.
+    if (!payeeQuery.trim() || !payorQuery.trim()) return
     setShowPayeeSuggestions(false)
     setShowPayorSuggestions(false)
     setHasSearched(true)
@@ -411,25 +444,91 @@ export default function CollectorSearch() {
     setShowPayeeSuggestions(false)
     setShowPayorSuggestions(false)
     setMatchedCount(0)
-    setMatchedIds([])
-    setBranchCounts({})
+    setMatchedRows([])
+    setBranchBreakdown({})
+    setSelectedBranch(null)
     setHasSearched(false)
   }
 
+  // Only branches CSBA actually operates are ever selectable — a row whose
+  // pickup_branch doesn't match a known office is surfaced as an "unmapped"
+  // notice instead (see ManifestCountCard), never as something reservable.
+  const officeBreakdown = useMemo(() => {
+    const known = {}
+    for (const key of Object.keys(OFFICES)) {
+      if (branchBreakdown[key]) known[key] = branchBreakdown[key]
+    }
+    return known
+  }, [branchBreakdown])
+
+  // How many known branches actually have matching checks, and whether the
+  // collector still needs to choose one of them before they can reserve.
+  // Reservation quantity is always driven off the *selected* branch — never
+  // the raw matchedCount — since a reservation can only ever cover one
+  // pickup location.
+  const qualifyingBranchCount = Object.values(officeBreakdown).filter((b) => b.total > 0).length
+  const needsBranchSelection = qualifyingBranchCount > 1 && !selectedBranch
+  const reservableCount = selectedBranch ? officeBreakdown[selectedBranch]?.total || 0 : 0
+  const reservableBanks = selectedBranch ? officeBreakdown[selectedBranch]?.banks || {} : {}
+  // True when the query matched more rows than the batch cap returned — the
+  // per-branch/per-bank breakdown is then based on a (deterministically
+  // ordered) slice rather than every matching row.
+  const batchLimited = matchedCount > matchedRows.length
+
   // ---------------------------------------------------------------------
   // Reservation flow — confirm modal collects and validates the collector's
-  // name, then calls the same create_reservation RPC.
+  // name, then calls the same create_reservation RPC, scoped to only the
+  // checks that live at the selected branch (which, with no bank filter
+  // applied, may span more than one issuing bank).
   // ---------------------------------------------------------------------
   function openConfirm() {
-    if (matchedCount === 0) return
+    if (reservableCount === 0 || needsBranchSelection) return
     setReserveError('')
     setShowConfirm(true)
   }
+async function assignQueueNumber(reservationId, branchKey) {
+  if (!reservationId || !branchKey) {
+    setQueueError('Could not generate a queue number. Please ask staff on-site.')
+    return
+  }
+  if (queueAssignedForRef.current === reservationId) return
+  queueAssignedForRef.current = reservationId
 
+  setAssigningQueue(true)
+  setQueueError('')
+  try {
+    const { data, error } = await supabase.rpc('assign_queue_number', {
+      p_reservation_id: reservationId,
+      p_branch: branchKey,
+    })
+    if (error) throw error
+const row = Array.isArray(data) ? data[0] : data
+if (!row?.out_queue_number) throw new Error('No queue number returned')
+setQueueInfo({ number: row.out_queue_number, date: row.out_queue_date, branch: branchKey })
+  } catch (err) {
+    console.error('assign_queue_number failed:', err)
+    queueAssignedForRef.current = null // allow a retry
+    setQueueError('Could not generate a queue number. You can retry, or ask staff on-site.')
+  } finally {
+    setAssigningQueue(false)
+  }
+}
   async function confirmPickup() {
     const validation = validateCollectorName(collectorName)
     if (!validation.valid) {
       setReserveError(validation.message)
+      return
+    }
+    if (!selectedBranch) {
+      setReserveError('Select a pickup location before confirming.')
+      return
+    }
+
+    const rowsForSelectedBranch = matchedRows.filter((row) => row.pickup_branch === selectedBranch)
+    const idsForSelectedBranch = rowsForSelectedBranch.map((row) => row.id)
+
+    if (idsForSelectedBranch.length === 0) {
+      setReserveError('No checks are available at that location anymore. Please search again.')
       return
     }
 
@@ -438,7 +537,7 @@ export default function CollectorSearch() {
     setReserveError('')
 
     const { data, error } = await supabase.rpc('create_reservation', {
-      p_check_ids: matchedIds,
+      p_check_ids: idsForSelectedBranch,
       p_collector_name: cleanName,
     })
 
@@ -449,23 +548,42 @@ export default function CollectorSearch() {
       return
     }
 
-    const result = Array.isArray(data) ? data[0] : data
-    setSuccessInfo({
-      count: matchedCount,
-      expiresAt: result?.expires_at,
-      collectorName: cleanName,
-      bank,
-      payee: payeeQuery,
-      payor: payorQuery,
-      branchCounts: { ...branchCounts },
-    })
-    setShowConfirm(false)
-    setCollectorName('')
-    fetchMatchCount(bank, payeeQuery, payorQuery)
+    const banksForSelectedBranch = {}
+    for (const row of rowsForSelectedBranch) {
+      const name = row.bank || UNKNOWN_BANK_LABEL
+      banksForSelectedBranch[name] = (banksForSelectedBranch[name] || 0) + 1
+    }
+
+const result = Array.isArray(data) ? data[0] : data
+const reservationId = result?.reservation_id
+
+setSuccessInfo({
+  reservationId,
+  branch: selectedBranch,
+  count: idsForSelectedBranch.length,
+  expiresAt: result?.expires_at,
+  collectorName: cleanName,
+  bank,
+  payee: payeeQuery,
+  payor: payorQuery,
+  branchBreakdown: {
+    [selectedBranch]: { total: idsForSelectedBranch.length, banks: banksForSelectedBranch },
+  },
+})
+setShowConfirm(false)
+setCollectorName('')
+setQueueInfo(null)
+setQueueError('')
+queueAssignedForRef.current = null
+fetchMatchCount(bank, payeeQuery, payorQuery)
+
+assignQueueNumber(reservationId, selectedBranch)
   }
 
-  const hasQueryText = !!(bank.trim() && payeeQuery.trim() && payorQuery.trim())
-  const filledCount = [bank, payeeQuery, payorQuery].filter((v) => v.trim().length > 0).length
+  // Bank is optional, so query "readiness" is driven by payee + payor only.
+  const hasQueryText = !!(payeeQuery.trim() && payorQuery.trim())
+  const requiredFilledCount = [payeeQuery, payorQuery].filter((v) => v.trim().length > 0).length
+  const filledCount = requiredFilledCount + (bank.trim() ? 1 : 0)
 
   const payeeTrimmed = payeeQuery.trim()
   const payorTrimmed = payorQuery.trim()
@@ -481,28 +599,51 @@ export default function CollectorSearch() {
         <div className="mx-auto max-w-5xl px-4 pt-6 sm:px-6 sm:pt-10">
           <Hero />
 
-          {successInfo && <SuccessManifest info={successInfo} onDismiss={() => setSuccessInfo(null)} />}
+    {successInfo && (
+  <SuccessManifest
+    info={successInfo}
+    onDismiss={() => setSuccessInfo(null)}
+    queueInfo={queueInfo}
+    queueError={queueError}
+    assigningQueue={assigningQueue}
+    onRetryQueue={() => assignQueueNumber(successInfo.reservationId, successInfo.branch)}
+  />
+)}
 
           {/* Search slip — identical ledger-styled layout to the client page:
-              numbered fields, progress bar, underline inputs. */}
+              numbered fields, progress bar, underline inputs. Bank is
+              optional — its slip field is styled distinctly (amber accent)
+              rather than the brand teal used for the two required fields. */}
           <div
             ref={searchSectionRef}
             className="relative z-20 -mt-5 mb-8 mx-auto max-w-4xl scroll-mt-6 sm:-mt-6 sm:mb-10"
           >
             <div className="overflow-hidden rounded-lg border border-slate-200 bg-white">
               <div className="flex h-[3px] w-full gap-[3px] bg-slate-100" aria-hidden="true">
-                {[0, 1, 2].map((i) => (
+                <div
+                  className={`h-full flex-1 transition-colors duration-300 ${
+                    bank.trim() ? 'bg-[var(--accent)]' : 'bg-transparent'
+                  }`}
+                />
+                {[0, 1].map((i) => (
                   <div
                     key={i}
                     className={`h-full flex-1 transition-colors duration-300 ${
-                      i < filledCount ? 'bg-[var(--brand)]' : 'bg-transparent'
+                      i < requiredFilledCount ? 'bg-[var(--brand)]' : 'bg-transparent'
                     }`}
                   />
                 ))}
               </div>
 
               <div className="grid grid-cols-1 divide-y divide-slate-200 sm:grid-cols-3 sm:divide-x sm:divide-y-0">
-                <SlipField index="01" icon={Landmark} label="Bank" filled={Boolean(bank)}>
+                <SlipField
+                  index="01"
+                  icon={Landmark}
+                  label="Bank"
+                  optional
+                  filled={Boolean(bank)}
+                  caption="Optional — leave blank to search every bank"
+                >
                   <BankDropdown
                     value={bank}
                     options={BANKS}
@@ -630,7 +771,9 @@ export default function CollectorSearch() {
 
               <div className="flex flex-col gap-2.5 border-t border-slate-200 bg-slate-50 px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-3 sm:px-5">
                 <p className="order-2 text-center text-[11px] font-medium text-slate-400 sm:order-1 sm:text-left sm:text-xs">
-                  {hasQueryText ? 'Ready — press search or hit Enter.' : `${filledCount}/3 fields filled`}
+                  {hasQueryText
+                    ? 'Ready — press search or hit Enter.'
+                    : `${requiredFilledCount}/2 required fields filled · bank optional`}
                 </p>
                 <div className="order-1 flex items-center gap-2 sm:order-2">
                   {(bank || payeeQuery || payorQuery) && (
@@ -646,7 +789,7 @@ export default function CollectorSearch() {
                     type="button"
                     onClick={handleSearch}
                     disabled={!hasQueryText || loading}
-                    title={!hasQueryText ? 'Select a bank and enter both payee and payor to search' : undefined}
+                    title={!hasQueryText ? 'Enter both a payee and a payor to search (bank is optional)' : undefined}
                     className="group inline-flex flex-1 items-center justify-center gap-2 rounded-md bg-[var(--brand)] px-4 py-2.5 text-sm font-semibold text-white transition-all duration-150 hover:bg-[var(--brand-dark)] active:scale-[0.97] disabled:pointer-events-none disabled:opacity-40 sm:flex-none sm:py-2"
                   >
                     {loading ? (
@@ -677,18 +820,27 @@ export default function CollectorSearch() {
               <ManifestCountCard
                 loading={loading}
                 count={matchedCount}
-                branchCounts={branchCounts}
+                branchBreakdown={branchBreakdown}
                 bank={bank}
                 payee={payeeQuery}
                 payor={payorQuery}
+                selectedBranch={selectedBranch}
+                onSelectBranch={setSelectedBranch}
                 onEditSearch={scrollToSearch}
+                batchLimited={batchLimited}
+                shownCount={matchedRows.length}
               />
             )}
           </div>
         </div>
 
         {/* Sticky bottom reserve bar — same brand gradient used throughout,
-            visible whenever there's something to reserve. */}
+            visible whenever there's something to reserve. When the query
+            spans more than one branch, this bar prompts the collector to
+            pick a location instead of letting them reserve everything at
+            once — a reservation is always scoped to a single pickup point,
+            even if — with no bank filter applied — that point holds checks
+            from several different banks. */}
         {hasSearched && !loading && matchedCount > 0 && !successInfo && (
           <div className="slide-up fixed inset-x-0 bottom-0 z-40 bg-gradient-to-r from-[var(--brand-dark)] via-[var(--brand)] to-[var(--brand-dark)] px-4 pb-6 pt-5 shadow-[0_-16px_40px_rgba(13,148,136,0.35)] sm:pb-5">
             <div className="absolute inset-x-0 top-0 h-[3px] bg-[var(--brand-light)]"></div>
@@ -696,19 +848,43 @@ export default function CollectorSearch() {
               <div className="flex w-full items-center gap-4 sm:w-auto">
                 <div className="relative flex h-14 w-14 shrink-0 items-center justify-center rounded-full bg-[var(--brand-light)]/15 ring-1 ring-[var(--brand-light)]/40">
                   <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[var(--brand-light)] opacity-20"></span>
-                  <Package className="h-7 w-7 text-[var(--brand-light)]" />
+                  {needsBranchSelection ? (
+                    <MapPin className="h-7 w-7 text-[var(--brand-light)]" />
+                  ) : (
+                    <Package className="h-7 w-7 text-[var(--brand-light)]" />
+                  )}
                 </div>
                 <div>
-                  <p className="text-xs font-semibold text-white uppercase tracking-wide">Ready for pickup</p>
-                  <p className="font-display text-2xl font-extrabold text-white">
-                    {matchedCount} Check{matchedCount === 1 ? '' : 's'}
-                  </p>
+                  {needsBranchSelection ? (
+                    <>
+                      <p className="text-xs font-semibold text-white uppercase tracking-wide">Action needed</p>
+                      <p className="font-display text-lg font-extrabold leading-tight text-white sm:text-xl">
+                        Select a pickup location above
+                      </p>
+                    </>
+                  ) : (
+                    <>
+                      <p className="text-xs font-semibold text-white uppercase tracking-wide">Ready for pickup</p>
+                      <p className="font-display text-2xl font-extrabold text-white">
+                        {reservableCount} Check{reservableCount === 1 ? '' : 's'}
+                      </p>
+                      {selectedBranch && (
+                        <p className="text-[11px] font-semibold text-[var(--brand-light)]">
+                          {OFFICES[selectedBranch]?.shortLabel || OFFICES[selectedBranch]?.label}
+                          {!bank && Object.keys(reservableBanks).length > 1 && (
+                            <> · {Object.keys(reservableBanks).length} banks</>
+                          )}
+                        </p>
+                      )}
+                    </>
+                  )}
                 </div>
               </div>
               <button
                 type="button"
                 onClick={openConfirm}
-                className="flex w-full items-center justify-center gap-2 rounded-xl bg-[var(--accent)] px-10 py-4 text-base font-semibold text-white shadow-xl shadow-black/25 transition-all hover:-translate-y-0.5 hover:bg-[var(--accent-dark)] active:scale-95 sm:w-auto"
+                disabled={needsBranchSelection}
+                className="flex w-full items-center justify-center gap-2 rounded-xl bg-[var(--accent)] px-10 py-4 text-base font-semibold text-white shadow-xl shadow-black/25 transition-all hover:-translate-y-0.5 hover:bg-[var(--accent-dark)] active:scale-95 disabled:pointer-events-none disabled:opacity-40 disabled:hover:translate-y-0 sm:w-auto"
               >
                 <Truck className="h-5 w-5" />
                 Reserve now
@@ -719,11 +895,12 @@ export default function CollectorSearch() {
 
         {showConfirm && (
           <ConfirmModal
-            count={matchedCount}
+            count={reservableCount}
             bank={bank}
             payee={payeeQuery}
             payor={payorQuery}
-            branchCounts={branchCounts}
+            selectedBranch={selectedBranch}
+            banks={reservableBanks}
             collectorName={collectorName}
             onCollectorNameChange={setCollectorName}
             onCancel={() => {
@@ -745,7 +922,7 @@ export default function CollectorSearch() {
 /* ---------------------------------------------------------------------- */
 
 const SlipField = React.forwardRef(function SlipField(
-  { index, icon: Icon, label, caption, warning, filled, children },
+  { index, icon: Icon, label, caption, warning, filled, optional, children },
   ref
 ) {
   return (
@@ -753,24 +930,31 @@ const SlipField = React.forwardRef(function SlipField(
       <div className="flex items-center gap-2">
         <span
           className={`font-mono text-[10px] transition-colors ${
-            filled ? 'text-[var(--brand)]' : 'text-slate-300'
+            filled ? (optional ? 'text-[var(--accent)]' : 'text-[var(--brand)]') : 'text-slate-300'
           }`}
         >
           {index}
         </span>
         <Icon
           className={`h-3.5 w-3.5 transition-colors group-focus-within:text-[var(--brand)] ${
-            filled ? 'text-[var(--brand)]' : 'text-slate-400'
+            filled ? (optional ? 'text-[var(--accent)]' : 'text-[var(--brand)]') : 'text-slate-400'
           }`}
         />
         <span className="text-[10.5px] font-semibold uppercase tracking-[0.14em] text-slate-500">{label}</span>
+        {optional && !filled && (
+          <span className="rounded-full bg-slate-100 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-slate-400">
+            Optional
+          </span>
+        )}
         {filled && (
           <svg
             key="check"
             viewBox="0 0 24 24"
             fill="none"
             aria-hidden="true"
-            className="check-draw ml-auto h-4 w-4 shrink-0 text-[var(--brand)]"
+            className={`check-draw ml-auto h-4 w-4 shrink-0 ${
+              optional ? 'text-[var(--accent)]' : 'text-[var(--brand)]'
+            }`}
           >
             <circle cx="12" cy="12" r="9.25" stroke="currentColor" strokeWidth="1.5" className="check-draw-circle" />
             <path
@@ -797,7 +981,7 @@ const SlipField = React.forwardRef(function SlipField(
   )
 })
 
-function BankDropdown({ value, options, onChange, placeholder = 'Select bank...' }) {
+function BankDropdown({ value, options, onChange, placeholder = 'All banks' }) {
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
   const [activeIndex, setActiveIndex] = useState(-1)
@@ -807,7 +991,12 @@ function BankDropdown({ value, options, onChange, placeholder = 'Select bank...'
   const buttonRef = useRef(null)
   const searchInputRef = useRef(null)
 
-  const filteredOptions = options.filter((o) => o.toLowerCase().includes(query.trim().toLowerCase()))
+  // '' represents the explicit "All Banks" choice, always offered as the
+  // first row unless the collector is actively filtering the list by name.
+  const trimmedQuery = query.trim().toLowerCase()
+  const nameMatches = options.filter((o) => o.toLowerCase().includes(trimmedQuery))
+  const allBanksMatchesQuery = trimmedQuery.length === 0 || 'all banks'.includes(trimmedQuery)
+  const filteredOptions = allBanksMatchesQuery ? ['', ...nameMatches] : nameMatches
 
   const MENU_MAX_HEIGHT = 340
   const VIEWPORT_MARGIN = 12
@@ -833,7 +1022,7 @@ function BankDropdown({ value, options, onChange, placeholder = 'Select bank...'
     if (!open) return
     measure()
     setQuery('')
-    setActiveIndex(Math.max(0, options.indexOf(value)))
+    setActiveIndex(Math.max(0, options.indexOf(value) + (value ? 1 : 0)))
     const raf = requestAnimationFrame(() => searchInputRef.current?.focus())
     function handleTrack() {
       measure()
@@ -873,7 +1062,7 @@ function BankDropdown({ value, options, onChange, placeholder = 'Select bank...'
 
   function commit(index) {
     const opt = filteredOptions[index]
-    if (opt != null) onChange(opt)
+    if (opt !== undefined) onChange(opt)
     setOpen(false)
   }
 
@@ -917,7 +1106,7 @@ function BankDropdown({ value, options, onChange, placeholder = 'Select bank...'
         onKeyDown={handleTriggerKeyDown}
         aria-haspopup="listbox"
         aria-expanded={open}
-        aria-label="Select bank"
+        aria-label="Select bank (optional)"
         className="flex w-full items-center gap-2.5 rounded-lg bg-white py-2.5 pl-2.5 pr-10 text-left shadow-sm outline-none transition-all duration-150 sm:py-2"
       >
         <BankAvatar name={value} muted={!value} />
@@ -976,7 +1165,7 @@ function BankDropdown({ value, options, onChange, placeholder = 'Select bank...'
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 onKeyDown={handleSearchKeyDown}
-                placeholder="Search banks..."
+                placeholder="Search banks, or leave blank for all..."
                 aria-label="Search banks"
                 className="w-full rounded-lg border border-slate-200 bg-slate-50 py-2 pl-8 pr-2.5 text-sm font-medium text-[var(--ink-dark)] outline-none transition-colors focus:border-[var(--brand)] focus:bg-white"
               />
@@ -991,9 +1180,10 @@ function BankDropdown({ value, options, onChange, placeholder = 'Select bank...'
                 filteredOptions.map((opt, i) => {
                   const isSelected = opt === value
                   const isActive = i === activeIndex
+                  const isAllBanks = opt === ''
                   return (
                     <button
-                      key={opt}
+                      key={isAllBanks ? '__all_banks__' : opt}
                       id={`bank-option-${i}`}
                       data-index={i}
                       type="button"
@@ -1003,10 +1193,10 @@ function BankDropdown({ value, options, onChange, placeholder = 'Select bank...'
                       onClick={() => commit(i)}
                       className={`flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2.5 text-left text-sm transition-colors ${
                         isActive ? 'bg-[var(--brand)]/10 text-[var(--brand-dark)]' : 'text-[var(--ink)]'
-                      } ${isSelected ? 'font-semibold' : 'font-medium'}`}
+                      } ${isSelected ? 'font-semibold' : 'font-medium'} ${isAllBanks ? 'border-b border-slate-100 mb-1' : ''}`}
                     >
-                      <BankAvatar name={opt} />
-                      <span className="min-w-0 flex-1 truncate">{opt}</span>
+                      <BankAvatar name={opt} muted={isAllBanks} />
+                      <span className="min-w-0 flex-1 truncate">{isAllBanks ? 'All Banks' : opt}</span>
                       {isSelected && <Check className="h-4 w-4 shrink-0 text-[var(--brand)]" />}
                     </button>
                   )
@@ -1067,6 +1257,47 @@ function BankAvatar({ name, muted, size = 38 }) {
   )
 }
 
+// Compact list of "bank → count" rows, used anywhere a branch's checks need
+// to be broken down by issuing bank: the branch cards, the confirm modal,
+// and the success manifest. Renders nothing if there's nothing to show.
+function BankBreakdownList({ banks, size = 'default' }) {
+  const entries = sortedBankEntries(banks)
+  if (entries.length === 0) return null
+
+  const compact = size === 'compact'
+
+  return (
+    <div
+      className={`flex flex-col gap-1.5 rounded-lg border border-slate-100 bg-slate-50/70 ${
+        compact ? 'px-3 py-2' : 'px-3.5 py-2.5'
+      }`}
+    >
+      <p className="flex items-center gap-1 text-[9.5px] font-semibold uppercase tracking-[0.12em] text-slate-400">
+        <Banknote className="h-3 w-3" />
+        Issuing bank{entries.length === 1 ? '' : 's'}
+      </p>
+      <div className="flex flex-col gap-1">
+        {entries.map(([bankName, count]) => (
+          <div key={bankName} className="flex items-center justify-between gap-2">
+            <span className="flex min-w-0 items-center gap-1.5">
+              <BankAvatar name={bankName === UNKNOWN_BANK_LABEL ? undefined : bankName} muted size={16} />
+              <span
+                className="truncate text-[11px] font-medium text-slate-600"
+                title={bankName}
+              >
+                {bankName}
+              </span>
+            </span>
+            <span className="shrink-0 rounded-full border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] font-bold tabular-nums text-[var(--brand-dark)]">
+              {count}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function PageStyles() {
   return (
     <style>{`
@@ -1116,6 +1347,13 @@ function PageStyles() {
         @keyframes cardIn {
           from { opacity: 0; transform: translateY(16px); }
           to { opacity: 1; transform: translateY(0); }
+        }
+
+        .pulse-ring { animation: pulseRing 1.8s cubic-bezier(0.16, 1, 0.3, 1) infinite; }
+        @keyframes pulseRing {
+          0% { box-shadow: 0 0 0 0 rgba(13, 148, 136, 0.35); }
+          70% { box-shadow: 0 0 0 8px rgba(13, 148, 136, 0); }
+          100% { box-shadow: 0 0 0 0 rgba(13, 148, 136, 0); }
         }
       }
 
@@ -1182,7 +1420,8 @@ function Hero() {
             <span className="text-[var(--accent)]">Checks</span>
           </h1>
           <p className="mt-6 max-w-sm text-base font-medium leading-relaxed text-[var(--brand-light)]">
-            Search a bank, payee, and payor to see how many checks are ready — then reserve them for pickup.
+            Enter a payee and payor to see how many checks are ready across every branch — then reserve them for
+            pickup.
           </p>
         </div>
 
@@ -1245,21 +1484,45 @@ function useCountUp(target, active) {
   return value
 }
 
-// Results card — shares the client page's full visual grammar: loading /
-// zero-result / success states, the Bank/Payee/Payor QueryChip header, AND
-// the branch breakdown grid (address, hours, phone — no map/street view).
-// Both CSBA offices are always listed here, whether or not this particular
-// search matched anything there, so a collector always knows the full
-// pickup picture. The reserve CTA itself still lives in the sticky bottom
-// bar, so the success state closes with a short "ready to reserve" prompt
-// instead of duplicating that button here.
-function ManifestCountCard({ loading, count, branchCounts, bank, payee, payor, onEditSearch }) {
+// Results card — organized by branch first: each pickup location shows how
+// many matching checks it holds, and — whenever the search wasn't narrowed
+// to a single bank — exactly which banks those checks come from and in
+// what quantities. Both CSBA offices are always listed, whether or not this
+// particular search matched anything there, so a collector always knows the
+// full pickup picture. The reserve CTA itself still lives in the sticky
+// bottom bar.
+//
+// When more than one branch has matching checks, each branch card becomes
+// a selectable "radio" — the collector must tap one before the sticky
+// reserve bar will let them proceed. This is what keeps a reservation
+// scoped to a single pickup point instead of quietly bundling every branch
+// together.
+function ManifestCountCard({
+  loading,
+  count,
+  branchBreakdown,
+  bank,
+  payee,
+  payor,
+  selectedBranch,
+  onSelectBranch,
+  onEditSearch,
+  batchLimited,
+  shownCount,
+}) {
   const displayCount = useCountUp(count, !loading)
+  const showBankBreakdown = !bank.trim()
 
-  const branches = getOrderedBranches(branchCounts)
+  const branches = getOrderedBranches(branchBreakdown)
   const matchedBranches = branches.filter((b) => b.count > 0)
   const isMultiLocation = matchedBranches.length > 1
-  const unmappedCount = Math.max(0, count - branches.reduce((sum, b) => sum + b.count, 0))
+  const unmappedCount = Math.max(0, shownCount - branches.reduce((sum, b) => sum + b.count, 0))
+
+  const distinctBankCount = useMemo(() => {
+    const names = new Set()
+    matchedBranches.forEach((b) => Object.keys(b.banks).forEach((n) => names.add(n)))
+    return names.size
+  }, [matchedBranches])
 
   if (loading) {
     return (
@@ -1298,6 +1561,16 @@ function ManifestCountCard({ loading, count, branchCounts, bank, payee, payor, o
             <div className="rounded-lg bg-white px-4 py-2 text-xs font-semibold uppercase tracking-widest text-slate-400 shadow-sm border border-slate-100">
               Try double-checking spelling
             </div>
+            {bank && (
+              <button
+                type="button"
+                onClick={onEditSearch}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-500 shadow-sm transition-colors hover:border-[var(--brand-light)] hover:text-[var(--brand-dark)]"
+              >
+                <Landmark className="h-3.5 w-3.5" />
+                Try without a bank filter
+              </button>
+            )}
             <button
               type="button"
               onClick={onEditSearch}
@@ -1335,6 +1608,11 @@ function ManifestCountCard({ loading, count, branchCounts, bank, payee, payor, o
                 </span>
               )
             )}
+            {showBankBreakdown && distinctBankCount > 1 && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2.5 py-1 text-[10px] font-bold text-slate-600">
+                <Banknote className="h-3 w-3" /> {distinctBankCount} banks
+              </span>
+            )}
           </div>
           <button
             type="button"
@@ -1357,23 +1635,69 @@ function ManifestCountCard({ loading, count, branchCounts, bank, payee, payor, o
           </div>
 
           <div className="flex flex-wrap items-center gap-2 sm:justify-end">
-            <MiniChip label="Bank" value={bank} logo={bank} />
+            <MiniChip label="Bank" value={bank || 'All banks'} logo={bank || undefined} />
             <MiniChip label="Payee" value={payee} />
             <MiniChip label="Payor" value={payor} />
           </div>
         </div>
+
+        {/* Explicit call-to-action the moment there's a choice to make —
+            sits right under the header so it's the first thing seen, not
+            something buried below the branch cards. */}
+        {isMultiLocation && (
+          <div
+            className={`flex items-center gap-2.5 rounded-xl border px-3.5 py-2.5 text-xs font-bold transition-colors ${
+              selectedBranch
+                ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                : 'border-[var(--accent)]/30 bg-[var(--accent-soft)] text-[var(--accent-dark)]'
+            }`}
+          >
+            {selectedBranch ? <CheckCircle2 className="h-4 w-4 shrink-0" /> : <MapPin className="h-4 w-4 shrink-0" />}
+            {selectedBranch
+              ? `Reserving from ${OFFICES[selectedBranch]?.shortLabel || OFFICES[selectedBranch]?.label} only`
+              : 'These checks are split across locations — tap one below to choose where to collect'}
+          </div>
+        )}
+
+        {batchLimited && (
+          <div className="flex items-start gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-[11px] font-medium text-slate-500">
+            <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-slate-400" />
+            Showing a breakdown of the first {shownCount.toLocaleString()} of {count.toLocaleString()} matching
+            checks. Add a bank to narrow the search and see the complete picture.
+          </div>
+        )}
       </div>
 
       {/* Branch breakdown — address-only cards, no embedded map/street view.
           Only branches that actually matched checks are shown here, so the
-          collector isn't sent to a location with nothing to pick up. */}
+          collector isn't sent to a location with nothing to pick up. Cards
+          become selectable radios once there's more than one to choose
+          from; with just one match, it's shown as already selected since
+          there's nothing to decide. Each card also lists the issuing banks
+          behind its count whenever the search wasn't already narrowed to a
+          single bank. */}
       <div className="relative z-10 px-4 py-4 sm:px-6 sm:py-5">
         <p className="mb-3 flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-400">
-          <Building2 className="h-3.5 w-3.5" /> Pickup location{matchedBranches.length === 1 ? '' : 's'}
+          <Building2 className="h-3.5 w-3.5" />
+          {isMultiLocation ? 'Choose a pickup location' : `Pickup location${matchedBranches.length === 1 ? '' : 's'}`}
         </p>
-        <div className={`grid gap-3 ${matchedBranches.length === 1 ? 'grid-cols-1' : 'grid-cols-1 lg:grid-cols-2'}`}>
+        <div
+          role={isMultiLocation ? 'radiogroup' : undefined}
+          aria-label={isMultiLocation ? 'Pickup location' : undefined}
+          className={`grid gap-3 ${matchedBranches.length === 1 ? 'grid-cols-1' : 'grid-cols-1 lg:grid-cols-2'}`}
+        >
           {matchedBranches.map((b, i) => (
-            <LocationCard key={b.key} office={b.office} count={b.count} delay={i * 80} />
+            <LocationCard
+              key={b.key}
+              office={b.office}
+              count={b.count}
+              banks={b.banks}
+              showBankBreakdown={showBankBreakdown}
+              delay={i * 80}
+              selectable={isMultiLocation}
+              selected={selectedBranch === b.key}
+              onSelect={() => onSelectBranch(b.key)}
+            />
           ))}
         </div>
 
@@ -1394,7 +1718,7 @@ function ManifestCountCard({ loading, count, branchCounts, bank, payee, payor, o
 function MiniChip({ label, value, logo }) {
   return (
     <div className="flex min-w-0 max-w-[240px] items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
-      {logo && <BankAvatar name={logo} size={22} />}
+      <BankAvatar name={logo} muted={!logo} size={22} />
       <div className="flex min-w-0 flex-col leading-tight">
         <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">{label}</span>
         <span className="truncate text-sm font-medium text-[var(--ink-dark)] sm:text-base" title={value || undefined}>
@@ -1406,11 +1730,19 @@ function MiniChip({ label, value, logo }) {
 }
 
 // Address-only branch card: identity + count, full address, hours/phone,
-// and a directions link — deliberately no embedded map or Street View
-// iframe, per the collector view's simpler, faster-scanning brief. Renders
-// the same whether the branch matched checks or not — a zero-match branch
-// is simply shown in a quieter, muted state rather than being hidden.
-function LocationCard({ office, count, delay = 0 }) {
+// a directions link, and — when the search spans every bank — a breakdown
+// of exactly which banks contribute to that branch's count. Deliberately no
+// embedded map or Street View iframe, per the collector view's simpler,
+// faster-scanning brief.
+//
+// When `selectable` is true (more than one branch matched), the whole card
+// becomes a radio button: click/tap or Enter/Space to select it as the one
+// and only location this reservation will be scoped to. Only one card can
+// ever be selected at a time — picking a new one silently deselects the
+// last. When there's exactly one matching branch, the card still renders
+// with the "Selected" affordance so the visual language stays consistent,
+// but isn't interactive since there's nothing else to choose.
+function LocationCard({ office, count, banks, showBankBreakdown, delay = 0, selectable = false, selected = false, onSelect }) {
   const [addressCopied, setAddressCopied] = useState(false)
   const directionsUrl = getDirectionsUrl(office)
   const hasMatches = count > 0
@@ -1418,7 +1750,8 @@ function LocationCard({ office, count, delay = 0 }) {
     ', '
   )
 
-  async function copyAddress() {
+  async function copyAddress(e) {
+    e.stopPropagation()
     try {
       await navigator.clipboard.writeText(fullAddress)
       setAddressCopied(true)
@@ -1428,16 +1761,46 @@ function LocationCard({ office, count, delay = 0 }) {
     }
   }
 
+  function handleCardKeyDown(e) {
+    if (!selectable) return
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault()
+      onSelect?.()
+    }
+  }
+
   return (
     <div
       style={{ animationDelay: `${delay}ms` }}
-      className={`card-in flex flex-col gap-2.5 rounded-xl border p-3.5 shadow-sm transition-all duration-200 hover:shadow-md ${
-        hasMatches
-          ? 'border-slate-200 bg-white hover:border-[var(--brand-light)]'
-          : 'border-slate-150 bg-slate-50/60 hover:border-slate-200'
+      role={selectable ? 'radio' : undefined}
+      aria-checked={selectable ? selected : undefined}
+      tabIndex={selectable ? 0 : undefined}
+      onClick={selectable ? onSelect : undefined}
+      onKeyDown={selectable ? handleCardKeyDown : undefined}
+      className={`card-in relative flex flex-col gap-2.5 rounded-xl border p-3.5 shadow-sm transition-all duration-200 ${
+        selectable ? 'cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand)] focus-visible:ring-offset-2' : ''
+      } ${
+        selected
+          ? 'border-[var(--brand)] bg-[var(--brand)]/5 shadow-md ring-1 ring-[var(--brand)]'
+          : hasMatches
+            ? 'border-slate-200 bg-white hover:border-[var(--brand-light)] hover:shadow-md'
+            : 'border-slate-150 bg-slate-50/60 hover:border-slate-200'
       }`}
     >
-      <div className="flex items-start justify-between gap-2">
+      {/* Selection indicator — top-right radio dot, only rendered once
+          there's an actual choice being made (selectable branches). */}
+      {selectable && (
+        <span
+          aria-hidden="true"
+          className={`absolute right-3.5 top-3.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border-2 transition-colors ${
+            selected ? 'border-[var(--brand)] bg-[var(--brand)]' : 'border-slate-300 bg-white'
+          }`}
+        >
+          {selected && <Check className="h-3 w-3 text-white" />}
+        </span>
+      )}
+
+      <div className="flex items-start justify-between gap-2 pr-6">
         <div className="flex min-w-0 items-center gap-2">
           <span
             className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${
@@ -1450,7 +1813,13 @@ function LocationCard({ office, count, delay = 0 }) {
             <h3 className="truncate font-display text-sm font-extrabold leading-tight text-[var(--ink-dark)]">
               {office.label}
             </h3>
-            <p className="text-[10px] font-medium text-slate-400">CSBA branch office</p>
+            <p className="text-[10px] font-medium text-slate-400">
+              {selected ? (
+                <span className="font-semibold text-[var(--brand-dark)]">Selected for pickup</span>
+              ) : (
+                'CSBA branch office'
+              )}
+            </p>
           </div>
         </div>
         <span
@@ -1466,6 +1835,8 @@ function LocationCard({ office, count, delay = 0 }) {
         <MapPin className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[var(--brand)]" />
         {fullAddress}
       </p>
+
+      {showBankBreakdown && <BankBreakdownList banks={banks} size="compact" />}
 
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-slate-100 pt-2 text-[11px] font-semibold text-slate-500">
         <span className="inline-flex items-center gap-1">
@@ -1483,6 +1854,7 @@ function LocationCard({ office, count, delay = 0 }) {
           href={directionsUrl}
           target="_blank"
           rel="noopener noreferrer"
+          onClick={(e) => e.stopPropagation()}
           className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-[var(--accent)] px-3 py-1.5 text-[11px] font-semibold text-white shadow-sm transition-all hover:bg-[var(--accent-dark)]"
         >
           <Navigation className="h-3 w-3" />
@@ -1497,6 +1869,10 @@ function LocationCard({ office, count, delay = 0 }) {
           {addressCopied ? 'Copied' : 'Copy'}
         </button>
       </div>
+
+      {selectable && !selected && (
+        <p className="text-center text-[10.5px] font-semibold text-slate-400">Tap to reserve from this location</p>
+      )}
     </div>
   )
 }
@@ -1505,13 +1881,18 @@ function LocationCard({ office, count, delay = 0 }) {
 // internal two-column body (summary left, action right) once there's room,
 // a pinned header/footer so only the middle scrolls, Escape-to-close,
 // click-outside-to-close, and a body-scroll lock while it's open. The
-// collector-name field validates live as the person types.
+// collector-name field validates live as the person types. The summary is
+// always scoped to the single selected branch — there is no "reserve
+// everything" path once a query spans more than one location. When no bank
+// was specified in the search, the bank breakdown for that branch is shown
+// here too, so the collector knows exactly what they're about to receive.
 function ConfirmModal({
   count,
   bank,
   payee,
   payor,
-  branchCounts,
+  selectedBranch,
+  banks,
   collectorName,
   onCollectorNameChange,
   onCancel,
@@ -1522,11 +1903,12 @@ function ConfirmModal({
   const [nameTouched, setNameTouched] = useState(false)
   const [idAcknowledged, setIdAcknowledged] = useState(false)
   const [idTouched, setIdTouched] = useState(false)
-  const matchedBranches = getOrderedBranches(branchCounts).filter((b) => b.count > 0)
+  const office = selectedBranch ? OFFICES[selectedBranch] : null
   const nameValidation = validateCollectorName(collectorName)
   const showNameError = nameTouched && !nameValidation.valid && collectorName.length > 0
   const showNameSuccess = nameTouched && nameValidation.valid
   const showIdError = idTouched && !idAcknowledged
+  const showBankBreakdown = !bank.trim()
 
   useEffect(() => {
     function handleKeyDown(e) {
@@ -1604,33 +1986,32 @@ function ConfirmModal({
                   <span className="font-display text-4xl font-extrabold text-[var(--brand)]">{count}</span>
                 </div>
                 <div className="grid grid-cols-1 divide-y divide-slate-100 border-t border-slate-100">
-                  <SummaryRow label="Bank" value={bank} />
+                  <SummaryRow label="Bank" value={bank || 'All banks'} />
                   <SummaryRow label="Payee" value={payee} />
                   <SummaryRow label="Payor" value={payor} />
                 </div>
               </div>
 
-              {/* Pickup at — only the office(s) that actually have matching
-                  checks, so the collector isn't sent somewhere empty. */}
-              {matchedBranches.length > 0 && (
+              {/* Pickup at — the single branch this reservation is scoped
+                  to. Never a list here: once a branch is picked, that's the
+                  only location this reservation can ever cover. If the
+                  search spanned every bank, the mix of issuing banks behind
+                  this count is broken out right below. */}
+              {office && (
                 <div className="flex flex-col gap-2">
                   <p className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-400">
                     <Building2 className="h-3.5 w-3.5" /> Pickup at
                   </p>
-                  {matchedBranches.map(({ key, office, count: branchCount }) => (
-                    <div
-                      key={key}
-                      className="flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white px-3.5 py-2.5"
-                    >
-                      <span className="flex min-w-0 items-center gap-2 truncate text-sm font-semibold text-[var(--ink-dark)]">
-                        <MapPin className="h-3.5 w-3.5 shrink-0 text-[var(--brand)]" />
-                        {office.label}
-                      </span>
-                      <span className="shrink-0 rounded-full bg-[var(--brand)]/10 px-2.5 py-0.5 text-xs font-bold text-[var(--brand-dark)]">
-                        {branchCount}
-                      </span>
-                    </div>
-                  ))}
+                  <div className="flex items-center justify-between gap-3 rounded-xl border border-[var(--brand)]/30 bg-[var(--brand)]/5 px-3.5 py-2.5">
+                    <span className="flex min-w-0 items-center gap-2 truncate text-sm font-semibold text-[var(--ink-dark)]">
+                      <MapPin className="h-3.5 w-3.5 shrink-0 text-[var(--brand)]" />
+                      {office.label}
+                    </span>
+                    <span className="shrink-0 rounded-full bg-[var(--brand)]/15 px-2.5 py-0.5 text-xs font-bold text-[var(--brand-dark)]">
+                      {count}
+                    </span>
+                  </div>
+                  {showBankBreakdown && <BankBreakdownList banks={banks} />}
                 </div>
               )}
             </div>
@@ -1835,10 +2216,23 @@ function useCountdown(expiresAt) {
   return mins === 1 ? '1 minute' : `${mins} minutes`
 }
 
-function SuccessManifest({ info, onDismiss }) {
+function SuccessManifest({ info, onDismiss, queueInfo, queueError, assigningQueue, onRetryQueue }) {
   const remaining = useCountdown(info.expiresAt)
-  const matchedBranches = getOrderedBranches(info.branchCounts).filter((b) => b.count > 0)
+  const matchedBranches = getOrderedBranches(info.branchBreakdown).filter((b) => b.count > 0)
   const isExpired = remaining === 'Expired'
+  const showBankBreakdown = !(info.bank || '').trim()
+
+  // Aggregate bank totals across the (single) reserved branch, for a quick
+  // top-level summary above the per-branch chips.
+  const aggregatedBanks = useMemo(() => {
+    const totals = {}
+    matchedBranches.forEach((b) => {
+      Object.entries(b.banks).forEach(([name, n]) => {
+        totals[name] = (totals[name] || 0) + n
+      })
+    })
+    return totals
+  }, [matchedBranches])
 
   return (
     <div className="slide-up relative z-20 mb-8 overflow-hidden rounded-2xl border border-[var(--brand-light)] bg-white shadow-xl">
@@ -1885,7 +2279,9 @@ function SuccessManifest({ info, onDismiss }) {
             </div>
           )}
 
-          <div
+          {showBankBreakdown && <div className="mt-3"><BankBreakdownList banks={aggregatedBanks} size="compact" /></div>}
+
+        <div
             className={`mt-4 flex flex-wrap items-center gap-2 rounded-xl px-4 py-3 text-sm font-semibold border ${
               isExpired
                 ? 'bg-red-50 text-red-600 border-red-100'
@@ -1904,6 +2300,14 @@ function SuccessManifest({ info, onDismiss }) {
             )}
           </div>
 
+          <QueueTicketSection
+            info={info}
+            queueInfo={queueInfo}
+            queueError={queueError}
+            assigningQueue={assigningQueue}
+            onRetry={onRetryQueue}
+          />
+
           {!isExpired && <div className="mt-3"><IdRequirementNotice variant="compact" /></div>}
         </div>
 
@@ -1918,7 +2322,468 @@ function SuccessManifest({ info, onDismiss }) {
     </div>
   )
 }
+// The queue "ticket" — a compact wallet-pass card. Tap the flip button to
+// reveal the barcode + fine print on the back. Front never duplicates the
+// collector/payee/payor/ID info already shown elsewhere in the success
+// card, so it stays small regardless of how much detail is on the
+// reservation.
+function TicketStyles() {
+  return (
+    <style>{`
+      .ticket-shimmer {
+        background: linear-gradient(90deg, #e2e8f0 25%, #f1f5f9 37%, #e2e8f0 63%);
+        background-size: 400% 100%;
+      }
+      .ticket-pulse-dot { opacity: 1; }
+      .flip-scene { perspective: 1600px; }
+      .flip-card {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        transition: transform 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+        transform-style: preserve-3d;
+      }
+      .flip-card.is-flipped { transform: rotateY(180deg); }
+      .flip-face {
+        position: absolute;
+        inset: 0;
+        backface-visibility: hidden;
+        -webkit-backface-visibility: hidden;
+        border-radius: 1rem;
+        overflow: hidden;
+      }
+      .flip-face-back { transform: rotateY(180deg); }
+      .digit-in {
+        display: inline-block;
+        animation: digitIn 0.42s cubic-bezier(0.16, 1, 0.3, 1) both;
+      }
+      @keyframes digitIn {
+        from { opacity: 0; transform: translateY(8px) scale(0.85); filter: blur(3px); }
+        to { opacity: 1; transform: none; filter: none; }
+      }
+      @media (prefers-reduced-motion: no-preference) {
+        .ticket-shimmer { animation: ticketShimmer 1.6s ease-in-out infinite; }
+        .ticket-pulse-dot { animation: ticketPulseDot 1.8s ease-in-out infinite; }
+      }
+      @keyframes ticketShimmer {
+        0% { background-position: 100% 50%; }
+        100% { background-position: 0 50%; }
+      }
+      @keyframes ticketPulseDot {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.35; }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .flip-card { transition: none; }
+        .digit-in { animation: none; }
+      }
+    `}</style>
+  )
+}
 
+function TicketSkeleton() {
+  return (
+    <div className="mt-4">
+      <TicketStyles />
+      <div className="ticket-shimmer h-[176px] w-full rounded-2xl border border-slate-200 shadow-sm sm:h-[188px]" />
+    </div>
+  )
+}
+
+function TicketError({ message, onRetry }) {
+  return (
+    <div className="mt-4 flex flex-col gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between">
+      <span className="flex items-start gap-2.5 text-sm font-semibold text-amber-700">
+        <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-amber-100">
+          <AlertCircle className="h-4 w-4" />
+        </span>
+        {message}
+      </span>
+      <button
+        type="button"
+        onClick={onRetry}
+        className="inline-flex h-11 shrink-0 items-center justify-center gap-1.5 rounded-xl border border-amber-300 bg-white px-4 text-sm font-semibold text-amber-700 shadow-sm transition-colors hover:bg-amber-100 sm:h-10"
+      >
+        Try again
+      </button>
+    </div>
+  )
+}
+
+function QueueTicketSection({ info, queueInfo, queueError, assigningQueue, onRetry }) {
+  if (assigningQueue) return <TicketSkeleton />
+  if (queueError) return <TicketError message={queueError} onRetry={onRetry} />
+  if (!queueInfo) return null
+  return <TicketCard info={info} queueInfo={queueInfo} />
+}
+
+function TicketCard({ info, queueInfo }) {
+  const [flipped, setFlipped] = useState(false)
+  const [copied, setCopied] = useState(false)
+  const [downloadState, setDownloadState] = useState('idle') // idle | saving | done
+
+  const code = formatQueueCode(queueInfo.branch, queueInfo.number)
+  const branchLabel = OFFICES[queueInfo.branch]?.shortLabel || OFFICES[queueInfo.branch]?.label || queueInfo.branch
+  const bars = useMemo(() => ticketBarcodeBars(code), [code])
+
+  async function copyCode(e) {
+    e.stopPropagation()
+    try {
+      await navigator.clipboard.writeText(code)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1800)
+    } catch (err) {
+      console.error('Clipboard write failed:', err)
+    }
+  }
+
+  function handleDownload(e) {
+    e.stopPropagation()
+    if (downloadState === 'saving') return
+    setDownloadState('saving')
+    downloadQueueTicket(info, { code, branchLabel, date: queueInfo.date }, () => {
+      setDownloadState('done')
+      setTimeout(() => setDownloadState('idle'), 1800)
+    })
+  }
+
+  return (
+    <div className="mt-4">
+      <TicketStyles />
+      <div className="scale-in flip-scene h-[176px] w-full sm:h-[188px]">
+        <div className={`flip-card ${flipped ? 'is-flipped' : ''}`}>
+          {/* FRONT — the number, and only the number, is the job here */}
+          <div className="flip-face relative bg-gradient-to-br from-[var(--brand-dark)] via-[var(--brand)] to-[var(--brand-dark)] px-5 py-4 text-white shadow-xl shadow-[var(--brand-dark)]/25 ring-1 ring-black/5 sm:px-6">
+            <div className="dot-pattern absolute inset-0 opacity-[0.07]" aria-hidden="true" />
+
+            <div className="relative z-10 flex h-full flex-col justify-between">
+              <div className="flex items-center justify-between gap-2">
+                <span className="inline-flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-[0.18em] text-[var(--brand-light)]">
+                  <span className="ticket-pulse-dot h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--brand-light)]" aria-hidden="true" />
+                  Now serving
+                </span>
+                <div className="flex items-center gap-1.5">
+                  <span className="inline-flex min-w-0 items-center gap-1 rounded-full bg-white/15 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wide backdrop-blur-sm">
+                    <MapPin className="h-3 w-3 shrink-0" />
+                    <span className="max-w-[90px] truncate sm:max-w-[140px]">{branchLabel}</span>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      setFlipped(true)
+                    }}
+                    aria-pressed={flipped}
+                    aria-label="Show ticket details"
+                    className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-white/15 text-white transition-colors hover:bg-white/25 active:scale-90"
+                  >
+                    <ChevronDown className="h-3.5 w-3.5 -rotate-90" />
+                  </button>
+                </div>
+              </div>
+
+              <div className="flex items-end justify-between gap-3">
+                <p className="font-display text-[42px] font-extrabold leading-none tracking-wide tabular-nums drop-shadow-sm sm:text-[48px]">
+                  {code.split('').map((ch, i) => (
+                    <span key={i} className="digit-in" style={{ animationDelay: `${i * 45}ms` }}>
+                      {ch}
+                    </span>
+                  ))}
+                </p>
+
+                <div className="flex shrink-0 items-center gap-1.5 pb-1.5">
+                  <button
+                    type="button"
+                    onClick={copyCode}
+                    aria-label={copied ? 'Queue number copied' : `Copy queue number ${code}`}
+                    className="flex h-9 w-9 items-center justify-center rounded-full bg-white/15 text-white transition-all hover:bg-white/25 active:scale-90"
+                  >
+                    {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleDownload}
+                    aria-label="Download ticket"
+                    disabled={downloadState === 'saving'}
+                    className="flex h-9 min-w-9 items-center justify-center gap-1.5 rounded-full bg-[var(--accent)] px-2.5 text-white shadow-md shadow-black/10 transition-all hover:bg-[var(--accent-dark)] active:scale-90 disabled:opacity-80"
+                  >
+                    {downloadState === 'saving' ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : downloadState === 'done' ? (
+                      <Check className="h-4 w-4" />
+                    ) : (
+                      <Download className="h-4 w-4" />
+                    )}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* BACK — barcode texture + fine print, revealed on flip */}
+          <div className="flip-face flip-face-back flex flex-col justify-between bg-white px-5 py-4 shadow-xl ring-1 ring-black/5 sm:px-6">
+            <div className="flex items-center justify-between gap-2">
+              <span className="inline-flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-[0.18em] text-slate-400">
+                <ShieldCheck className="h-3.5 w-3.5 text-[var(--brand)]" />
+                Verified ticket
+              </span>
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  setFlipped(false)
+                }}
+                aria-pressed={flipped}
+                aria-label="Show queue number"
+                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-slate-100 text-slate-500 transition-colors hover:bg-slate-200 active:scale-90"
+              >
+                <ChevronDown className="h-3.5 w-3.5 rotate-90" />
+              </button>
+            </div>
+
+            <div className="flex flex-col items-center gap-2">
+              <div className="flex h-9 items-end gap-[3px]" aria-hidden="true">
+                {bars.map((h, i) => (
+                  <span key={i} className="w-[2.5px] shrink-0 rounded-[1px] bg-slate-300" style={{ height: `${h}px` }} />
+                ))}
+              </div>
+              <p className="font-mono text-[11px] font-semibold tracking-[0.25em] text-slate-400">{code}</p>
+            </div>
+
+            <p className="text-center text-[11px] font-medium leading-snug text-slate-500">
+              Bring this ticket and a valid ID to the {branchLabel} counter.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// Renders the ticket to a high-DPI PNG on a transparent, padded canvas so
+// the drop shadow has room to render, then triggers a download. `onDone`
+// is required by TicketCard's button state — always call it once the
+// download has fired, success or not, so the UI never gets stuck on
+// "Saving...".
+function downloadQueueTicket(info, queue, onDone) {
+  const dpr = Math.min(3, window.devicePixelRatio || 1)
+  const cardWidth = 640
+  const cardHeight = 900
+  const margin = 48
+  const width = cardWidth + margin * 2
+  const height = cardHeight + margin * 2
+
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.round(width * dpr)
+  canvas.height = Math.round(height * dpr)
+  const ctx = canvas.getContext('2d')
+  if (!ctx) {
+    onDone?.()
+    return
+  }
+  ctx.scale(dpr, dpr)
+
+  const fontStack = '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif'
+  const cardX = margin
+  const cardY = margin
+  const cardRadius = 28
+
+  function roundedRectPath(x, y, w, h, r) {
+    ctx.beginPath()
+    ctx.moveTo(x + r, y)
+    ctx.lineTo(x + w - r, y)
+    ctx.arcTo(x + w, y, x + w, y + r, r)
+    ctx.lineTo(x + w, y + h - r)
+    ctx.arcTo(x + w, y + h, x + w - r, y + h, r)
+    ctx.lineTo(x + r, y + h)
+    ctx.arcTo(x, y + h, x, y + h - r, r)
+    ctx.lineTo(x, y + r)
+    ctx.arcTo(x, y, x + r, y, r)
+    ctx.closePath()
+  }
+
+  try {
+    // 1. Drop shadow + white card base
+    ctx.save()
+    ctx.shadowColor = 'rgba(15, 23, 42, 0.30)'
+    ctx.shadowBlur = 40
+    ctx.shadowOffsetY = 20
+    ctx.fillStyle = '#ffffff'
+    roundedRectPath(cardX, cardY, cardWidth, cardHeight, cardRadius)
+    ctx.fill()
+    ctx.restore()
+
+    ctx.save()
+    roundedRectPath(cardX, cardY, cardWidth, cardHeight, cardRadius)
+    ctx.clip()
+
+    // 2. Header band
+    const headerHeight = 300
+    const headerGradient = ctx.createLinearGradient(cardX, cardY, cardX + cardWidth, cardY + headerHeight)
+    headerGradient.addColorStop(0, '#0f766e')
+    headerGradient.addColorStop(1, '#0d9488')
+    ctx.fillStyle = headerGradient
+    ctx.fillRect(cardX, cardY, cardWidth, headerHeight)
+
+    ctx.fillStyle = 'rgba(255,255,255,0.07)'
+    for (let dy = cardY + 20; dy < cardY + headerHeight; dy += 26) {
+      for (let dx = cardX + 20; dx < cardX + cardWidth; dx += 26) {
+        ctx.beginPath()
+        ctx.arc(dx, dy, 2, 0, Math.PI * 2)
+        ctx.fill()
+      }
+    }
+
+    ctx.textAlign = 'left'
+    ctx.fillStyle = 'rgba(204, 251, 241, 0.9)'
+    ctx.font = `700 13px ${fontStack}`
+    ctx.fillText('QUEUE TICKET', cardX + 36, cardY + 44)
+
+    ctx.textAlign = 'right'
+    ctx.font = `700 12px ${fontStack}`
+    const branchText = queue.branchLabel.toUpperCase()
+    ctx.fillText(
+      branchText.length > 26 ? branchText.slice(0, 24) + '…' : branchText,
+      cardX + cardWidth - 36,
+      cardY + 44
+    )
+
+    ctx.textAlign = 'center'
+    ctx.fillStyle = '#ffffff'
+    ctx.font = `800 92px ${fontStack}`
+    ctx.fillText(queue.code, cardX + cardWidth / 2, cardY + 192)
+
+    ctx.font = `600 15px ${fontStack}`
+    ctx.fillStyle = 'rgba(204, 251, 241, 0.9)'
+    ctx.fillText(queue.date, cardX + cardWidth / 2, cardY + 226)
+
+    // 3. Perforation seam with real punched notches (transparent cutouts)
+    const seamY = cardY + headerHeight
+    ctx.save()
+    ctx.globalCompositeOperation = 'destination-out'
+    ctx.beginPath()
+    ctx.arc(cardX, seamY, 18, 0, Math.PI * 2)
+    ctx.fill()
+    ctx.beginPath()
+    ctx.arc(cardX + cardWidth, seamY, 18, 0, Math.PI * 2)
+    ctx.fill()
+    ctx.restore()
+
+    ctx.strokeStyle = '#e2e8f0'
+    ctx.lineWidth = 2
+    ctx.setLineDash([8, 8])
+    ctx.beginPath()
+    ctx.moveTo(cardX + 34, seamY)
+    ctx.lineTo(cardX + cardWidth - 34, seamY)
+    ctx.stroke()
+    ctx.setLineDash([])
+
+    // 4. Details
+    let y = seamY + 54
+
+    function row(label, value) {
+      ctx.textAlign = 'left'
+      ctx.fillStyle = '#94a3b8'
+      ctx.font = `700 12px ${fontStack}`
+      ctx.fillText(label.toUpperCase(), cardX + 36, y)
+
+      ctx.fillStyle = '#0f172a'
+      ctx.font = `600 21px ${fontStack}`
+      const maxWidth = cardWidth - 72
+      const words = String(value ?? '—').split(' ')
+      let line = ''
+      let lineY = y + 27
+      for (const word of words) {
+        const test = line ? `${line} ${word}` : word
+        if (ctx.measureText(test).width > maxWidth && line) {
+          ctx.fillText(line, cardX + 36, lineY)
+          line = word
+          lineY += 27
+        } else {
+          line = test
+        }
+      }
+      ctx.fillText(line, cardX + 36, lineY)
+      y = lineY + 28
+    }
+
+    row('Collector', info.collectorName)
+    row('Pickup location', queue.branchLabel)
+    row('Payee', info.payee)
+    row('Payor', info.payor)
+    row('Checks reserved', String(info.count))
+    if (info.expiresAt) row('Pick up before', new Date(info.expiresAt).toLocaleString())
+
+    // 5. Footer note + barcode
+    ctx.strokeStyle = '#e2e8f0'
+    ctx.lineWidth = 1
+    ctx.beginPath()
+    ctx.moveTo(cardX + 36, y)
+    ctx.lineTo(cardX + cardWidth - 36, y)
+    ctx.stroke()
+    y += 26
+
+    ctx.textAlign = 'center'
+    ctx.fillStyle = '#64748b'
+    ctx.font = `600 14px ${fontStack}`
+    wrapCenteredText(
+      ctx,
+      'Keep this ticket and present it, with a valid ID, at the branch counter.',
+      cardX + cardWidth / 2,
+      y,
+      cardWidth - 90,
+      20
+    )
+
+    const bars = ticketBarcodeBars(queue.code)
+    const barcodeY = cardY + cardHeight - 56
+    let barX = cardX + (cardWidth - bars.length * 7) / 2
+    ctx.fillStyle = '#cbd5e1'
+    bars.forEach((h) => {
+      ctx.fillRect(barX, barcodeY - h, 3, h)
+      barX += 7
+    })
+
+    ctx.restore() // end clip
+  } catch (err) {
+    console.error('Ticket render failed:', err)
+    onDone?.()
+    return
+  }
+
+  canvas.toBlob((blob) => {
+    if (!blob) {
+      onDone?.()
+      return
+    }
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `queue-ticket-${queue.code}-${queue.date}.png`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+    onDone?.()
+  }, 'image/png')
+}
+
+function wrapCenteredText(ctx, text, cx, startY, maxWidth, lineHeight) {
+  const words = text.split(' ')
+  let line = ''
+  let y = startY
+  for (const word of words) {
+    const test = line ? `${line} ${word}` : word
+    if (ctx.measureText(test).width > maxWidth && line) {
+      ctx.fillText(line, cx, y)
+      line = word
+      y += lineHeight
+    } else {
+      line = test
+    }
+  }
+  if (line) ctx.fillText(line, cx, y)
+}
 function PromptState({ ready }) {
   return (
     <div className="slide-up flex flex-col items-center justify-center rounded-2xl border-2 border-dashed border-slate-200 bg-white px-6 py-24 text-center shadow-sm">
@@ -1935,7 +2800,7 @@ function PromptState({ ready }) {
       <p className="mt-3 max-w-sm text-base font-medium text-slate-500">
         {ready
           ? 'Tap "View available checks" above to see what\u2019s ready.'
-          : 'Select a bank and enter the payee and payor details above to locate items available for pickup.'}
+          : 'Enter the payee and payor details above to locate items available for pickup — bank is optional and, left blank, every bank is searched.'}
       </p>
     </div>
   )

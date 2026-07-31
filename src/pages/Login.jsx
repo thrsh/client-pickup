@@ -5,6 +5,17 @@
 // auth, where they're SENT is decided entirely by their actual
 // profiles.role, read from the database, never by anything in the URL or
 // form. RequireRole still gates every protected route on the real role.
+//
+// v3 — visual pass:
+//  - No gradients anywhere (solid fills only, per design direction).
+//  - Deliberate motion: entrance animation on load, a mode-switch
+//    transition between signin/otp/forgot, a shake on validation failure,
+//    a segmented animated OTP input, and consistent hover/press states.
+//  - Mandatory Data Privacy Act (RA 10173) + Terms & Conditions consent.
+//  - "Remember my email" (client-side only — never remembers a password),
+//    offline detection, in-app policy preview sheet.
+//  - prefers-reduced-motion is respected — all decorative animation is
+//    disabled for people who've asked their OS for that.
 import React, { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
@@ -17,6 +28,11 @@ import {
   CheckCircle2,
   KeyRound,
   ArrowLeft,
+  Check,
+  X,
+  WifiOff,
+  FileText,
+  ShieldAlert,
 } from 'lucide-react'
 import { supabase } from '../lib/supabaseClient'
 import { Input } from '../components/ui/input'
@@ -33,6 +49,53 @@ const MAX_RESENDS_BEFORE_SOFT_LOCK = 6
 const RESEND_STATE_RESET_MS = 30 * 60 * 1000 // resend-count backoff resets after 30 min of inactivity
 
 const OTP_STATE_STORAGE_KEY_PREFIX = 'csba_verifier_otp_state:'
+const REMEMBERED_EMAIL_KEY = 'csba_remembered_email'
+
+// ---------------------------------------------------------------------------
+// Local, scoped animation styles. Kept inline so this component doesn't
+// depend on custom keyframes being present in tailwind.config.js. All of it
+// is solid-color motion — no gradients — and every rule is neutralized
+// under prefers-reduced-motion.
+// ---------------------------------------------------------------------------
+function MotionStyles() {
+  return (
+    <style>{`
+      @keyframes csba-float {
+        0%, 100% { transform: translate(0, 0); }
+        50% { transform: translate(10px, -14px); }
+      }
+      @keyframes csba-accent-grow {
+        from { transform: scaleX(0); }
+        to { transform: scaleX(1); }
+      }
+      @keyframes csba-shake {
+        10%, 90% { transform: translateX(-1px); }
+        20%, 80% { transform: translateX(2px); }
+        30%, 50%, 70% { transform: translateX(-4px); }
+        40%, 60% { transform: translateX(4px); }
+      }
+      @keyframes csba-pop {
+        0% { transform: scale(0.5); opacity: 0; }
+        60% { transform: scale(1.12); opacity: 1; }
+        100% { transform: scale(1); opacity: 1; }
+      }
+      @keyframes csba-rise {
+        from { opacity: 0; transform: translateY(10px); }
+        to { opacity: 1; transform: translateY(0); }
+      }
+      .csba-float { animation: csba-float 10s ease-in-out infinite; }
+      .csba-accent { transform-origin: left center; animation: csba-accent-grow 600ms cubic-bezier(0.16,1,0.3,1) both; }
+      .csba-shake { animation: csba-shake 480ms cubic-bezier(.36,.07,.19,.97) both; }
+      .csba-pop { animation: csba-pop 220ms cubic-bezier(0.34,1.56,0.64,1) both; }
+      .csba-rise { animation: csba-rise 420ms cubic-bezier(0.16,1,0.3,1) both; }
+      @media (prefers-reduced-motion: reduce) {
+        .csba-float, .csba-accent, .csba-shake, .csba-pop, .csba-rise {
+          animation: none !important;
+        }
+      }
+    `}</style>
+  )
+}
 
 // ---------------------------------------------------------------------------
 // Resend state: { lastSentAt: number, count: number }
@@ -83,6 +146,28 @@ function clearOtpResendState(email) {
     window.localStorage.removeItem(OTP_STATE_STORAGE_KEY_PREFIX + normalizeEmail(email))
   } catch {
     // ignore
+  }
+}
+
+function getRememberedEmail() {
+  if (typeof window === 'undefined') return ''
+  try {
+    return window.localStorage.getItem(REMEMBERED_EMAIL_KEY) || ''
+  } catch {
+    return ''
+  }
+}
+
+function setRememberedEmail(email) {
+  if (typeof window === 'undefined') return
+  try {
+    if (email) {
+      window.localStorage.setItem(REMEMBERED_EMAIL_KEY, normalizeEmail(email))
+    } else {
+      window.localStorage.removeItem(REMEMBERED_EMAIL_KEY)
+    }
+  } catch {
+    // ignore — non-critical convenience feature
   }
 }
 
@@ -180,6 +265,224 @@ async function recordServerAttempt(email, stage, success) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Legal copy for the in-app preview sheet. Placeholder body text — swap in
+// your actual DPO-approved Data Privacy Notice and Terms & Conditions before
+// shipping. Kept as plain components so the sheet can render either without
+// a network round trip (and without ever blocking sign-in on a fetch).
+// ---------------------------------------------------------------------------
+function DataPrivacyNoticeBody() {
+  return (
+    <>
+      <p>
+        CSBA collects and processes the personal data you provide on this portal (name, email
+        address, role, and login activity) solely to authenticate your identity, maintain audit
+        records, and administer your account.
+      </p>
+      <p>
+        Your data is processed in accordance with the Data Privacy Act of 2012 (Republic Act No.
+        10173) and its Implementing Rules and Regulations. It is retained only for as long as
+        necessary for these purposes, stored with administrative and technical safeguards, and
+        never sold or shared with third parties for marketing purposes.
+      </p>
+      <p>
+        You may request access to, correction of, or deletion of your personal data, subject to
+        our recordkeeping obligations, by contacting the Data Protection Officer.
+      </p>
+    </>
+  )
+}
+
+function TermsOfUseBody() {
+  return (
+    <>
+      <p>
+        Access to this portal is limited to authorized CSBA personnel. Your account credentials
+        are personal to you — do not share your password or verification codes with anyone,
+        including colleagues or support staff.
+      </p>
+      <p>
+        You agree to use this system only for its intended administrative purpose, to keep your
+        account information accurate, and to report any suspected unauthorized access
+        immediately.
+      </p>
+      <p>
+        Login activity, including timestamps and general device information, is logged for
+        security auditing. Misuse of this system may result in account suspension and further
+        action under applicable law.
+      </p>
+    </>
+  )
+}
+
+// Bottom-sheet on mobile, centered dialog on larger screens. Self-contained
+// (no external dialog dependency) so it works regardless of which shadcn
+// primitives are already generated in this project.
+function NoticeSheet({ notice, onClose }) {
+  const closeButtonRef = useRef(null)
+
+  useEffect(() => {
+    if (!notice) return
+    closeButtonRef.current?.focus()
+    function onKeyDown(e) {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    const prevOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    return () => {
+      window.removeEventListener('keydown', onKeyDown)
+      document.body.style.overflow = prevOverflow
+    }
+  }, [notice, onClose])
+
+  if (!notice) return null
+
+  const title = notice === 'privacy' ? 'Data Privacy Notice' : 'Terms & Conditions of Use'
+  const Icon = notice === 'privacy' ? ShieldAlert : FileText
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-end justify-center bg-gray-900/50 backdrop-blur-sm sm:items-center sm:p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="notice-sheet-title"
+      onClick={onClose}
+    >
+      <div
+        className="animate-in slide-in-from-bottom-6 sm:zoom-in-95 sm:slide-in-from-bottom-0 flex max-h-[85vh] w-full flex-col overflow-hidden rounded-t-2xl bg-white shadow-2xl duration-200 sm:max-w-lg sm:rounded-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mx-auto mt-2.5 h-1 w-10 shrink-0 rounded-full bg-gray-200 sm:hidden" />
+
+        <div className="flex shrink-0 items-center justify-between gap-4 border-b border-gray-100 px-5 pb-4 pt-3 sm:px-6 sm:pt-5">
+          <div className="flex items-center gap-2.5">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-teal-50 text-teal-600">
+              <Icon className="h-4 w-4" />
+            </div>
+            <h3 id="notice-sheet-title" className="text-base font-semibold text-gray-900">
+              {title}
+            </h3>
+          </div>
+          <button
+            ref={closeButtonRef}
+            type="button"
+            onClick={onClose}
+            className="rounded-full p-1.5 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500"
+            aria-label="Close"
+          >
+            <X className="h-4.5 w-4.5" />
+          </button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto px-5 py-4 text-sm leading-relaxed text-gray-600 sm:px-6 sm:py-5">
+          {notice === 'privacy' ? <DataPrivacyNoticeBody /> : <TermsOfUseBody />}
+        </div>
+
+        <div className="shrink-0 border-t border-gray-100 px-5 py-4 sm:px-6">
+          <Button
+            type="button"
+            onClick={onClose}
+            className="w-full bg-teal-600 text-white shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:bg-teal-700 hover:shadow-md active:translate-y-0 focus-visible:ring-teal-500"
+          >
+            I understand
+          </Button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// Accessible, dependency-free checkbox styled to match shadcn/ui's visual
+// language (rounded-md, ring-based focus state, teal fill on check, and a
+// small pop when it becomes checked). Swap for ../components/ui/checkbox
+// if you've already generated that primitive — the markup contract
+// (checked/onChange) is the same either way.
+function ConsentCheckbox({ id, checked, onChange, invalid, children }) {
+  return (
+    <label
+      htmlFor={id}
+      className="group flex cursor-pointer select-none items-start gap-3 rounded-lg p-1 -m-1 transition-colors active:bg-gray-100"
+    >
+      <span className="relative mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center">
+        <input
+          id={id}
+          type="checkbox"
+          className="peer sr-only"
+          checked={checked}
+          onChange={onChange}
+          aria-invalid={invalid || undefined}
+        />
+        <span
+          className={cn(
+            'h-5 w-5 rounded-md border-2 bg-white transition-colors duration-150',
+            'peer-checked:border-teal-600 peer-checked:bg-teal-600',
+            'peer-focus-visible:ring-2 peer-focus-visible:ring-teal-500 peer-focus-visible:ring-offset-2',
+            invalid ? 'border-red-300' : 'border-gray-300 group-hover:border-teal-400'
+          )}
+        />
+        {checked && (
+          <Check
+            className="csba-pop pointer-events-none absolute h-3.5 w-3.5 text-white"
+            strokeWidth={3}
+          />
+        )}
+      </span>
+      <span className="text-[13px] leading-relaxed text-gray-600">{children}</span>
+    </label>
+  )
+}
+
+// Segmented, animated OTP field: six boxes rendered from one hidden input so
+// typing, backspace, and pasting a full code all behave normally, while each
+// digit pops in as it lands. Replaces a plain letter-spaced text input with
+// something that actually shows progress.
+function OtpBoxes({ value, onChange, disabled, inputRef, invalid }) {
+  return (
+    <div className="relative">
+      <input
+        ref={inputRef}
+        id="otp"
+        name="otp"
+        type="text"
+        inputMode="numeric"
+        autoComplete="one-time-code"
+        maxLength={OTP_LENGTH}
+        value={value}
+        onChange={onChange}
+        disabled={disabled}
+        aria-label="6-digit verification code"
+        className="absolute inset-0 h-full w-full cursor-text opacity-0 disabled:cursor-not-allowed"
+      />
+      <div className="flex justify-between gap-1.5 sm:gap-2" aria-hidden="true">
+        {Array.from({ length: OTP_LENGTH }).map((_, i) => {
+          const char = value[i]
+          const isNextToFill = i === value.length
+          return (
+            <div
+              key={i}
+              className={cn(
+                'flex h-12 flex-1 items-center justify-center rounded-lg border-2 bg-white text-lg font-semibold text-gray-800 transition-colors duration-150 sm:h-14',
+                char ? 'border-teal-600' : 'border-gray-200',
+                isNextToFill && !disabled && !char && 'border-teal-400',
+                invalid && 'border-red-300'
+              )}
+            >
+              {char ? (
+                <span key={char + '-' + i} className="csba-pop">
+                  {char}
+                </span>
+              ) : null}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+// Single shared login for every role — same form for admin, verifier, and
+// approver accounts.
 export default function Login() {
   const portal = PORTAL_LABEL
 
@@ -195,6 +498,26 @@ export default function Login() {
   const [failedAttempts, setFailedAttempts] = useState(0)
   const [logoError, setLogoError] = useState(false)
   const [checkingExistingSession, setCheckingExistingSession] = useState(true)
+
+  // Consent — required every sign-in, independent of the credentials
+  // themselves, so accepting old terms never silently carries forward.
+  const [consents, setConsents] = useState({ privacy: false, terms: false })
+  const [consentError, setConsentError] = useState('')
+  const [activeNotice, setActiveNotice] = useState(null) // 'privacy' | 'terms' | null
+
+  // Bumped on every validation/auth failure so the relevant panel can
+  // replay its shake animation, including on repeated identical errors.
+  const [shakeTick, setShakeTick] = useState(0)
+  const [otpShakeTick, setOtpShakeTick] = useState(0)
+
+  // Convenience — remembers only the email locally, never the password.
+  const [rememberEmail, setRememberEmail] = useState(false)
+
+  // Connectivity — surfaces a clear reason when requests would otherwise
+  // just hang, instead of leaving people staring at a spinner.
+  const [isOnline, setIsOnline] = useState(
+    typeof navigator === 'undefined' ? true : navigator.onLine
+  )
 
   // OTP-specific state
   const [otp, setOtp] = useState('')
@@ -215,6 +538,33 @@ export default function Login() {
 
   const isSecureConnection =
     typeof window !== 'undefined' && window.location.protocol === 'https:'
+
+  // Prefill a remembered email (client-side convenience only — password is
+  // never stored).
+  useEffect(() => {
+    const remembered = getRememberedEmail()
+    if (remembered) {
+      setEmail(remembered)
+      setRememberEmail(true)
+    }
+  }, [])
+
+  // Track connectivity so the UI can explain a stalled request instead of
+  // leaving a spinner running indefinitely.
+  useEffect(() => {
+    function goOnline() {
+      setIsOnline(true)
+    }
+    function goOffline() {
+      setIsOnline(false)
+    }
+    window.addEventListener('online', goOnline)
+    window.addEventListener('offline', goOffline)
+    return () => {
+      window.removeEventListener('online', goOnline)
+      window.removeEventListener('offline', goOffline)
+    }
+  }, [])
 
   // If someone already has a live session and lands on this page (e.g. a
   // stale bookmark, or clicking back after signing in), send them straight
@@ -310,7 +660,24 @@ export default function Login() {
     const emailErr = validateEmail(email)
     const passwordErr = validatePassword(password)
     setFieldErrors({ email: emailErr, password: passwordErr })
-    if (emailErr || passwordErr) return
+
+    const missingConsent = !consents.privacy || !consents.terms
+    setConsentError(
+      missingConsent
+        ? 'Please accept the Data Privacy Notice and Terms & Conditions to continue.'
+        : ''
+    )
+
+    if (emailErr || passwordErr || missingConsent) {
+      setShakeTick((t) => t + 1)
+      return
+    }
+
+    if (!isOnline) {
+      setError('You appear to be offline. Reconnect and try again.')
+      setShakeTick((t) => t + 1)
+      return
+    }
 
     const trimmedEmail = normalizeEmail(email)
     setError('')
@@ -326,6 +693,7 @@ export default function Login() {
           ? `Too many failed attempts. Try again in ${lockout.retryAfterMinutes} minute(s).`
           : 'Too many failed attempts. Please try again later.'
       )
+      setShakeTick((t) => t + 1)
       return
     }
 
@@ -338,11 +706,13 @@ export default function Login() {
       setLoading(false)
       setError(friendlyAuthError(signInError.message))
       setFailedAttempts((n) => n + 1)
+      setShakeTick((t) => t + 1)
       recordServerAttempt(trimmedEmail, 'password', false)
       return
     }
 
     recordServerAttempt(trimmedEmail, 'password', true)
+    setRememberedEmail(rememberEmail ? trimmedEmail : '')
 
     // Password confirmed correct — but don't trust this session until OTP passes.
     await supabase.auth.signOut()
@@ -359,6 +729,7 @@ export default function Login() {
 
     if (otpSendError) {
       setError(friendlyAuthError(otpSendError.message))
+      setShakeTick((t) => t + 1)
       return
     }
 
@@ -376,6 +747,13 @@ export default function Login() {
   async function submitOtp(code) {
     if (!/^\d{6}$/.test(code)) {
       setOtpError('Enter the 6-digit code.')
+      setOtpShakeTick((t) => t + 1)
+      return
+    }
+
+    if (!isOnline) {
+      setOtpError('You appear to be offline. Reconnect and try again.')
+      setOtpShakeTick((t) => t + 1)
       return
     }
 
@@ -392,6 +770,7 @@ export default function Login() {
           ? `Too many failed codes. Try again in ${lockout.retryAfterMinutes} minute(s).`
           : 'Too many failed codes. Please try again later.'
       )
+      setOtpShakeTick((t) => t + 1)
       return
     }
 
@@ -406,6 +785,7 @@ export default function Login() {
       setOtpFailedAttempts((n) => n + 1)
       setOtp('')
       setOtpError(friendlyAuthError(verifyError.message))
+      setOtpShakeTick((t) => t + 1)
       recordServerAttempt(trimmedEmail, 'otp', false)
       return
     }
@@ -478,6 +858,7 @@ export default function Login() {
     if (count >= MAX_RESENDS_BEFORE_SOFT_LOCK) {
       setResendsExhausted(true)
       setOtpError('Too many code requests. Please go back and sign in again in a few minutes.')
+      setOtpShakeTick((t) => t + 1)
       return
     }
 
@@ -504,6 +885,7 @@ export default function Login() {
 
     if (otpSendError) {
       setOtpError(friendlyAuthError(otpSendError.message))
+      setOtpShakeTick((t) => t + 1)
 
       // Only release the reserved cooldown for genuine local failures
       // (e.g. the request never reached Supabase). If Supabase itself
@@ -527,7 +909,16 @@ export default function Login() {
 
     const emailErr = validateEmail(email)
     setFieldErrors((f) => ({ ...f, email: emailErr }))
-    if (emailErr) return
+    if (emailErr) {
+      setShakeTick((t) => t + 1)
+      return
+    }
+
+    if (!isOnline) {
+      setError('You appear to be offline. Reconnect and try again.')
+      setShakeTick((t) => t + 1)
+      return
+    }
 
     setError('')
     setLoading(true)
@@ -542,6 +933,7 @@ export default function Login() {
 
     if (resetError) {
       setError(friendlyAuthError(resetError.message))
+      setShakeTick((t) => t + 1)
       return
     }
     setMode('forgot-sent')
@@ -556,14 +948,28 @@ export default function Login() {
   }
 
   return (
-    <div className="relative flex min-h-[80vh] items-center justify-center overflow-hidden bg-gray-50/50 px-4 py-12 sm:px-6 lg:px-8">
-      {/* Soft ambient brand color, kept subtle so the page still reads as a secure tool */}
-      <div className="pointer-events-none absolute -top-24 -left-24 h-72 w-72 rounded-full bg-teal-200/30 blur-3xl" />
-      <div className="pointer-events-none absolute -bottom-24 -right-24 h-72 w-72 rounded-full bg-orange-200/25 blur-3xl" />
+    <div className="relative flex min-h-[100dvh] items-center justify-center overflow-hidden bg-gray-50 px-4 py-10 sm:min-h-[80vh] sm:px-6 sm:py-12 lg:px-8">
+      <MotionStyles />
 
-      <Card className="relative w-full max-w-md overflow-hidden border-0 shadow-xl sm:border sm:border-gray-100">
-        {/* Brand accent line, teal-to-orange, at the top of the card */}
-        <div className="h-1.5 w-full bg-gradient-to-r from-teal-600 via-teal-500 to-orange-500" />
+      {/* One quiet, slow-drifting solid shape instead of a cluster of
+          blurred gradient blobs — a single deliberate accent, not decoration. */}
+      <div
+        className="csba-float pointer-events-none absolute -top-16 -left-16 h-64 w-64 rounded-full bg-teal-100/60 blur-3xl"
+        aria-hidden="true"
+      />
+
+      <Card className="csba-rise relative w-full max-w-md overflow-hidden border border-gray-200 bg-white shadow-[0_1px_2px_rgba(0,0,0,0.04),0_12px_32px_rgba(15,23,42,0.08)]">
+        {/* Solid brand accent — grows in on load instead of a blended gradient bar */}
+        <div className="flex h-1 w-full overflow-hidden bg-gray-100">
+          <div className="csba-accent h-full w-full bg-teal-600" />
+        </div>
+
+        {!isOnline && (
+          <div className="flex items-center justify-center gap-2 bg-amber-50 px-4 py-2 text-xs font-medium text-amber-700">
+            <WifiOff className="h-3.5 w-3.5 shrink-0" />
+            You're offline — reconnect to sign in.
+          </div>
+        )}
 
         <CardHeader className="items-center space-y-4 pt-8 text-center">
           <div className="flex flex-col items-center justify-center gap-3">
@@ -571,11 +977,11 @@ export default function Login() {
               <img
                 src="https://csba.ph/logo.png"
                 alt="CSBA logo"
-                className="h-32 w-32 object-contain drop-shadow-sm"
+                className="h-32 w-32 object-contain"
                 onError={() => setLogoError(true)}
               />
             ) : (
-              <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-teal-600 text-base font-bold tracking-wide text-white">
+              <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-teal-600 text-base font-bold tracking-wide text-white transition-transform duration-200 hover:scale-105">
                 CSBA
               </div>
             )}
@@ -607,7 +1013,11 @@ export default function Login() {
 
         <CardContent className="px-6 pb-8 sm:px-8">
           {mode === 'signin' && (
-            <form onSubmit={handleSubmit} noValidate className="flex flex-col gap-4">
+            <form
+              onSubmit={handleSubmit}
+              noValidate
+              className="csba-rise flex flex-col gap-4"
+            >
               <div className="space-y-1.5">
                 <label htmlFor="email" className="text-sm font-medium text-gray-700">
                   Email Address
@@ -627,12 +1037,12 @@ export default function Login() {
                   aria-invalid={!!fieldErrors.email}
                   aria-describedby={fieldErrors.email ? 'email-error' : undefined}
                   className={cn(
-                    'transition-shadow focus-visible:ring-teal-500',
+                    'text-base transition-shadow duration-150 focus-visible:ring-teal-500 sm:text-sm',
                     fieldErrors.email && 'border-red-300 focus-visible:ring-red-400'
                   )}
                 />
                 {fieldErrors.email && (
-                  <p id="email-error" className="flex items-center gap-1 text-xs text-red-600">
+                  <p id="email-error" className="csba-rise flex items-center gap-1 text-xs text-red-600">
                     <AlertCircle className="h-3 w-3 shrink-0" />
                     {fieldErrors.email}
                   </p>
@@ -647,7 +1057,7 @@ export default function Login() {
                   <button
                     type="button"
                     onClick={goToForgotPassword}
-                    className="text-xs font-medium text-teal-600 hover:text-teal-700 hover:underline"
+                    className="text-xs font-medium text-teal-600 transition-colors hover:text-teal-700 hover:underline"
                   >
                     Forgot password?
                   </button>
@@ -673,38 +1083,108 @@ export default function Login() {
                     aria-invalid={!!fieldErrors.password}
                     aria-describedby={fieldErrors.password ? 'password-error' : undefined}
                     className={cn(
-                      'pr-10 transition-shadow focus-visible:ring-teal-500',
+                      'pr-10 text-base transition-shadow duration-150 focus-visible:ring-teal-500 sm:text-sm',
                       fieldErrors.password && 'border-red-300 focus-visible:ring-red-400'
                     )}
                   />
                   <button
                     type="button"
                     onClick={() => setShowPassword((v) => !v)}
-                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 transition-colors hover:text-gray-600"
                     aria-label={showPassword ? 'Hide password' : 'Show password'}
                   >
                     {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                   </button>
                 </div>
                 {fieldErrors.password && (
-                  <p id="password-error" className="flex items-center gap-1 text-xs text-red-600">
+                  <p id="password-error" className="csba-rise flex items-center gap-1 text-xs text-red-600">
                     <AlertCircle className="h-3 w-3 shrink-0" />
                     {fieldErrors.password}
                   </p>
                 )}
                 {capsLockOn && (
-                  <p className="flex items-center gap-1 text-xs text-orange-600">
+                  <p className="csba-rise flex items-center gap-1 text-xs text-orange-600">
                     <AlertCircle className="h-3 w-3 shrink-0" />
                     Caps Lock is on
                   </p>
                 )}
               </div>
 
+              <label className="flex w-fit items-center gap-2 text-xs text-gray-500">
+                <input
+                  type="checkbox"
+                  checked={rememberEmail}
+                  onChange={(e) => setRememberEmail(e.target.checked)}
+                  className="h-3.5 w-3.5 rounded border-gray-300 text-teal-600 transition-colors focus-visible:ring-2 focus-visible:ring-teal-500"
+                />
+                Remember my email on this device
+              </label>
+
+              {/* Data Privacy Act + Terms consent — required to proceed */}
+              <div
+                key={`consent-${shakeTick}`}
+                className={cn(
+                  'space-y-3 rounded-xl border p-3.5 transition-colors duration-200',
+                  consentError
+                    ? 'border-red-200 bg-red-50/50 csba-shake'
+                    : 'border-gray-200 bg-gray-50/60'
+                )}
+              >
+                <ConsentCheckbox
+                  id="consent-privacy"
+                  checked={consents.privacy}
+                  invalid={!!consentError && !consents.privacy}
+                  onChange={(e) => {
+                    setConsents((c) => ({ ...c, privacy: e.target.checked }))
+                    setConsentError('')
+                  }}
+                >
+                  I consent to the collection and processing of my personal data as described in
+                  the{' '}
+                  <button
+                    type="button"
+                    onClick={() => setActiveNotice('privacy')}
+                    className="font-medium text-teal-700 underline underline-offset-2 hover:text-teal-800"
+                  >
+                    Data Privacy Notice
+                  </button>
+                  , in accordance with the Data Privacy Act of 2012 (RA 10173).
+                </ConsentCheckbox>
+
+                <ConsentCheckbox
+                  id="consent-terms"
+                  checked={consents.terms}
+                  invalid={!!consentError && !consents.terms}
+                  onChange={(e) => {
+                    setConsents((c) => ({ ...c, terms: e.target.checked }))
+                    setConsentError('')
+                  }}
+                >
+                  I have read and agree to the{' '}
+                  <button
+                    type="button"
+                    onClick={() => setActiveNotice('terms')}
+                    className="font-medium text-teal-700 underline underline-offset-2 hover:text-teal-800"
+                  >
+                    Terms & Conditions
+                  </button>{' '}
+                  of use of this portal.
+                </ConsentCheckbox>
+
+                {consentError && (
+                  <p className="flex items-center gap-1.5 text-xs text-red-600">
+                    <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+                    {consentError}
+                  </p>
+                )}
+              </div>
+
               {error && (
                 <div
+                  key={`error-${shakeTick}`}
                   role="alert"
                   aria-live="assertive"
-                  className="flex items-center gap-2 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-600 animate-in fade-in slide-in-from-top-1"
+                  className="csba-shake flex items-center gap-2 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-600"
                 >
                   <AlertCircle className="h-4 w-4 shrink-0" />
                   <p>{error}</p>
@@ -712,7 +1192,7 @@ export default function Login() {
               )}
 
               {failedAttempts >= 3 && (
-                <div className="flex items-start gap-2 rounded-md border border-teal-200 bg-teal-50 p-3 text-xs text-teal-800">
+                <div className="csba-rise flex items-start gap-2 rounded-md border border-teal-200 bg-teal-50 p-3 text-xs text-teal-800">
                   <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                   <p>
                     Still having trouble signing in?{' '}
@@ -730,9 +1210,9 @@ export default function Login() {
 
               <Button
                 type="submit"
-                disabled={loading}
+                disabled={loading || !isOnline}
                 aria-busy={loading}
-                className="mt-2 w-full bg-teal-600 text-white shadow-sm transition-colors hover:bg-teal-700 focus-visible:ring-teal-500 disabled:opacity-60"
+                className="mt-1 h-11 w-full bg-teal-600 text-base font-medium text-white shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:bg-teal-700 hover:shadow-md focus-visible:ring-teal-500 active:translate-y-0 active:scale-[0.99] disabled:translate-y-0 disabled:opacity-60 disabled:shadow-sm sm:text-sm"
               >
                 {loading ? 'Signing in\u2026' : 'Sign in'}
               </Button>
@@ -740,30 +1220,20 @@ export default function Login() {
           )}
 
           {mode === 'otp' && (
-            <form onSubmit={handleOtpSubmit} noValidate className="flex flex-col gap-4">
+            <form onSubmit={handleOtpSubmit} noValidate className="csba-rise flex flex-col gap-4">
               <div className="space-y-1.5">
                 <label htmlFor="otp" className="text-sm font-medium text-gray-700">
                   Verification code
                 </label>
-                <Input
-                  id="otp"
-                  name="otp"
-                  ref={otpInputRef}
-                  type="text"
-                  inputMode="numeric"
-                  autoComplete="one-time-code"
-                  maxLength={OTP_LENGTH}
-                  value={otp}
-                  onChange={handleOtpChange}
-                  disabled={loading || resendsExhausted}
-                  placeholder="123456"
-                  aria-invalid={!!otpError}
-                  aria-describedby={otpError ? 'otp-error' : undefined}
-                  className={cn(
-                    'text-center text-lg tracking-[0.5em] transition-shadow focus-visible:ring-teal-500',
-                    otpError && 'border-red-300 focus-visible:ring-red-400'
-                  )}
-                />
+                <div key={`otp-${otpShakeTick}`} className={otpError ? 'csba-shake' : undefined}>
+                  <OtpBoxes
+                    value={otp}
+                    onChange={handleOtpChange}
+                    disabled={loading || resendsExhausted}
+                    inputRef={otpInputRef}
+                    invalid={!!otpError}
+                  />
+                </div>
                 {otpError && (
                   <p id="otp-error" className="flex items-center gap-1 text-xs text-red-600">
                     <AlertCircle className="h-3 w-3 shrink-0" />
@@ -773,7 +1243,7 @@ export default function Login() {
               </div>
 
               {otpFailedAttempts >= 3 && (
-                <div className="flex items-start gap-2 rounded-md border border-teal-200 bg-teal-50 p-3 text-xs text-teal-800">
+                <div className="csba-rise flex items-start gap-2 rounded-md border border-teal-200 bg-teal-50 p-3 text-xs text-teal-800">
                   <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                   <p>
                     Still not working? Make sure you're using the most recent code sent to your
@@ -784,9 +1254,9 @@ export default function Login() {
 
               <Button
                 type="submit"
-                disabled={loading || otp.length !== OTP_LENGTH || resendsExhausted}
+                disabled={loading || otp.length !== OTP_LENGTH || resendsExhausted || !isOnline}
                 aria-busy={loading}
-                className="w-full bg-teal-600 text-white shadow-sm transition-colors hover:bg-teal-700 focus-visible:ring-teal-500 disabled:opacity-60"
+                className="h-11 w-full bg-teal-600 text-base font-medium text-white shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:bg-teal-700 hover:shadow-md focus-visible:ring-teal-500 active:translate-y-0 active:scale-[0.99] disabled:translate-y-0 disabled:opacity-60 sm:text-sm"
               >
                 <KeyRound className="mr-2 h-4 w-4" />
                 {loading ? 'Verifying\u2026' : 'Verify & sign in'}
@@ -796,7 +1266,7 @@ export default function Login() {
                 type="button"
                 onClick={handleResendOtp}
                 disabled={resendCooldown > 0 || loading || otpSendingRef.current || resendsExhausted}
-                className="text-center text-sm font-medium text-teal-600 hover:text-teal-700 disabled:cursor-not-allowed disabled:text-gray-400"
+                className="text-center text-sm font-medium text-teal-600 transition-colors hover:text-teal-700 disabled:cursor-not-allowed disabled:text-gray-400"
               >
                 {resendsExhausted
                   ? 'Too many requests \u2014 sign in again shortly'
@@ -808,7 +1278,7 @@ export default function Login() {
               <button
                 type="button"
                 onClick={goToSignIn}
-                className="flex items-center justify-center gap-1 text-center text-sm font-medium text-gray-500 hover:text-gray-700"
+                className="flex items-center justify-center gap-1 text-center text-sm font-medium text-gray-500 transition-colors hover:text-gray-700"
               >
                 <ArrowLeft className="h-3.5 w-3.5" />
                 Back to sign in
@@ -817,7 +1287,7 @@ export default function Login() {
           )}
 
           {mode === 'forgot-form' && (
-            <form onSubmit={handleForgotSubmit} noValidate className="flex flex-col gap-4">
+            <form onSubmit={handleForgotSubmit} noValidate className="csba-rise flex flex-col gap-4">
               <div className="space-y-1.5">
                 <label htmlFor="reset-email" className="text-sm font-medium text-gray-700">
                   Email Address
@@ -837,12 +1307,12 @@ export default function Login() {
                   aria-invalid={!!fieldErrors.email}
                   aria-describedby={fieldErrors.email ? 'reset-email-error' : undefined}
                   className={cn(
-                    'transition-shadow focus-visible:ring-teal-500',
+                    'text-base transition-shadow duration-150 focus-visible:ring-teal-500 sm:text-sm',
                     fieldErrors.email && 'border-red-300 focus-visible:ring-red-400'
                   )}
                 />
                 {fieldErrors.email && (
-                  <p id="reset-email-error" className="flex items-center gap-1 text-xs text-red-600">
+                  <p id="reset-email-error" className="csba-rise flex items-center gap-1 text-xs text-red-600">
                     <AlertCircle className="h-3 w-3 shrink-0" />
                     {fieldErrors.email}
                   </p>
@@ -851,9 +1321,10 @@ export default function Login() {
 
               {error && (
                 <div
+                  key={`error-${shakeTick}`}
                   role="alert"
                   aria-live="assertive"
-                  className="flex items-center gap-2 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-600 animate-in fade-in slide-in-from-top-1"
+                  className="csba-shake flex items-center gap-2 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-600"
                 >
                   <AlertCircle className="h-4 w-4 shrink-0" />
                   <p>{error}</p>
@@ -862,9 +1333,9 @@ export default function Login() {
 
               <Button
                 type="submit"
-                disabled={loading}
+                disabled={loading || !isOnline}
                 aria-busy={loading}
-                className="mt-2 w-full bg-teal-600 text-white shadow-sm transition-colors hover:bg-teal-700 focus-visible:ring-teal-500 disabled:opacity-60"
+                className="mt-2 h-11 w-full bg-teal-600 text-base font-medium text-white shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:bg-teal-700 hover:shadow-md focus-visible:ring-teal-500 active:translate-y-0 active:scale-[0.99] sm:text-sm"
               >
                 <Mail className="mr-2 h-4 w-4" />
                 {loading ? 'Sending link\u2026' : 'Send reset link'}
@@ -873,7 +1344,7 @@ export default function Login() {
               <button
                 type="button"
                 onClick={goToSignIn}
-                className="text-center text-sm font-medium text-gray-500 hover:text-gray-700"
+                className="text-center text-sm font-medium text-gray-500 transition-colors hover:text-gray-700"
               >
                 Back to sign in
               </button>
@@ -881,9 +1352,9 @@ export default function Login() {
           )}
 
           {mode === 'forgot-sent' && (
-            <div className="flex flex-col gap-4">
+            <div className="csba-rise flex flex-col gap-4">
               <div className="flex items-start gap-2 rounded-md border border-teal-200 bg-teal-50 p-3 text-sm text-teal-800">
-                <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
+                <CheckCircle2 className="csba-pop mt-0.5 h-4 w-4 shrink-0" />
                 <p>
                   Sent to <span className="font-medium">{normalizeEmail(email)}</span>. Didn\u2019t
                   get it? Check your spam folder, or try again in a few minutes.
@@ -892,7 +1363,7 @@ export default function Login() {
               <Button
                 type="button"
                 onClick={goToSignIn}
-                className="w-full bg-teal-600 text-white shadow-sm transition-colors hover:bg-teal-700 focus-visible:ring-teal-500"
+                className="h-11 w-full bg-teal-600 text-base font-medium text-white shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:bg-teal-700 hover:shadow-md focus-visible:ring-teal-500 active:translate-y-0 sm:text-sm"
               >
                 Back to sign in
               </Button>
@@ -902,14 +1373,22 @@ export default function Login() {
           <p className="mt-8 text-center text-xs text-gray-400">
             Authorized personnel only. Accounts are managed by CSBA.
           </p>
-          {isSecureConnection && (
-            <p className="mt-2 flex items-center justify-center gap-1.5 text-[11px] text-gray-400">
-              <Lock className="h-3 w-3" />
-              Connection encrypted
+          <div className="mt-2 flex flex-wrap items-center justify-center gap-x-3 gap-y-1">
+            {isSecureConnection && (
+              <p className="flex items-center gap-1.5 text-[11px] text-gray-400">
+                <Lock className="h-3 w-3" />
+                Connection encrypted
+              </p>
+            )}
+            <p className="flex items-center gap-1.5 text-[11px] text-gray-400">
+              <ShieldCheck className="h-3 w-3" />
+              RA 10173 compliant
             </p>
-          )}
+          </div>
         </CardContent>
       </Card>
+
+      <NoticeSheet notice={activeNotice} onClose={() => setActiveNotice(null)} />
     </div>
   )
 }
