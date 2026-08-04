@@ -9,13 +9,35 @@
 // validates against staled_check_reports.check_ids server-side with row
 // locking and per-check optimistic-concurrency guards.
 //
-// Branch scoping: profiles.branch stores machine-readable codes
-// (csba_parqal / csba_bgc / all_branches); checks.pickup_branch stores the
-// human-readable label collectors/verifiers actually typed. BRANCH_CODE_TO_LABEL
-// is the single translation point between the two — update it there if
-// either vocabulary changes. The corresponding Postgres RLS policy on
-// `checks` must apply the same translation; a client-side filter alone is
-// not the access boundary.
+// BRANCH SCOPING
+// profiles.branch stores a machine code (csba_parqal / csba_bgc /
+// all_branches); checks.pickup_branch stores the human-readable label.
+// BRANCH_CODE_TO_LABEL is the single translation point. The Postgres RLS
+// policy on `checks` must apply the same translation — this client-side
+// filter is defense in depth, not the access boundary.
+//
+// staled_check_reports has no branch column of its own — a report is
+// scoped by the branch of the checks it references. That means the
+// report-level query below can't be branch-filtered server-side, so a
+// page of reports can come back with zero checks visible to a
+// branch-locked approver purely by chance. See PAGINATION below for how
+// that's handled without leaving "Load more" looking broken.
+//
+// COUNT / BADGE
+// The tab badge (via `onSynced`) is derived reactively from the checks
+// actually present in `groups` — never from the raw report-level server
+// count — so the badge can never show a number the rendered list doesn't
+// back up.
+//
+// PAGINATION
+// Reports are paginated (REPORT_PAGE_SIZE at a time); the checks table is
+// then queried by id and branch-filtered. If a fetched page of reports
+// yields zero visible checks for a branch-locked approver and more pages
+// exist, the loader keeps fetching subsequent pages automatically (capped
+// by MAX_AUTO_PAGE_FETCHES) until it finds a non-empty page or runs out —
+// so a click on "Load more" (or the initial load) doesn't appear to do
+// nothing just because the next 50 reports happened to belong to another
+// branch.
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
@@ -32,14 +54,11 @@ import { formatCurrency, formatDate, cn } from '../../lib/utils'
 import { useProfile, hasRole } from '../../context/ProfileContext'
 import { STALE_BUCKETS, getStaleBucket } from '../../lib/staleChecks'
 
-// ---------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------
-
 const STALE_LINK_COLUMN = 'report_number'
 const BRANCH_COLUMN = 'pickup_branch'
 
-const PAGE_SIZE = 100
+const REPORT_PAGE_SIZE = 50
+const MAX_AUTO_PAGE_FETCHES = 6
 const POLL_INTERVAL_MS = 20000
 const SUCCESS_FLASH_MS = 900
 const ALLOWED_ROLES = ['approver', 'admin']
@@ -52,7 +71,6 @@ const SEARCH_DEBOUNCE_MS = 250
 const UNSPECIFIED_BRANCH = 'No branch on file'
 const UNSPECIFIED_BANK = 'Unspecified bank'
 
-// profiles.branch (code) -> checks.pickup_branch (label)
 const BRANCH_CODE_TO_LABEL = {
   csba_parqal: 'CSBA - PARQAL',
   csba_bgc: 'CSBA - BGC',
@@ -63,7 +81,7 @@ const SELECT_COLUMNS =
   'id, status, payee, payor, check_no, check_date, amount, bank, pickup_branch, form_2307_attached, submitted_by_name, submitted_at, report_number'
 const REPORT_SELECT_COLUMNS =
   'report_number, generated_by_name, generated_at, submitted_at, submitted_by_name, decided_at, check_ids'
-const REPORT_PAGE_SIZE = 50
+
 const SORT_OPTIONS = [
   { value: 'submitted_asc', label: 'Oldest submitted first' },
   { value: 'submitted_desc', label: 'Newest submitted first' },
@@ -89,13 +107,9 @@ const FOCUSABLE_SELECTOR =
   'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
 
 const PHASE_LABELS = {
-  verifying: 'Verifying latest status…',
-  submitting: 'Submitting decisions…',
+  verifying: 'Double-checking these checks are still up to date…',
+  submitting: 'Saving your decision…',
 }
-
-// ---------------------------------------------------------------------
-// Pure helpers
-// ---------------------------------------------------------------------
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -111,10 +125,6 @@ function branchKey(branch) {
   return normalizeBranch(branch).trim().toLowerCase()
 }
 
-// Resolves a profiles.branch code to the checks.pickup_branch label it
-// should be compared against. Returns null for "unrestricted" (admin-like)
-// codes and for anything not in BRANCH_CODE_TO_LABEL — callers must treat
-// null-with-a-real-code as a config gap, not as "no restriction".
 function resolveBranchLabel(code) {
   if (!code || code === UNRESTRICTED_BRANCH_CODE) return null
   return BRANCH_CODE_TO_LABEL[code] || null
@@ -158,6 +168,10 @@ function parseAmountBound(raw) {
   return Number.isFinite(n) ? n : null
 }
 
+// Builds display groups from a page of reports + the checks they
+// reference. A report contributes nothing if none of its checks survive
+// branch filtering — this is the one place "invisible to this approver"
+// gets decided.
 function buildGroupsFromReports(reports, checksById, requiredBranch) {
   const required = requiredBranch ? branchKey(requiredBranch) : null
   const groups = []
@@ -232,6 +246,45 @@ async function runSupabaseQuery(buildQuery, signal) {
   throw lastError
 }
 
+function safeNotify(callback, payload) {
+  try {
+    callback?.(payload)
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[ApproverStaleReports] onSynced callback threw:', err)
+  }
+}
+
+async function fetchReportsPage(from, to, signal) {
+  return runSupabaseQuery(
+    () =>
+      supabase
+        .from('staled_check_reports')
+        .select(REPORT_SELECT_COLUMNS, { count: 'exact' })
+        .not('submitted_at', 'is', null)
+        .is('decided_at', null)
+        .order('submitted_at', { ascending: true })
+        .range(from, to)
+        .abortSignal(signal),
+    signal
+  )
+}
+
+async function fetchChecksForReports(reports, effectiveBranch, signal) {
+  const ids = [...new Set(reports.flatMap((r) => r.check_ids || []))]
+  if (ids.length === 0) return new Map()
+
+  let query = supabase.from('checks').select(SELECT_COLUMNS).in('id', ids).abortSignal(signal)
+  // Real branch scoping happens here, against a real column with a real
+  // CHECK constraint — not against staled_check_reports, which has no
+  // branch of its own.
+  if (effectiveBranch) query = query.eq(BRANCH_COLUMN, effectiveBranch)
+
+  const { data, error } = await query
+  if (error) throw error
+  return new Map((data || []).map((c) => [c.id, c]))
+}
+
 // Re-checks live status of every check in a decision batch directly
 // against Postgres immediately before the RPC call, so a concurrent
 // decision, recall, or branch change surfaces a specific message instead
@@ -273,32 +326,12 @@ async function revalidateReportChecks(reportNumber, expectedItems, requiredBranc
   }
 }
 
-function groupByReport(rows) {
-  const map = new Map()
-  rows.forEach((row) => {
-    if (!map.has(row.reportNumber)) map.set(row.reportNumber, { reportNumber: row.reportNumber, items: [] })
-    map.get(row.reportNumber).items.push(row)
-  })
-  return [...map.values()]
-}
-
-function flattenGroups(groups) {
-  return groups.flatMap((g) => g.items)
-}
-
-// Merges a newly fetched page into rows already on screen, de-duplicated
-// by check id, so a row that shifted position between pages never
-// appears twice.
-function mergeRows(existingRows, incomingRows) {
-  const map = new Map(existingRows.map((r) => [r.checkId, r]))
-  incomingRows.forEach((r) => map.set(r.checkId, r))
-  return [...map.values()]
-}
 function mergeGroups(existingGroups, incomingGroups) {
   const map = new Map(existingGroups.map((g) => [g.reportNumber, g]))
   incomingGroups.forEach((g) => map.set(g.reportNumber, g))
   return [...map.values()]
 }
+
 function matchesSearch(items, reportNumber, term) {
   if (!term) return true
   const needle = term.toLowerCase()
@@ -342,17 +375,11 @@ function slugify(value) {
 }
 
 // Batch decisions are per-report, not per-check: a Staled Check Report is
-// generated as a single unit, so approving or returning it applies the same
-// disposition to every check it contains. If some of those checks turn out
-// not to belong, the whole report is returned and a corrected report gets
-// generated again — there is no partial/per-row outcome here.
+// generated as a single unit, so approving or returning it applies the
+// same disposition to every check it contains.
 function buildInitialBatchDecision() {
   return { decision: 'approve', remarks: '' }
 }
-
-// ---------------------------------------------------------------------
-// Small presentational components
-// ---------------------------------------------------------------------
 
 function BankBadge({ bank }) {
   const label = normalizeBank(bank)
@@ -470,7 +497,7 @@ function UnmappedBranch({ code }) {
 
 function Toast({ message, variant }) {
   return (
-    <div className="fixed bottom-20 left-1/2 z-50 -translate-x-1/2 animate-in fade-in slide-in-from-bottom-2 sm:bottom-6">
+    <div className="fixed bottom-20 left-1/2 z-50 -translate-x-1/2 animate-in fade-in slide-in-from-bottom-2 sm:bottom-6" role="status" aria-live="polite">
       <div className={cn('flex items-center gap-2 rounded-md px-4 py-2.5 text-sm font-medium text-white shadow-lg', variant === 'warning' ? 'bg-orange-600' : variant === 'error' ? 'bg-red-600' : 'bg-ink-900')}>
         {variant === 'error' ? <WifiOff className="h-4 w-4 shrink-0" /> : <CheckCircle2 className="h-4 w-4 shrink-0" />}
         {message}
@@ -500,7 +527,7 @@ function FilterSelect({ label, value, onChange, options }) {
 
 function ListSkeleton() {
   return (
-    <div className="space-y-2.5">
+    <div className="space-y-2.5" aria-hidden="true">
       {Array.from({ length: 4 }).map((_, i) => (
         <div key={i} className="h-16 animate-pulse rounded-lg border border-ink-100 bg-ink-50/60" />
       ))}
@@ -508,21 +535,22 @@ function ListSkeleton() {
   )
 }
 
-function EmptyState({ hasFilter, branchLabel }) {
+function EmptyState({ hasFilter, branchLabel, onClearFilters }) {
   return (
     <div className="flex flex-col items-center rounded-lg border border-dashed border-ink-200 px-4 py-16 text-center">
-      <Inbox className="h-8 w-8 text-ink-200" />
+      {hasFilter ? <Search className="h-8 w-8 text-ink-200" /> : <Inbox className="h-8 w-8 text-ink-200" />}
       <p className="mt-3 font-display text-lg font-semibold text-ink-700">{hasFilter ? 'No matching checks' : 'Nothing awaiting approval'}</p>
       <p className="mt-1 max-w-sm text-sm text-ink-400">
-        {hasFilter ? 'Try a different search or filter combination, or clear your filters.' : `Staled check reports submitted for ${branchLabel} will show up here.`}
+        {hasFilter ? 'Try a different search or filter combination.' : `Staled check reports submitted for ${branchLabel} will show up here.`}
       </p>
+      {hasFilter && (
+        <button onClick={onClearFilters} className="mt-4 rounded-md border border-ink-200 px-3.5 py-1.5 text-xs font-medium text-ink-600 hover:bg-ink-50">
+          Clear filters
+        </button>
+      )}
     </div>
   )
 }
-
-// ---------------------------------------------------------------------
-// Component
-// ---------------------------------------------------------------------
 
 export default function ApproverStaleReports({ active = true, refreshToken = 0, onSynced } = {}) {
   const { role, name, branch: myBranchCode, loading: profileLoading, error: profileError } = useProfile()
@@ -536,7 +564,10 @@ export default function ApproverStaleReports({ active = true, refreshToken = 0, 
   const canQuery = isAdmin || (Boolean(myBranchCode) && (myBranchCode === UNRESTRICTED_BRANCH_CODE || Boolean(myBranchLabel)))
 
   const [groups, setGroups] = useState([])
-  const [totalCount, setTotalCount] = useState(0)
+  // Total undecided REPORTS on the server (unscoped by branch — the
+  // reports table has no branch column). Drives pagination only; never
+  // shown to the user as "how many checks are pending."
+  const [reportsTotalCount, setReportsTotalCount] = useState(0)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [loadingMore, setLoadingMore] = useState(false)
@@ -570,7 +601,7 @@ export default function ApproverStaleReports({ active = true, refreshToken = 0, 
   const effectiveBranch = isAdmin ? (branchScopeFilter !== 'all' ? branchScopeFilter : null) : branchLocked ? myBranchLabel : null
 
   const isMountedRef = useRef(true)
-  const loadedCountRef = useRef(0)
+  const loadedReportsCountRef = useRef(0)
   const requestIdRef = useRef(0)
   const abortControllerRef = useRef(null)
   const toastTimerRef = useRef(null)
@@ -584,6 +615,16 @@ export default function ApproverStaleReports({ active = true, refreshToken = 0, 
     onSyncedRef.current = onSynced
   }, [onSynced])
 
+  // The number of checks actually rendered — the one and only source for
+  // the tab badge. Derived from `groups`, so it can never drift from what
+  // the user sees on screen.
+  const checksVisibleCount = useMemo(() => groups.reduce((sum, g) => sum + g.items.length, 0), [groups])
+
+  useEffect(() => {
+    if (!lastUpdated) return
+    safeNotify(onSyncedRef.current, { count: checksVisibleCount, lastUpdated })
+  }, [checksVisibleCount, lastUpdated])
+
   useEffect(() => {
     clearTimeout(searchTimerRef.current)
     searchTimerRef.current = setTimeout(() => setDebouncedSearch(search.trim()), SEARCH_DEBOUNCE_MS)
@@ -596,7 +637,7 @@ export default function ApproverStaleReports({ active = true, refreshToken = 0, 
     toastTimerRef.current = setTimeout(() => setToast(null), 3500)
   }
 
-const load = useCallback(
+  const load = useCallback(
     async (mode) => {
       if (!canQuery) return
 
@@ -607,7 +648,7 @@ const load = useCallback(
       const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS)
 
       if (mode === 'initial') {
-        loadedCountRef.current = 0
+        loadedReportsCountRef.current = 0
         setLoading(true)
       } else if (mode === 'loadMore') {
         setLoadingMore(true)
@@ -616,68 +657,50 @@ const load = useCallback(
       }
       setLoadError(null)
 
-      const from = mode === 'loadMore' ? loadedCountRef.current : 0
-      const windowSize = mode === 'refresh' ? Math.max(loadedCountRef.current, REPORT_PAGE_SIZE) : REPORT_PAGE_SIZE
-      const to = from + windowSize - 1
-
       try {
-        // Step 1: fetch submitted-but-undecided REPORTS. This is the
-        // authoritative "awaiting approval" list — never derived from
-        // checks.status.
-        const buildReportsQuery = () =>
-          supabase
-            .from('staled_check_reports')
-            .select(REPORT_SELECT_COLUMNS, { count: 'exact' })
-            .not('submitted_at', 'is', null)
-            .is('decided_at', null)
-            .order('submitted_at', { ascending: true })
-            .range(from, to)
-            .abortSignal(controller.signal)
+        let from = mode === 'loadMore' ? loadedReportsCountRef.current : 0
+        let windowSize = mode === 'refresh' ? Math.max(loadedReportsCountRef.current, REPORT_PAGE_SIZE) : REPORT_PAGE_SIZE
+        let serverCount = reportsTotalCount
+        let collectedGroups = []
+        let fetches = 0
 
-        const { data: reportRows, count } = await runSupabaseQuery(buildReportsQuery, controller.signal)
-        if (!isMountedRef.current || requestId !== requestIdRef.current) return
+        // Keeps pulling report pages while a branch-locked approver's
+        // page came back with nothing visible and more pages remain —
+        // see PAGINATION in the header comment.
+        while (true) {
+          const to = from + windowSize - 1
+          const { data: reportRows, count } = await fetchReportsPage(from, to, controller.signal)
+          if (!isMountedRef.current || requestId !== requestIdRef.current) return
 
-        const reports = reportRows || []
+          const reports = reportRows || []
+          serverCount = typeof count === 'number' ? count : serverCount
 
-        // Step 2: fetch the actual checks those reports reference, by id
-        // — not by status or report_number, so a submit RPC that forgot
-        // to stamp those columns can't hide the report from approvers.
-        const allCheckIds = [...new Set(reports.flatMap((r) => r.check_ids || []))]
-        let checksById = new Map()
+          const checksById = await fetchChecksForReports(reports, effectiveBranch, controller.signal)
+          if (!isMountedRef.current || requestId !== requestIdRef.current) return
 
-        if (allCheckIds.length > 0) {
-          let checksQuery = supabase.from('checks').select(SELECT_COLUMNS).in('id', allCheckIds).abortSignal(controller.signal)
-          // Branch scoping happens here, against a real column with a
-          // real CHECK constraint — not against staled_check_reports.
-          // branches, which is free-text and easy to get out of sync.
-          if (effectiveBranch) checksQuery = checksQuery.eq(BRANCH_COLUMN, effectiveBranch)
+          const batchGroups = buildGroupsFromReports(reports, checksById, effectiveBranch)
+          collectedGroups = collectedGroups.concat(batchGroups)
 
-          const { data: checkRows, error: checksError } = await checksQuery
-          if (checksError) throw checksError
-          checksById = new Map((checkRows || []).map((c) => [c.id, c]))
+          from += reports.length
+          fetches += 1
+          windowSize = REPORT_PAGE_SIZE
+
+          const moreServerRows = reports.length > 0 && from < serverCount
+          const shouldAutoContinue = Boolean(effectiveBranch) && batchGroups.length === 0 && moreServerRows && fetches < MAX_AUTO_PAGE_FETCHES
+          if (!shouldAutoContinue) break
         }
 
-        if (!isMountedRef.current || requestId !== requestIdRef.current) return
-
-        const newGroups = buildGroupsFromReports(reports, checksById, effectiveBranch)
-
-        setGroups((prev) => (mode === 'loadMore' ? mergeGroups(prev, newGroups) : newGroups))
-
-        const newLoadedCount = from + reports.length
-        loadedCountRef.current = newLoadedCount
-        const serverCount = count ?? newLoadedCount
-        setTotalCount(serverCount)
-        setHasMore(reports.length >= windowSize && newLoadedCount < serverCount)
-
-        const syncedAt = Date.now()
-        setLastUpdated(syncedAt)
+        setGroups((prev) => (mode === 'loadMore' ? mergeGroups(prev, collectedGroups) : collectedGroups))
+        loadedReportsCountRef.current = from
+        setReportsTotalCount(serverCount)
+        setHasMore(from < serverCount)
+        setLastUpdated(Date.now())
         setSelectedCheckIds((prev) => {
-          if (prev.size === 0) return prev
-          const validIds = new Set(newGroups.flatMap((g) => g.items.map((c) => c.checkId)))
-          const next = new Set([...prev].filter((id) => mode === 'loadMore' || validIds.has(id)))
+          if (prev.size === 0 || mode === 'loadMore') return prev
+          const validIds = new Set(collectedGroups.flatMap((g) => g.items.map((c) => c.checkId)))
+          const next = new Set([...prev].filter((id) => validIds.has(id)))
           return next.size === prev.size ? prev : next
         })
-        onSyncedRef.current?.({ count: serverCount, lastUpdated: syncedAt })
       } catch (err) {
         if (err?.name === 'AbortError' || controller.signal.aborted) return
         if (!isMountedRef.current || requestId !== requestIdRef.current) return
@@ -692,7 +715,7 @@ const load = useCallback(
         }
       }
     },
-    [canQuery, effectiveBranch]
+    [canQuery, effectiveBranch, reportsTotalCount]
   )
 
   useEffect(() => {
@@ -724,7 +747,7 @@ const load = useCallback(
   // Realtime sync scoped to the effective branch, so an approver's channel
   // only wakes for changes that could affect their queue. Best-effort: if
   // the channel fails to subscribe, polling still keeps the page correct.
- useEffect(() => {
+  useEffect(() => {
     if (!authorized || !active || !canQuery) return
     let debounceTimer = null
     const channel = supabase
@@ -940,14 +963,12 @@ const load = useCallback(
     setActionError(null)
 
     const snapshotGroups = groups
-    const snapshotTotalCount = totalCount
     const decidedCheckIds = new Set(confirmAction.checks.map((c) => c.checkId))
     let appliedOptimisticUpdate = false
 
     function rollback() {
       if (!appliedOptimisticUpdate) return
       setGroups(snapshotGroups)
-      setTotalCount(snapshotTotalCount)
       appliedOptimisticUpdate = false
     }
 
@@ -959,8 +980,7 @@ const load = useCallback(
       await revalidateReportChecks(confirmAction.reportNumber, confirmAction.checks, effectiveBranch, controller.signal)
 
       setGroups((prev) => prev.map((g) => ({ ...g, items: g.items.filter((c) => !decidedCheckIds.has(c.checkId)) })).filter((g) => g.items.length > 0))
-      setTotalCount((prev) => Math.max(0, prev - decidedCheckIds.size))
-      loadedCountRef.current = Math.max(0, loadedCountRef.current - decidedCheckIds.size)
+      loadedReportsCountRef.current = Math.max(0, loadedReportsCountRef.current - 1)
       setSelectedCheckIds((prev) => {
         if (prev.size === 0) return prev
         const next = new Set(prev)
@@ -975,12 +995,10 @@ const load = useCallback(
           : { check_id: c.checkId, decision: 'return', remarks: batchDecision.remarks.trim() }
       )
 
-      setActionPhase('submitting')
-      const { data, error } = await supabase.rpc('approver_decide_staled_report', {
-        p_report_number: confirmAction.reportNumber,
-        p_decisions,
-        p_approver_name: approverName,
-      })
+    const { data, error } = await supabase.rpc('approver_decide_staled_report', {
+  p_report_number: confirmAction.reportNumber,
+  p_decisions,
+})
 
       if (error) {
         rollback()
@@ -1025,41 +1043,45 @@ const load = useCallback(
   }
 
   function exportCsv() {
-    const headers = ['Report #', 'Bank', 'Branch', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount', 'Stale bucket', '2307 Attached', 'Submitted by', 'Submitted at']
-    const rows = [headers]
-    visibleGroups.forEach((g) => {
-      g.items.forEach((c) => {
-        rows.push([
-          g.reportNumber,
-          normalizeBank(c.bank),
-          normalizeBranch(c.pickup_branch),
-          c.check_no || '',
-          c.payee || '',
-          c.payor || '',
-          c.check_date || '',
-          c.amount ?? '',
-          getStaleBucket(c.check_date) === STALE_BUCKETS.STALE ? 'Stale' : 'Nearing stale',
-          attachment2307State(c.form_2307_attached),
-          c.submitted_by_name || '',
-          c.submitted_at || '',
-        ])
+    try {
+      const headers = ['Report #', 'Bank', 'Branch', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount', 'Stale bucket', '2307 Attached', 'Submitted by', 'Submitted at']
+      const rows = [headers]
+      visibleGroups.forEach((g) => {
+        g.items.forEach((c) => {
+          rows.push([
+            g.reportNumber,
+            normalizeBank(c.bank),
+            normalizeBranch(c.pickup_branch),
+            c.check_no || '',
+            c.payee || '',
+            c.payor || '',
+            c.check_date || '',
+            c.amount ?? '',
+            getStaleBucket(c.check_date) === STALE_BUCKETS.STALE ? 'Stale' : 'Nearing stale',
+            attachment2307State(c.form_2307_attached),
+            c.submitted_by_name || '',
+            c.submitted_at || '',
+          ])
+        })
       })
-    })
-    const csv = rows.map((row) => row.map(csvCell).join(',')).join('\n')
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `stale-report-approvals-${slugify(effectiveBranch)}-${new Date().toISOString().slice(0, 10)}.csv`
-    document.body.appendChild(a)
-    a.click()
-    a.remove()
-    URL.revokeObjectURL(url)
+      const csv = rows.map((row) => row.map(csvCell).join(',')).join('\n')
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `stale-report-approvals-${slugify(effectiveBranch)}-${new Date().toISOString().slice(0, 10)}.csv`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      showToast('Could not export CSV. Please try again.', 'warning')
+    }
   }
 
   const activeSortLabel = SORT_OPTIONS.find((o) => o.value === sortBy)?.label || 'Sort'
   const hasActiveFilter = Boolean(search.trim()) || activeFilterCount > 0
-  const loadedCount = groups.reduce((sum, g) => sum + g.items.length, 0)
+  const reportsLoadedCount = groups.length
 
   if (profileLoading) return <div className="flex min-h-[40vh] items-center justify-center text-sm text-ink-300">Loading…</div>
   if (profileError) return <ProfileLoadError error={profileError} />
@@ -1089,7 +1111,7 @@ const load = useCallback(
           {lastUpdated && <span className="hidden font-mono text-[11px] text-ink-300 sm:inline">Updated {Math.max(0, Math.round((now - lastUpdated) / 1000))}s ago</span>}
           <button
             onClick={() => setAutoRefresh((v) => !v)}
-            className="flex items-center gap-1.5 rounded-md border border-ink-200 px-2.5 py-2 text-xs font-medium text-ink-600 transition hover:bg-ink-50"
+            className="flex items-center gap-1.5 rounded-md border border-ink-200 px-2.5 py-2 text-xs font-medium text-ink-600 transition hover:bg-ink-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500"
             title={autoRefresh ? 'Pause auto-refresh' : 'Resume auto-refresh'}
           >
             {autoRefresh ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
@@ -1098,7 +1120,7 @@ const load = useCallback(
           <button
             onClick={() => load('refresh')}
             disabled={refreshing || loading}
-            className="flex items-center gap-1.5 rounded-md border border-ink-200 px-3 py-2 text-sm font-medium text-ink-600 transition hover:bg-ink-50 disabled:opacity-50"
+            className="flex items-center gap-1.5 rounded-md border border-ink-200 px-3 py-2 text-sm font-medium text-ink-600 transition hover:bg-ink-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500 disabled:opacity-50"
           >
             <RefreshCw className={cn('h-3.5 w-3.5', refreshing && 'animate-spin')} />
             <span className="hidden sm:inline">Refresh</span>
@@ -1118,10 +1140,11 @@ const load = useCallback(
         </div>
       )}
 
-      {!loading && totalCount > loadedCount && (
+      {!loading && hasMore && (
         <div className="mb-4 flex items-center gap-2 rounded-md border border-blue-200 bg-blue-50 px-4 py-2.5 text-sm text-blue-700">
           <Info className="h-4 w-4 shrink-0" />
-          Showing {loadedCount} of {totalCount} pending checks in scope. Load more below, or narrow with search and filters.
+          Loaded {reportsLoadedCount} report{reportsLoadedCount === 1 ? '' : 's'} in scope ({summary.checks} check{summary.checks === 1 ? '' : 's'} shown) — more may be
+          available. Load more below, or narrow with search and filters.
         </div>
       )}
 
@@ -1267,7 +1290,14 @@ const load = useCallback(
       {loading ? (
         <ListSkeleton />
       ) : visibleGroups.length === 0 ? (
-        <EmptyState hasFilter={hasActiveFilter} branchLabel={effectiveBranch || 'your branch'} />
+        <EmptyState
+          hasFilter={hasActiveFilter}
+          branchLabel={effectiveBranch || 'your branch'}
+          onClearFilters={() => {
+            clearAdvancedFilters()
+            setSearch('')
+          }}
+        />
       ) : (
         <>
           <div className="space-y-2.5">
@@ -1294,7 +1324,7 @@ const load = useCallback(
                 className="flex items-center gap-2 rounded-md border border-ink-200 px-4 py-2 text-sm font-medium text-ink-600 transition hover:bg-ink-50 disabled:opacity-50"
               >
                 {loadingMore ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ChevronsDown className="h-3.5 w-3.5" />}
-                {loadingMore ? 'Loading…' : `Load more (${Math.max(totalCount - loadedCount, 0)} remaining)`}
+                {loadingMore ? 'Loading…' : 'Load more reports'}
               </button>
             </div>
           )}
@@ -1501,12 +1531,8 @@ function ReportGroupRow({ group, waitingLabel, expanded, onToggleExpand, selecte
   )
 }
 
-// A Staled Check Report is generated and submitted as one unit, so it is
-// decided as one unit: either every check on it is confirmed stale, or the
-// whole report is handed back to the pool. There is no per-check split here
-// — if a subset of checks doesn't belong, the report is returned and a
-// corrected one is generated fresh, rather than editing this one check by
-// check.
+import { createPortal } from 'react-dom'
+
 function ReviewModal({ action, onCancel, onConfirm, loading, phase, error, successFlash }) {
   const allChecks = action.checks
   const total = orderTotal(allChecks)
@@ -1573,9 +1599,10 @@ function ReviewModal({ action, onCancel, onConfirm, loading, phase, error, succe
     onConfirm({ decision, remarks: remarks.trim() })
   }
 
-  return (
+  const modal = (
     <div
-      className="fixed inset-0 z-40 flex items-start justify-center overflow-y-auto bg-ink-900/50 p-3 py-6 sm:items-center sm:p-6"
+      className="fixed inset-0 z-[999] flex items-center justify-center bg-ink-950/55 p-4"
+      style={{ contain: 'layout paint' }}
       onMouseDown={(e) => {
         if (e.target === e.currentTarget && !loading && !successFlash) onCancel()
       }}
@@ -1585,59 +1612,78 @@ function ReviewModal({ action, onCancel, onConfirm, loading, phase, error, succe
         role="dialog"
         aria-modal="true"
         aria-labelledby="stale-review-modal-title"
-        className="relative flex max-h-[65vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl ring-1 ring-black/5"
+        className="relative flex h-[55vh] w-[59vw] min-w-[340px] max-w-[59vw] flex-col overflow-hidden rounded-3xl bg-white shadow-[0_20px_60px_-15px_rgba(0,0,0,0.35)] ring-1 ring-black/5"
       >
-        <div className="flex shrink-0 items-start justify-between gap-3 border-b border-ink-100 px-5 py-3.5">
-          <div className="flex min-w-0 items-start gap-3">
-            <span className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-teal-50 text-teal-700">
-              <Stamp className="h-4.5 w-4.5" />
-            </span>
-            <div className="min-w-0">
-              <h2 id="stale-review-modal-title" className="truncate font-display text-lg font-semibold leading-tight text-ink-900">
-                Report {action.reportNumber}
-              </h2>
-              <p className="mt-0.5 flex flex-wrap items-center gap-x-2 font-mono text-[11px] uppercase tracking-wide text-ink-400">
-                <span>
-                  {allChecks.length} check{allChecks.length === 1 ? '' : 's'}
-                </span>
-                <span className="text-ink-200">·</span>
-                <span className="font-semibold text-ink-600">{formatCurrency(total)}</span>
-                {staleCount > 0 && (
-                  <>
-                    <span className="text-ink-200">·</span>
-                    <span className="text-amber-700">{staleCount} stale</span>
-                  </>
-                )}
-              </p>
+        {/* Header */}
+        <div className="relative shrink-0 overflow-hidden border-b border-ink-100 bg-gradient-to-br from-amber-50 via-white to-white px-6 py-4">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex min-w-0 items-start gap-3">
+              <span className="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-amber-400 to-amber-500 text-white shadow-md shadow-amber-500/30">
+                <FileClock className="h-5 w-5" />
+              </span>
+              <div className="min-w-0">
+                <p className="font-mono text-[10px] font-semibold uppercase tracking-[0.18em] text-amber-600">Stale check report</p>
+                <h2 id="stale-review-modal-title" className="truncate font-display text-xl font-semibold leading-tight text-ink-900">
+                  Report {action.reportNumber}
+                </h2>
+                <p className="mt-1 flex flex-wrap items-center gap-x-2 text-xs text-ink-500">
+                  <span className="font-medium">
+                    {allChecks.length} check{allChecks.length === 1 ? '' : 's'}
+                  </span>
+                  <span className="text-ink-200">•</span>
+                  <span className="font-mono font-semibold text-ink-700">{formatCurrency(total)}</span>
+                  {staleCount > 0 && (
+                    <>
+                      <span className="text-ink-200">•</span>
+                      <span className="font-medium text-amber-700">{staleCount} already stale</span>
+                    </>
+                  )}
+                </p>
+              </div>
             </div>
+            <button
+              onClick={onCancel}
+              disabled={loading}
+              className="shrink-0 rounded-full p-1.5 text-ink-400 transition hover:bg-white hover:text-ink-700 disabled:opacity-40"
+              aria-label="Close"
+            >
+              <X className="h-4.5 w-4.5" />
+            </button>
           </div>
-          <button onClick={onCancel} disabled={loading} className="shrink-0 rounded-md p-1 text-ink-300 transition hover:bg-ink-50 hover:text-ink-600 disabled:opacity-40" aria-label="Close">
-            <X className="h-4.5 w-4.5" />
-          </button>
         </div>
 
-        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-3.5">
-          <div className="grid grid-cols-1 gap-4 lg:grid-cols-5">
+        {/* Body */}
+        <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
+          <div className="grid h-full grid-cols-1 gap-5 lg:grid-cols-5">
             <div className="lg:col-span-2">
-              <p className="text-[11px] font-medium uppercase tracking-wide text-ink-400">Decided as a whole</p>
+              <p className="mb-2.5 text-sm font-semibold text-ink-700">What's the call on this report?</p>
 
-              <div className="mt-2 flex flex-col gap-2">
+              <div className="flex flex-col gap-2.5">
                 <button
                   type="button"
                   disabled={loading}
                   onClick={() => selectDecision('approve')}
                   aria-pressed={decision === 'approve'}
                   className={cn(
-                    'flex items-start gap-2.5 rounded-xl border-2 p-3 text-left transition disabled:cursor-not-allowed disabled:opacity-50',
-                    decision === 'approve' ? 'border-teal-600 bg-teal-50/70 shadow-sm' : 'border-ink-100 hover:border-teal-200 hover:bg-teal-50/30'
+                    'group flex items-start gap-3 rounded-2xl border-2 p-3.5 text-left transition-all disabled:cursor-not-allowed disabled:opacity-50',
+                    decision === 'approve'
+                      ? 'border-teal-500 bg-teal-50 shadow-sm shadow-teal-500/10'
+                      : 'border-ink-100 hover:border-teal-200 hover:bg-teal-50/40'
                   )}
                 >
-                  <span className={cn('mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full', decision === 'approve' ? 'bg-teal-600 text-white' : 'bg-ink-100 text-ink-400')}>
-                    <Check className="h-3.5 w-3.5" />
+                  <span
+                    className={cn(
+                      'mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full transition-colors',
+                      decision === 'approve' ? 'bg-teal-600 text-white' : 'bg-ink-100 text-ink-400 group-hover:bg-teal-100 group-hover:text-teal-600'
+                    )}
+                  >
+                    <Check className="h-4 w-4" strokeWidth={2.5} />
                   </span>
                   <span className="min-w-0">
-                    <span className="block text-sm font-semibold text-ink-900">Confirm stale</span>
-                    <span className="mt-0.5 block text-xs text-ink-500">All {allChecks.length} checks confirmed. No reason needed.</span>
+                    <span className="block text-sm font-semibold text-ink-900">Yes, these are stale</span>
+                    <span className="mt-0.5 block text-xs leading-relaxed text-ink-500">
+                      All {allChecks.length} check{allChecks.length === 1 ? '' : 's'} go back to the bank. No reason needed.
+                    </span>
                   </span>
                 </button>
 
@@ -1647,24 +1693,33 @@ function ReviewModal({ action, onCancel, onConfirm, loading, phase, error, succe
                   onClick={() => selectDecision('return')}
                   aria-pressed={decision === 'return'}
                   className={cn(
-                    'flex items-start gap-2.5 rounded-xl border-2 p-3 text-left transition disabled:cursor-not-allowed disabled:opacity-50',
-                    decision === 'return' ? 'border-orange-500 bg-orange-50/70 shadow-sm' : 'border-ink-100 hover:border-orange-200 hover:bg-orange-50/30'
+                    'group flex items-start gap-3 rounded-2xl border-2 p-3.5 text-left transition-all disabled:cursor-not-allowed disabled:opacity-50',
+                    decision === 'return'
+                      ? 'border-orange-400 bg-orange-50 shadow-sm shadow-orange-400/10'
+                      : 'border-ink-100 hover:border-orange-200 hover:bg-orange-50/40'
                   )}
                 >
-                  <span className={cn('mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full', decision === 'return' ? 'bg-orange-500 text-white' : 'bg-ink-100 text-ink-400')}>
-                    <RotateCcw className="h-3.5 w-3.5" />
+                  <span
+                    className={cn(
+                      'mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full transition-colors',
+                      decision === 'return' ? 'bg-orange-500 text-white' : 'bg-ink-100 text-ink-400 group-hover:bg-orange-100 group-hover:text-orange-600'
+                    )}
+                  >
+                    <RotateCcw className="h-4 w-4" strokeWidth={2.5} />
                   </span>
                   <span className="min-w-0">
-                    <span className="block text-sm font-semibold text-ink-900">Return entire report</span>
-                    <span className="mt-0.5 block text-xs text-ink-500">All {allChecks.length} checks go back to the pool.</span>
+                    <span className="block text-sm font-semibold text-ink-900">No, send it back</span>
+                    <span className="mt-0.5 block text-xs leading-relaxed text-ink-500">
+                      All {allChecks.length} check{allChecks.length === 1 ? '' : 's'} become available again.
+                    </span>
                   </span>
                 </button>
               </div>
 
               {requiresReason && (
-                <div className="mt-3">
-                  <label htmlFor="stale-return-reason" className="mb-1 flex items-center justify-between text-xs font-medium text-ink-600">
-                    <span>Reason for returning</span>
+                <div className="mt-3.5">
+                  <label htmlFor="stale-return-reason" className="mb-1.5 flex items-center justify-between text-xs font-medium text-ink-600">
+                    <span>What should the submitter fix?</span>
                     <span className="font-mono text-[11px] font-normal text-ink-300">
                       {remarks.length}/{REMARKS_MAX_LEN}
                     </span>
@@ -1675,7 +1730,7 @@ function ReviewModal({ action, onCancel, onConfirm, loading, phase, error, succe
                     value={remarks}
                     onChange={(e) => setRemarks(e.target.value.slice(0, REMARKS_MAX_LEN))}
                     onBlur={(e) => setRemarks(e.target.value.trim())}
-                    placeholder="e.g. several checks were already picked up"
+                    placeholder="e.g. a few of these were already picked up last week"
                     maxLength={REMARKS_MAX_LEN}
                     rows={2}
                     required
@@ -1683,60 +1738,88 @@ function ReviewModal({ action, onCancel, onConfirm, loading, phase, error, succe
                     aria-invalid={showValidation && missingReason}
                     disabled={loading}
                     className={cn(
-                      'w-full resize-none rounded-lg border px-3 py-2 text-sm text-ink-800 transition focus:outline-none focus:ring-1 focus:ring-orange-500 disabled:cursor-not-allowed disabled:opacity-60',
-                      showValidation && missingReason ? 'border-orange-500' : 'border-ink-200'
+                      'w-full resize-none rounded-xl border px-3.5 py-2.5 text-sm text-ink-800 shadow-sm transition focus:outline-none focus:ring-2 focus:ring-orange-500/30 disabled:cursor-not-allowed disabled:opacity-60',
+                      showValidation && missingReason ? 'border-orange-400' : 'border-ink-200'
                     )}
                   />
                   {showValidation && missingReason && (
-                    <p className="mt-1 flex items-center gap-1.5 text-xs text-orange-600">
+                    <p className="mt-1.5 flex items-center gap-1.5 text-xs font-medium text-orange-600">
                       <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-                      Enter a reason before confirming.
+                      Let them know what to fix before sending it back.
                     </p>
                   )}
-                  <div className="mt-2 flex items-start gap-2 rounded-md bg-orange-50 px-3 py-2 text-xs text-orange-700">
-                    <RotateCcw className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                    This report closes out — a corrected report is generated fresh from what's still stale.
+                  <div className="mt-2 flex items-start gap-2 rounded-xl bg-orange-50 px-3.5 py-2.5 text-xs leading-relaxed text-orange-700">
+                    <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    This closes out this report. Anything still stale comes back on a fresh one.
                   </div>
                 </div>
               )}
 
               {error && (
-                <div className="mt-3 flex items-start gap-2 rounded-md border border-orange-200 bg-orange-50 px-3 py-2.5 text-sm text-orange-700">
-                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                <div className="mt-3.5 flex items-start gap-2.5 rounded-xl border border-orange-200 bg-orange-50 px-3.5 py-3 text-sm text-orange-700">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
                   <div>
-                    <p className="font-medium">{error.type === 'network' ? 'Connection problem' : error.type === 'conflict' ? 'This report changed' : 'Could not submit'}</p>
-                    <p className="mt-0.5">{error.message}</p>
-                    {error.type === 'conflict' && <p className="mt-1 text-xs opacity-80">Close and reopen this report to review the latest data.</p>}
+                    <p className="font-medium">
+                      {error.type === 'network' ? "Couldn't connect" : error.type === 'conflict' ? 'This report just changed' : "Couldn't save this"}
+                    </p>
+                    <p className="mt-0.5 text-orange-700/90">{error.message}</p>
+                    {error.type === 'conflict' && <p className="mt-1 text-xs opacity-80">Close this and reopen the report to see the latest.</p>}
                   </div>
                 </div>
               )}
             </div>
 
-            <div className="lg:col-span-3">
-              <div className="overflow-hidden rounded-lg border border-ink-100">
-                <div className="flex items-center justify-between border-b border-ink-100 bg-ink-50/60 px-3 py-1.5">
-                  <span className="font-mono text-[11px] uppercase tracking-wide text-ink-400">Checks on this report</span>
-                  <span className="font-mono text-[11px] text-ink-400">{allChecks.length}</span>
+            <div className="flex flex-col lg:col-span-3">
+              <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-ink-100 shadow-sm">
+                <div className="flex items-center justify-between border-b border-ink-100 bg-ink-50/70 px-4 py-2">
+                  <span className="text-xs font-semibold uppercase tracking-wide text-ink-400">Checks on this report</span>
+                  <span className="rounded-full bg-white px-2 py-0.5 font-mono text-[11px] font-medium text-ink-500 shadow-sm">{allChecks.length}</span>
                 </div>
-                <div className="max-h-[30vh] divide-y divide-dashed divide-ink-50 overflow-y-auto">
-                  {allChecks.map((c, idx) => {
-                    const isStale = getStaleBucket(c.check_date) === STALE_BUCKETS.STALE
-                    return (
-                      <div key={c.checkId ?? idx} className="flex items-center gap-2.5 px-3 py-2 text-sm">
-                        <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', isStale ? 'bg-orange-500' : 'bg-teal-500')} title={isStale ? 'Stale' : 'Nearing stale'} />
-                        <span className="w-16 shrink-0 truncate font-mono text-xs text-ink-600">{c.check_no ?? '—'}</span>
-                        <span className="min-w-0 flex-1 truncate font-medium text-ink-800" title={c.payee || undefined}>
-                          {c.payee || '—'}
-                        </span>
-                        <span className="hidden shrink-0 truncate text-xs text-ink-400 sm:block sm:max-w-[110px]" title={c.bank || undefined}>
-                          {normalizeBank(c.bank)}
-                        </span>
-                        <span className="shrink-0 font-mono text-xs font-medium text-ink-700">{safeCurrency(c.amount)}</span>
-                      </div>
-                    )
-                  })}
+                <div className="min-h-0 flex-1 overflow-auto bg-white">
+                  <table className="w-full min-w-[620px] text-left text-xs">
+                    <thead className="sticky top-0 bg-ink-50/90 text-[10px] uppercase tracking-wide text-ink-400 backdrop-filter-none">
+                      <tr className="border-b border-ink-100">
+                        <th className="px-3 py-2 font-medium">Check no.</th>
+                        <th className="px-2 py-2 font-medium">Bank</th>
+                        <th className="px-2 py-2 font-medium">Branch</th>
+                        <th className="px-2 py-2 font-medium">Payee</th>
+                        <th className="px-2 py-2 font-medium">Payor</th>
+                        <th className="px-2 py-2 font-medium">Check date</th>
+                        <th className="px-2 py-2 text-right font-medium">Amount</th>
+                        <th className="px-2 py-2 font-medium">Bucket</th>
+                        <th className="px-3 py-2 font-medium">2307</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-ink-50">
+                      {allChecks.map((c, idx) => (
+                        <tr key={c.checkId ?? idx} className="transition-colors hover:bg-ink-50/60">
+                          <td className="px-3 py-2 font-mono text-ink-700">{c.check_no ?? '—'}</td>
+                          <td className="px-2 py-2">
+                            <BankBadge bank={c.bank} />
+                          </td>
+                          <td className="max-w-[110px] truncate px-2 py-2 text-ink-500" title={c.pickup_branch || undefined}>
+                            {c.pickup_branch || '—'}
+                          </td>
+                          <td className="max-w-[130px] truncate px-2 py-2 font-medium text-ink-800" title={c.payee || undefined}>
+                            {c.payee || '—'}
+                          </td>
+                          <td className="max-w-[130px] truncate px-2 py-2 text-ink-500" title={c.payor || undefined}>
+                            {c.payor || '—'}
+                          </td>
+                          <td className="whitespace-nowrap px-2 py-2 text-ink-500">{c.check_date ? formatDate(c.check_date) : '—'}</td>
+                          <td className="whitespace-nowrap px-2 py-2 text-right font-mono font-semibold text-ink-700">{safeCurrency(c.amount)}</td>
+                          <td className="px-2 py-2">
+                            <StaleBucketBadge checkDate={c.check_date} />
+                          </td>
+                          <td className="px-3 py-2">
+                            <Attachment2307Badge value={c.form_2307_attached} />
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 </div>
-                <div className="flex items-center justify-between border-t border-ink-100 bg-ink-50/60 px-3 py-2">
+                <div className="flex shrink-0 items-center justify-between border-t border-ink-100 bg-ink-50/70 px-4 py-2">
                   <span className="text-xs font-medium text-ink-500">Total</span>
                   <span className="font-mono text-sm font-semibold text-ink-900">{formatCurrency(total)}</span>
                 </div>
@@ -1745,41 +1828,58 @@ function ReviewModal({ action, onCancel, onConfirm, loading, phase, error, succe
           </div>
         </div>
 
-        <div className="flex shrink-0 items-center justify-between gap-2 border-t border-ink-100 px-5 py-3">
+        {/* Footer */}
+        <div className="flex shrink-0 items-center justify-between gap-3 border-t border-ink-100 bg-ink-50/40 px-6 py-3.5">
           <span className="text-xs text-ink-400">{loading && phase ? PHASE_LABELS[phase] : ''}</span>
-          <div className="flex items-center gap-2">
-            <button ref={cancelButtonRef} onClick={onCancel} disabled={loading} className="rounded-md border border-ink-200 px-3.5 py-2 text-sm font-medium text-ink-600 transition hover:bg-ink-50 disabled:opacity-40">
+          <div className="flex items-center gap-2.5">
+            <button
+              ref={cancelButtonRef}
+              onClick={onCancel}
+              disabled={loading}
+              className="rounded-xl border border-ink-200 bg-white px-4 py-2 text-sm font-medium text-ink-600 transition hover:bg-ink-50 disabled:opacity-40"
+            >
               Cancel
             </button>
             <button
               onClick={handleConfirmClick}
               disabled={loading}
               className={cn(
-                'flex items-center gap-2 rounded-md px-4 py-2 text-sm font-semibold text-white transition disabled:cursor-not-allowed disabled:opacity-60',
-                decision === 'return' ? 'bg-orange-500 hover:bg-orange-600' : 'bg-teal-600 hover:bg-teal-700'
+                'flex items-center gap-2 rounded-xl px-4.5 py-2 text-sm font-semibold text-white shadow-sm transition disabled:cursor-not-allowed disabled:opacity-60',
+                decision === 'return' ? 'bg-orange-500 hover:bg-orange-600 hover:shadow-orange-500/25' : 'bg-teal-600 hover:bg-teal-700 hover:shadow-teal-600/25'
               )}
             >
               {loading && <Loader2 className="h-4 w-4 animate-spin" />}
               {loading
                 ? phase === 'verifying'
-                  ? 'Verifying…'
-                  : 'Submitting…'
+                  ? 'Checking…'
+                  : 'Saving…'
                 : decision === 'return'
-                  ? `Return ${allChecks.length} check${allChecks.length === 1 ? '' : 's'}`
+                  ? `Send back ${allChecks.length} check${allChecks.length === 1 ? '' : 's'}`
                   : `Confirm ${allChecks.length} check${allChecks.length === 1 ? '' : 's'} as stale`}
             </button>
           </div>
         </div>
 
         {successFlash && (
-          <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-white/95 backdrop-blur-sm">
-            <div className={cn('flex h-14 w-14 items-center justify-center rounded-full', decision === 'return' ? 'bg-orange-100' : 'bg-teal-100')}>
-              <Check className={cn('h-7 w-7', decision === 'return' ? 'text-orange-600' : 'text-teal-600')} strokeWidth={3} />
+          <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-4 bg-white">
+            <div className={cn('relative flex h-20 w-20 items-center justify-center rounded-full', decision === 'return' ? 'bg-orange-50' : 'bg-teal-50')}>
+              <div
+                className={cn('absolute inset-0 rounded-full', decision === 'return' ? 'bg-orange-200/60' : 'bg-teal-200/60', 'animate-ping')}
+                style={{ animationIterationCount: 1, animationDuration: '600ms' }}
+              />
+              <div className={cn('relative flex h-14 w-14 items-center justify-center rounded-full shadow-lg', decision === 'return' ? 'bg-orange-500 shadow-orange-300' : 'bg-teal-600 shadow-teal-300')}>
+                <Check className="h-7 w-7 text-white" strokeWidth={3} />
+              </div>
             </div>
-            <p className="text-sm font-semibold text-ink-800">{successFlash.message}</p>
+            <div className="text-center">
+              <p className="text-base font-semibold text-ink-900">{successFlash.message}</p>
+              <p className="mt-1 text-sm text-ink-400">Report {action.reportNumber} is closed out.</p>
+            </div>
           </div>
         )}
       </div>
     </div>
   )
+
+  return createPortal(modal, document.body)
 }

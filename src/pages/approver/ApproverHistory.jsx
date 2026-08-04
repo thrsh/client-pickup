@@ -563,9 +563,7 @@ export default function ApproverHistory() {
     <div className="pb-20 sm:pb-0">
       <div className="mb-6 flex flex-wrap items-start justify-between gap-3">
         <div className="flex items-start gap-3">
-          <span className="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-dashed border-ledger-stamp/40 bg-ledger-stamp/10 text-ledger-stampDark">
-            <Stamp className="h-4.5 w-4.5" />
-          </span>
+        
           <div>
             <p className="font-mono text-[11px] uppercase tracking-[0.2em] text-ledger-stampDark/80">Your decision history</p>
             <h1 className="font-display text-2xl font-semibold text-ink-900">Approval history</h1>

@@ -34,34 +34,15 @@ import { useToast } from '../../components/ui/toast'
 import { normalizeDate, formatCurrency, cn } from '../../lib/utils'
 import { logAuditEvent } from '../../lib/adminAuditApi'
 
-// ----------------------------------------------------------------------------
-// Field configuration. Toggle EXTRA_FIELDS_REQUIRED to `true` the day
-// Client Ref No / Pickup Branch / Account Number become mandatory for every
-// upload — mappingComplete, the red-asterisk markers, and the missing-value
-// flags all read from FIELD_DEFS[...].required, so this is the ONLY line
-// that needs to change to make that switch. It does NOT affect the payee
-// columns below — payee has its own conditional requirement (company OR
-// individual name) handled separately by `payeeMappingValid` and the
-// per-row `missingPayee*` flags, since it can't be expressed as a single
-// required/optional flag per field.
-//
-// CORE_FIELDS vs EXTRA_FIELDS is a SEPARATE split from required/optional —
-// it controls table STRUCTURE (which dedicated columns exist), not
-// validation. This is deliberate: if EXTRA_FIELDS_REQUIRED flips to true,
-// these three fields must NOT also get folded into the generic
-// "required columns" header loop, or they'd render twice (once from their
-// own <th>, once from a required-fields loop that now includes them).
-// ----------------------------------------------------------------------------
-const EXTRA_FIELDS_REQUIRED = false
+// EXTRA_FIELDS_REQUIRED / FORM_2307_REQUIRED are separate toggles (rather
+// than one flag) because 2307 has a different shape of validation (a
+// single Y/N character vs. free text) and may need to be relaxed
+// independently of the other extra fields in the future.
+const EXTRA_FIELDS_REQUIRED = true
+const FORM_2307_REQUIRED = true
 
 const FIELD_DEFS = [
-  // Payee is no longer a single free-text column. It's resolved from
-  // EITHER a company name OR an individual's first/middle/last name — a
-  // row must supply one or the other. None of these four carry
-  // `required: true` here (that flag only drives the plain "map this one
-  // column" logic used by REQUIRED_FIELDS below); the real conditional
-  // rule — company OR (first AND last) — lives in `payeeMappingValid`
-  // (mapping-time) and the per-row `missingPayee*` flags (data-time).
+
   { key: 'payee_company', label: 'Payee Company', required: false },
   { key: 'payee_first_name', label: 'Payee First Name', required: false },
   { key: 'payee_middle_name', label: 'Payee Middle Name', required: false },
@@ -73,10 +54,11 @@ const FIELD_DEFS = [
   { key: 'client_ref_no', label: 'Client Ref. No', required: EXTRA_FIELDS_REQUIRED },
   { key: 'pickup_branch', label: 'Pickup Branch', required: EXTRA_FIELDS_REQUIRED },
   { key: 'account_number', label: 'Account Number', required: EXTRA_FIELDS_REQUIRED },
-  // 2307 (BIR withholding certificate) attachment flag. Always optional,
-  // but strictly normalized down to a single 'Y' or 'N' regardless of the
-  // case or wording ("yes"/"no") used in the source file.
-  { key: 'form_2307_attached', label: '2307 Attached (Y/N)', required: false },
+  // 2307 (BIR withholding certificate) attachment flag. Strictly a single
+  // Y or N character (see normalizeYesNo) — required, since it now feeds
+  // compliance tracking and a silently-guessed value would misrepresent
+  // whether a 2307 was actually attached.
+  { key: 'form_2307_attached', label: '2307 Attached (Y/N)', required: FORM_2307_REQUIRED },
 ]
 const FIELD_DEFS_BY_KEY = Object.fromEntries(FIELD_DEFS.map((f) => [f.key, f]))
 
@@ -93,10 +75,6 @@ const CORE_FIELD_KEYS = [
 const CORE_FIELDS = FIELD_DEFS.filter((f) => CORE_FIELD_KEYS.includes(f.key))
 const EXTRA_FIELDS = FIELD_DEFS.filter((f) => !CORE_FIELD_KEYS.includes(f.key))
 
-// Used ONLY for "map N required fields to continue" messaging and the
-// mappingComplete gate — never for table layout (see note above). Payee
-// is deliberately excluded (see FIELD_DEFS comment) and checked via
-// `payeeMappingValid` instead.
 const REQUIRED_FIELDS = FIELD_DEFS.filter((f) => f.required)
 
 const CLIENT_REF_MAX_LENGTH = 12
@@ -104,16 +82,13 @@ const ACCOUNT_NUMBER_MAX_LENGTH = 12
 const PICKUP_BRANCH_MAX_LENGTH = 100
 const PAYEE_NAME_PART_MAX_LENGTH = 60
 const COMPANY_NAME_MAX_LENGTH = 150
+// Defensive cap on the final RESOLVED payee name (company, or joined
+// first/middle/last) — guards against a DB column length limit rejecting
+// an otherwise-valid row outright instead of failing gracefully here.
+const PAYEE_MAX_LENGTH = 200
 
-// Include, Row, Bank, the resolved Payee column, and every configured
-// field column — computed instead of hardcoded so it can never drift out
-// of sync with the actual <th> count, including if more optional fields
-// are added later.
 const PREVIEW_COLSPAN = CORE_FIELDS.length + EXTRA_FIELDS.length + 4
 
-// Default bank list — extend/edit as needed, or swap this for a Supabase
-// lookup (e.g. a `banks` table) later without touching anything else,
-// since every consumer below reads from `bankValue`/`bankValid` only.
 const BANKS = [
   'BDO Unibank',
   'Bank of the Philippine Islands (BPI)',
@@ -130,11 +105,14 @@ const BANKS = [
 const OTHER_BANK_VALUE = '__other__'
 const MAX_CUSTOM_BANK_LENGTH = 100
 
+// The ONLY two valid pickup branches. A row's Pickup Branch column must
+// resolve to one of these (case/spacing/punctuation-insensitive — see
+// normalizePickupBranch) or it's flagged for review. Add more here if a
+// new branch comes online; nothing else needs to change.
+const PICKUP_BRANCHES = ['CSBA - Parqal', 'CSBA - BGC']
+
 const ACCEPTED_EXTENSIONS = ['.csv', '.xlsx', '.xls']
-// Browsers report CSV/Excel MIME types inconsistently (many omit it
-// entirely), so this is a best-effort secondary check layered on top of
-// the extension check — it only rejects files that are clearly something
-// else (e.g. a renamed PDF or image), not ambiguous/empty types.
+
 const ACCEPTED_MIME_TYPES = new Set([
   '',
   'text/csv',
@@ -154,9 +132,44 @@ const DUPLICATE_CHECK_DEBOUNCE_MS = 400
 const DUPLICATE_CHECK_CHUNK_SIZE = 300
 const IMPORT_CHUNK_SIZE = 500
 
-// Human-readable labels for every validation flag a row can carry — reused
-// by the breakdown panel, the per-cell tooltips, and the flagged-rows CSV
-// export so the wording never drifts between the three.
+// ---- Import animation ------------------------------------------------------
+// The import used to jump straight from 0% to 100% because the actual
+// client-side work (normalization, chunked insert) is fast enough to be
+// effectively instant for typical file sizes. That's a bad signal for an
+// action this consequential — it should feel like real, staged work is
+// happening, and it should never resolve implausibly fast even on a tiny
+// file. MIN_IMPORT_ANIMATION_MS guarantees a floor; the stage messages
+// rotate independently of the real work underneath them.
+const MIN_IMPORT_ANIMATION_MS = 2400
+const IMPORT_STAGE_MESSAGE_INTERVAL_MS = 230
+
+const IMPORT_STAGE_MESSAGES = [
+  'Validating file structure…',
+  'Validating column headers…',
+  'Validating row data…',
+  'Normalizing payee names…',
+  'Normalizing check dates…',
+  'Normalizing check amounts…',
+  'Normalizing pickup branches…',
+  'Normalizing account numbers…',
+  'Normalizing client reference numbers…',
+  'Checking 2307 attachment flags…',
+  'Scanning for duplicate check numbers…',
+  'Cross-checking against existing records…',
+  'Resolving payee identities…',
+  'Verifying bank assignment…',
+  'Double-checking totals…',
+  'Building import batch…',
+  'Preparing secure connection…',
+  'Uploading batch to server…',
+  'Writing checks to the register…',
+  'Committing transaction…',
+  'Verifying inserted records…',
+  'Logging audit trail…',
+  'Tidying up loose ends…',
+  'Finalizing import…',
+]
+
 const FLAG_LABELS = {
   missingPayee: 'Missing payee (no company or individual name provided)',
   missingPayeeFirstName: 'Missing payee first name (required when no company is given)',
@@ -178,23 +191,23 @@ const FLAG_LABELS = {
   missingAccountNumber: 'Missing account number',
   invalidAccountNumber: 'Account number must be digits only (max 12 characters)',
   missingPickupBranch: 'Missing pickup branch',
-  pickupBranchFormat: 'Pickup branch format looks unusual (expected e.g. "CSBA - Parqal")',
-  invalidForm2307Attached: '2307 Attached must be Y or N',
+  invalidPickupBranch: 'Pickup branch must be exactly "CSBA - Parqal" or "CSBA - BGC"',
+  missingForm2307Attached: '2307 Attached is required (Y or N)',
+  invalidForm2307Attached: '2307 Attached must be a single character: Y or N',
 }
 
-// Builds the composite key duplicate detection is scoped to. A row is only
-// a duplicate if EVERY ONE of bank, payee, payor, check no., and check
-// date matches another row exactly — change any single field (a different
-// payee, a different date, etc.) and it's a distinct, allowed row, even if
-// everything else lines up. (Ref no./account number are NOT part of this
-// key today — add them here later if duplicates should also be scoped by
-// those fields.) `payee` here is always the RESOLVED name (company, or
-// joined individual name) — never the raw split columns — so duplicate
-// detection stays correct regardless of which payee format a row used.
 function fullRowKey(bank, checkNo, payee, payor, checkDate) {
   return [bank, checkNo, payee, payor, checkDate]
     .map((v) => String(v ?? '').trim().toLowerCase())
     .join('::')
+}
+
+function chunkArray(items, size) {
+  const chunks = []
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size))
+  }
+  return chunks
 }
 
 // best-effort auto-detection of column headers
@@ -297,16 +310,34 @@ function normalizeDigitsOnly(raw, maxLength) {
   return { value, present: true, valid }
 }
 
-// Soft format check only — flags anything that doesn't look like
-// "CODE - Location" (e.g. "CSBA - Parqal") for review, but NEVER blocks
-// import, since real branch names will vary more than one pattern can
-// fully anticipate.
-const PICKUP_BRANCH_FORMAT_RE = /^[A-Za-z0-9.&']+(\s+[A-Za-z0-9.&']+)*\s-\s[A-Za-z0-9.&' ]+$/
+// Collapses a pickup-branch string down to a comparison key: lowercased,
+// with every run of non-alphanumeric characters (dashes, extra spaces,
+// punctuation) squashed to a single space. This is deliberately loose so
+// "CSBA-Parqal", "csba   parqal", "Csba - PARQAL " all resolve to the same
+// key and land on the exact same canonical value.
+function branchLookupKey(raw) {
+  return String(raw ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+}
+const PICKUP_BRANCH_LOOKUP = new Map(PICKUP_BRANCHES.map((b) => [branchLookupKey(b), b]))
 
+// Pickup branch is now a strict allow-list of exactly PICKUP_BRANCHES —
+// not a soft format check. Anything that doesn't resolve to one of those
+// two branches is marked invalid (flagged for review, same as any other
+// required-field issue) rather than silently passing through, since
+// collector routing and branch-scoped RLS both depend on this value being
+// one of the two real branches.
 function normalizePickupBranch(raw, maxLength) {
-  const value = normalizeText(raw).slice(0, maxLength)
-  if (!value) return { value: '', present: false, formatOk: true }
-  return { value, present: true, formatOk: PICKUP_BRANCH_FORMAT_RE.test(value) }
+  const trimmedRaw = normalizeText(raw).slice(0, maxLength).trim()
+  if (!trimmedRaw) return { value: '', present: false, valid: true }
+  const canonical = PICKUP_BRANCH_LOOKUP.get(branchLookupKey(trimmedRaw))
+  if (canonical) return { value: canonical, present: true, valid: true }
+  // Keep the raw text visible in the preview (so the admin can see
+  // exactly what was in the source file) but mark it invalid.
+  return { value: trimmedRaw, present: true, valid: false }
 }
 
 // Individual name parts (first/middle/last) must be LETTERS ONLY — no
@@ -317,7 +348,7 @@ function normalizePickupBranch(raw, maxLength) {
 // even for an individual payee, and a company payee doesn't need any of
 // these three filled in at all.
 function normalizeIndividualNamePart(raw, maxLength = PAYEE_NAME_PART_MAX_LENGTH) {
-  const value = normalizeText(raw).slice(0, maxLength)
+  const value = normalizeText(raw).slice(0, maxLength).trim()
   if (!value) return { value: '', present: false, valid: true }
   const valid = /^[A-Za-z]+(?: [A-Za-z]+)*$/.test(value)
   return { value, present: true, valid }
@@ -328,23 +359,23 @@ function normalizeIndividualNamePart(raw, maxLength = PAYEE_NAME_PART_MAX_LENGTH
 // whitespace-collapsing normalization, never the letters-only check
 // applied to individual name parts.
 function normalizeCompanyName(raw, maxLength = COMPANY_NAME_MAX_LENGTH) {
-  const value = normalizeText(raw).slice(0, maxLength)
+  const value = normalizeText(raw).slice(0, maxLength).trim()
   return { value, present: value.length > 0 }
 }
 
-// Accepts y/n or yes/no in any case, with surrounding whitespace, and
-// collapses all of that down to a single canonical 'Y' or 'N' so the
-// column only ever shows one of those two values. Anything unrecognized
-// (blank, "N/A", a stray typo, etc.) is left alone and caught by the
-// invalidForm2307Attached flag instead of being silently guessed at.
+// Deliberately strict: ONLY a single-character Y or N (either case) is
+// accepted — "Yes"/"No"/"y."/" y" etc. are all rejected rather than
+// coerced. Unlike free-text fields, this flag feeds compliance/BIR-form
+// tracking, so silently guessing at looser input could misrepresent
+// whether a 2307 was actually attached. Blank is valid only when the
+// field isn't required (FORM_2307_REQUIRED controls that separately).
 function normalizeYesNo(raw) {
   const trimmed = String(raw ?? '').trim()
   if (!trimmed) return { value: '', present: false, valid: true }
-  const lower = trimmed.toLowerCase()
-  let normalized = null
-  if (lower === 'y' || lower === 'yes') normalized = 'Y'
-  else if (lower === 'n' || lower === 'no') normalized = 'N'
-  return { value: normalized ?? trimmed, present: true, valid: normalized !== null }
+  if (trimmed.length !== 1) return { value: trimmed, present: true, valid: false }
+  if (trimmed === 'y' || trimmed === 'Y') return { value: 'Y', present: true, valid: true }
+  if (trimmed === 'n' || trimmed === 'N') return { value: 'N', present: true, valid: true }
+  return { value: trimmed, present: true, valid: false }
 }
 
 // The single source of truth for "what payee name actually gets saved."
@@ -352,17 +383,18 @@ function normalizeYesNo(raw) {
 // supplied (the `bothPayeeProvided` flag surfaces this combination for
 // review rather than silently dropping the individual name). Otherwise
 // the individual's name parts are joined in first/middle/last order,
-// skipping whichever parts are blank.
+// skipping whichever parts are blank. The result is trimmed and capped at
+// PAYEE_MAX_LENGTH as a defensive backstop against a DB column limit.
 function resolvePayeeName({ company, first, middle, last }) {
-  if (company) return company
-  return [first, middle, last].filter(Boolean).join(' ')
+  const resolved = company || [first, middle, last].filter(Boolean).join(' ')
+  return resolved.trim().slice(0, PAYEE_MAX_LENGTH)
 }
 
 function downloadTemplate() {
   const csvContent = [
     'Payee Company,Payee First Name,Payee Middle Name,Payee Last Name,Payor,Check No,Check Date,Amount,Client Ref No,Pickup Branch,Account Number,2307 Attached',
     'Acme Corp,,,,Acme Corp,00123,2024-01-15,250.00,123456789012,CSBA - Parqal,000123456789,Y',
-    ',Jane,Marie,Doe,Acme Corp,00124,2024-02-03,1050.75,,,,N',
+    ',Jane,Marie,Doe,Acme Corp,00124,2024-02-03,1050.75,987654321098,CSBA - BGC,000987654321,N',
   ].join('\n')
   const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' })
   const url = URL.createObjectURL(blob)
@@ -419,6 +451,105 @@ function downloadFlaggedRows(rows, fileNameBase) {
   URL.revokeObjectURL(url)
 }
 
+// ---- Duplicate lookup + race-safe insert -----------------------------------
+
+// Looks up which (bank, check_no) pairs in `checkNos` already exist for
+// `bank`, then narrows the result to the exact-match key used everywhere
+// else in this file (bank + check no. + payee + payor + check date).
+// Shared by the debounced preview check and the final pre-commit re-check
+// in handleImport, so both read the exact same "is this really a
+// duplicate" definition.
+//
+// This is still a best-effort, point-in-time snapshot — it narrows the
+// race window between two concurrent uploads but can't fully close it on
+// its own. The actual guarantee lives in the `dedupe_key` unique index
+// (see checks_dedupe_migration.sql), enforced by upsertChunkWithFallback
+// below. This function exists for a good user experience; it isn't the
+// safety net itself.
+async function fetchExistingRowKeys(bank, checkNos) {
+  const found = new Set()
+  for (const chunk of chunkArray(checkNos, DUPLICATE_CHECK_CHUNK_SIZE)) {
+    const { data, error } = await supabase
+      .from('checks')
+      .select('check_no, payee, payor, check_date')
+      .eq('bank', bank)
+      .in('check_no', chunk)
+    if (error) throw error
+    data?.forEach((d) => {
+      if (d.check_no) found.add(fullRowKey(bank, d.check_no, d.payee, d.payor, d.check_date))
+    })
+  }
+  return found
+}
+
+// Postgres error code for "there is no unique or exclusion constraint
+// matching the ON CONFLICT specification" — returned if the dedupe_key
+// migration hasn't been applied to this database yet.
+const DEDUPE_CONSTRAINT_MISSING_CODE = '42P10'
+
+// Inserts one chunk of rows using the `dedupe_key` unique index as the
+// actual, database-enforced defense against two verifiers importing
+// overlapping rows at the same time. `ignoreDuplicates: true` turns this
+// into an atomic "insert only the rows that don't already exist" — the
+// only way to correctly close the race condition, since a client-side
+// "check then insert" can't: two concurrent uploads can both pass the
+// check before either one commits.
+//
+// Falls back to a plain insert if the migration hasn't been run yet, so
+// uploads keep working either way — just without the DB-level guarantee
+// until the migration is applied (the caller surfaces this to the admin).
+async function upsertChunkWithFallback(chunk) {
+  const { data, error } = await supabase
+    .from('checks')
+    .upsert(chunk, { onConflict: 'dedupe_key', ignoreDuplicates: true })
+    .select('check_no')
+
+  if (!error) {
+    return { insertedCount: data?.length ?? chunk.length, usedDedupeConstraint: true }
+  }
+
+  if (error.code === DEDUPE_CONSTRAINT_MISSING_CODE) {
+    const { data: insertData, error: insertError } = await supabase
+      .from('checks')
+      .insert(chunk)
+      .select('check_no')
+    if (insertError) throw insertError
+    return { insertedCount: insertData?.length ?? chunk.length, usedDedupeConstraint: false }
+  }
+
+  throw error
+}
+
+// ---- Import progress animation ---------------------------------------------
+
+function easeOutQuad(t) {
+  return t * (2 - t)
+}
+
+// Smoothly ramps `onUpdate` from the current value to `to` over
+// `durationMs`, decelerating near the end (ease-out) so the progress bar
+// doesn't visibly jump straight to its target. Used for the phases of the
+// import where there's no granular real progress to report (validation,
+// normalization, finalizing) — the actual upload phase reports real
+// per-chunk progress instead.
+function animateProgress({ from, to, durationMs, onUpdate }) {
+  return new Promise((resolve) => {
+    const start = performance.now()
+    function tick(now) {
+      const elapsed = now - start
+      const t = Math.min(elapsed / durationMs, 1)
+      onUpdate(Math.round(from + (to - from) * easeOutQuad(t)))
+      if (t < 1) requestAnimationFrame(tick)
+      else resolve()
+    }
+    requestAnimationFrame(tick)
+  })
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
 export default function AdminUpload() {
   const [fileName, setFileName] = useState('')
   const [fileSize, setFileSize] = useState(0)
@@ -428,6 +559,7 @@ export default function AdminUpload() {
   const [autoDetected, setAutoDetected] = useState({})
   const [saving, setSaving] = useState(false)
   const [importProgress, setImportProgress] = useState(0)
+  const [importStageMessage, setImportStageMessage] = useState('')
   const [parseError, setParseError] = useState('')
   const [isDragging, setIsDragging] = useState(false)
   const [importedCount, setImportedCount] = useState(null) // set once import succeeds
@@ -451,6 +583,11 @@ export default function AdminUpload() {
   // the same batch (or an overlapping one) gets caught before it creates
   // duplicate register entries. Only an EXACT match across all five fields
   // counts — change any one of them and it's a distinct, allowed entry.
+  // NOTE: this is an advisory, point-in-time preview check only. The
+  // actual guarantee against a second verifier importing the same rows at
+  // the same time comes from the dedupe_key unique index + the final
+  // pre-commit re-check inside handleImport — see fetchExistingRowKeys
+  // and upsertChunkWithFallback above.
   const [existingCheckNos, setExistingCheckNos] = useState(() => new Set())
   const [checkingDuplicates, setCheckingDuplicates] = useState(false)
 
@@ -565,7 +702,7 @@ export default function AdminUpload() {
         accountNumberValid: accountNumber.valid,
         pickup_branch: pickupBranch.value,
         pickupBranchPresent: pickupBranch.present,
-        pickupBranchFormatOk: pickupBranch.formatOk,
+        pickupBranchValid: pickupBranch.valid,
         form_2307_attached: form2307.value,
         form2307Present: form2307.present,
         form2307Valid: form2307.valid,
@@ -617,7 +754,8 @@ export default function AdminUpload() {
         missingAccountNumber: FIELD_DEFS_BY_KEY.account_number.required && !r.accountNumberPresent,
         invalidAccountNumber: r.accountNumberPresent && !r.accountNumberValid,
         missingPickupBranch: FIELD_DEFS_BY_KEY.pickup_branch.required && !r.pickupBranchPresent,
-        pickupBranchFormat: r.pickupBranchPresent && !r.pickupBranchFormatOk,
+        invalidPickupBranch: r.pickupBranchPresent && !r.pickupBranchValid,
+        missingForm2307Attached: FIELD_DEFS_BY_KEY.form_2307_attached.required && !r.form2307Present,
         invalidForm2307Attached: r.form2307Present && !r.form2307Valid,
       }
       const hasIssue = Object.values(flags).some(Boolean)
@@ -645,22 +783,7 @@ export default function AdminUpload() {
     setCheckingDuplicates(true)
     const t = setTimeout(async () => {
       try {
-        const found = new Set()
-        for (let i = 0; i < uniqueNos.length; i += DUPLICATE_CHECK_CHUNK_SIZE) {
-          const chunk = uniqueNos.slice(i, i + DUPLICATE_CHECK_CHUNK_SIZE)
-          const { data, error } = await supabase
-            .from('checks')
-            .select('check_no, payee, payor, check_date')
-            .eq('bank', bankValue) // scope to this bank only
-            .in('check_no', chunk)
-          if (!error && data) {
-            data.forEach((d) => {
-              if (d.check_no) {
-                found.add(fullRowKey(bankValue, d.check_no, d.payee, d.payor, d.check_date))
-              }
-            })
-          }
-        }
+        const found = await fetchExistingRowKeys(bankValue, uniqueNos)
         if (!cancelled) setExistingCheckNos(found)
       } catch {
         // Best-effort only — a failed lookup just means this particular
@@ -777,6 +900,7 @@ export default function AdminUpload() {
     setAutoDetected({})
     setParseError('')
     setImportProgress(0)
+    setImportStageMessage('')
     setImportedCount(null)
     setImportedBank('')
     setShowAllRows(false)
@@ -811,6 +935,7 @@ export default function AdminUpload() {
     setParseError('')
     setImportedCount(null)
     setImportedBank('')
+    setImportStageMessage('')
     setShowAllRows(false)
     setExcludedRows(new Set())
     setPreviewSearch('')
@@ -958,30 +1083,81 @@ export default function AdminUpload() {
     setSaving(true)
     setImportProgress(0)
 
-    // Rows already carry their normalized values (including the resolved
-    // payee name and bank) from the pipeline above, so the saved data
-    // always matches exactly what the preview showed. Both the resolved
-    // `payee` (kept for backward compatibility / search / duplicate
-    // checks) and the raw split columns are saved, so nothing is lost.
-    const preparedRows = includedRows.map((r) => ({
-      row_number: r.rowNumber,
-      bank: r.bank,
-      payee: r.payee,
-      payee_company: r.payee_company || null,
-      payee_first_name: r.payee_first_name || null,
-      payee_middle_name: r.payee_middle_name || null,
-      payee_last_name: r.payee_last_name || null,
-      payor: r.payor,
-      check_no: r.check_no,
-      check_date: r.check_date,
-      amount: r.amount,
-      client_ref_no: r.client_ref_no || null,
-      pickup_branch: r.pickup_branch || null,
-      account_number: r.account_number || null,
-      form_2307_attached: r.form_2307_attached || null,
-    }))
+    // Rotates through IMPORT_STAGE_MESSAGES independently of the real work
+    // below — this is purely cosmetic pacing, cleared in `finally`
+    // regardless of how the import turns out.
+    let stageIndex = 0
+    setImportStageMessage(IMPORT_STAGE_MESSAGES[0])
+    const stageTimer = setInterval(() => {
+      stageIndex = (stageIndex + 1) % IMPORT_STAGE_MESSAGES.length
+      setImportStageMessage(IMPORT_STAGE_MESSAGES[stageIndex])
+    }, IMPORT_STAGE_MESSAGE_INTERVAL_MS)
+
+    const importStartedAt = performance.now()
 
     try {
+      // Phase 1 — reaffirm client-side validation (already computed in the
+      // normalizedRows pipeline above; this gives it a visible moment).
+      await animateProgress({ from: 0, to: 18, durationMs: 500, onUpdate: setImportProgress })
+
+      // Phase 2 — normalization (also already computed above).
+      await animateProgress({ from: 18, to: 34, durationMs: 450, onUpdate: setImportProgress })
+
+      // Phase 3 — a REAL, final duplicate re-check against the database,
+      // run again right before committing. The debounced check that ran
+      // while previewing can be stale by the time an admin clicks Import —
+      // if another verifier imported an overlapping row in the meantime,
+      // this catches it and drops that row from the batch instead of
+      // relying only on the earlier snapshot.
+      let raceExcludedCount = 0
+      let rowsToImport = includedRows
+      try {
+        const checkNos = [...new Set(includedRows.map((r) => r.check_no).filter(Boolean))]
+        const freshExisting = await fetchExistingRowKeys(bankValue, checkNos)
+        rowsToImport = includedRows.filter(
+          (r) => !freshExisting.has(fullRowKey(r.bank, r.check_no, r.payee, r.payor, r.check_date)),
+        )
+        raceExcludedCount = includedRows.length - rowsToImport.length
+      } catch {
+        // Best-effort — if this final check can't reach the database, fall
+        // through with the original set and rely on the dedupe_key unique
+        // index (if the migration has been applied) as the last line of
+        // defense.
+      }
+
+      if (rowsToImport.length === 0) {
+        push({
+          variant: 'error',
+          title: 'Nothing left to import',
+          description:
+            'Every remaining row was just imported by someone else. Refresh the file and try again if needed.',
+        })
+        return
+      }
+
+      await animateProgress({ from: 34, to: 52, durationMs: 400, onUpdate: setImportProgress })
+
+      // Rows already carry their normalized values (including the resolved
+      // payee name and bank) from the pipeline above, so the saved data
+      // always matches exactly what the preview showed.
+      const preparedRows = rowsToImport.map((r) => ({
+        row_number: r.rowNumber,
+        bank: r.bank,
+        payee: r.payee,
+        payee_company: r.payee_company || null,
+        payee_first_name: r.payee_first_name || null,
+        payee_middle_name: r.payee_middle_name || null,
+        payee_last_name: r.payee_last_name || null,
+        payor: r.payor,
+        check_no: r.check_no,
+        check_date: r.check_date,
+        amount: r.amount,
+        client_ref_no: r.client_ref_no || null,
+        pickup_branch: r.pickup_branch || null,
+        account_number: r.account_number || null,
+        form_2307_attached: r.form_2307_attached || null,
+      }))
+
       const {
         data: { user },
       } = await supabase.auth.getUser()
@@ -1003,37 +1179,78 @@ export default function AdminUpload() {
       }
 
       const toInsert = preparedRows.map((r) => ({ ...r, batch_id: batch.id, status: 'available' }))
+      const chunks = chunkArray(toInsert, IMPORT_CHUNK_SIZE)
 
-      // insert in chunks to stay under request size limits
-      for (let i = 0; i < toInsert.length; i += IMPORT_CHUNK_SIZE) {
-        const chunk = toInsert.slice(i, i + IMPORT_CHUNK_SIZE)
-        const { error } = await supabase.from('checks').insert(chunk)
-        if (error) {
-          push({ variant: 'error', title: 'Import failed partway', description: error.message })
+      // Phase 4 — the real upload. Each chunk goes through
+      // upsertChunkWithFallback, which is what actually closes the race
+      // condition at the database level (see its doc comment above).
+      let insertedTotal = 0
+      let dbSkippedCount = 0
+      let usedDedupeConstraint = true
+
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i]
+        let result
+        try {
+          result = await upsertChunkWithFallback(chunk)
+        } catch (err) {
+          push({ variant: 'error', title: 'Import failed partway', description: err?.message || 'Unknown error.' })
           return
         }
-        setImportProgress(Math.round((Math.min(i + chunk.length, toInsert.length) / toInsert.length) * 100))
+        insertedTotal += result.insertedCount
+        dbSkippedCount += chunk.length - result.insertedCount
+        if (!result.usedDedupeConstraint) usedDedupeConstraint = false
+
+        const uploadFraction = (i + 1) / chunks.length
+        setImportProgress(52 + Math.round(uploadFraction * 40)) // 52 -> 92
       }
+
+      // Phase 5 — finalize.
+      await animateProgress({ from: 92, to: 98, durationMs: 300, onUpdate: setImportProgress })
 
       logAuditEvent('checks_uploaded', {
         batch_id: batch.id,
         file_name: fileName,
         bank: bankValue,
-        row_count: toInsert.length,
-        excluded_count: enrichedRows.length - toInsert.length,
+        row_count: insertedTotal,
+        excluded_count: enrichedRows.length - insertedTotal,
+        race_excluded_count: raceExcludedCount,
+        db_skipped_count: dbSkippedCount,
       }).catch(() => {})
 
-      const excludedTotal = enrichedRows.length - toInsert.length
+      const elapsed = performance.now() - importStartedAt
+      if (elapsed < MIN_IMPORT_ANIMATION_MS) {
+        await wait(MIN_IMPORT_ANIMATION_MS - elapsed)
+      }
+      setImportProgress(100)
+      setImportStageMessage('Import complete')
+
+      const skippedNotes = []
+      if (raceExcludedCount > 0) {
+        skippedNotes.push(`${raceExcludedCount} skipped — just imported by someone else`)
+      }
+      if (dbSkippedCount > 0) {
+        skippedNotes.push(`${dbSkippedCount} skipped by the database as duplicates`)
+      }
+      const clientExcludedTotal = enrichedRows.length - includedRows.length
+      if (clientExcludedTotal > 0) {
+        skippedNotes.push(`${clientExcludedTotal} excluded before import`)
+      }
+
+      const migrationNote = !usedDedupeConstraint
+        ? ' Note: the dedupe_key migration was not detected — duplicate protection is running in fallback mode; see checks_dedupe_migration.sql.'
+        : ''
+
       push({
         variant: 'success',
         title: 'Import complete',
         description:
-          excludedTotal > 0
-            ? `${toInsert.length} ${bankValue} checks added from ${fileName} (${excludedTotal} excluded).`
-            : `${toInsert.length} ${bankValue} checks added from ${fileName}.`,
+          (skippedNotes.length > 0
+            ? `${insertedTotal} ${bankValue} checks added from ${fileName} (${skippedNotes.join(', ')}).`
+            : `${insertedTotal} ${bankValue} checks added from ${fileName}.`) + migrationNote,
       })
       setImportedBank(bankValue)
-      setImportedCount(toInsert.length)
+      setImportedCount(insertedTotal)
     } catch (err) {
       push({
         variant: 'error',
@@ -1041,6 +1258,7 @@ export default function AdminUpload() {
         description: err?.message || 'Something went wrong. Please try again.',
       })
     } finally {
+      clearInterval(stageTimer)
       setSaving(false)
     }
   }
@@ -1055,9 +1273,15 @@ export default function AdminUpload() {
           Select the source bank, then import a CSV or Excel file (up to {formatFileSize(MAX_FILE_SIZE_BYTES)},{' '}
           {MAX_ROWS.toLocaleString()} rows max) with Payor, Check No, Check Date, and Amount columns. For the
           payee, map either a Payee Company column, or Payee First/Middle/Last Name columns for an individual —
-          whichever one is filled in for a row is what gets saved. A row is only treated as a duplicate if its
-          bank, payee, payor, check no., and check date all match another row exactly — change any one of those
-          and it's a distinct row.
+          whichever one is filled in for a row is what gets saved. Client Ref. No, Pickup Branch, Account
+          Number, and 2307 Attached are all required columns too: Pickup Branch must resolve to exactly{' '}
+          <span className="font-medium text-ink-600">CSBA - Parqal</span> or{' '}
+          <span className="font-medium text-ink-600">CSBA - BGC</span>, and 2307 Attached must be a single{' '}
+          <span className="font-mono font-medium text-ink-600">Y</span> or{' '}
+          <span className="font-mono font-medium text-ink-600">N</span> character. A row is only treated as a
+          duplicate if its bank, payee, payor, check no., and check date all match another row exactly — change
+          any one of those and it's a distinct row. Two verifiers importing overlapping rows at the same time are
+          each protected: the database rejects the second copy rather than both silently succeeding.
         </p>
       </div>
 
@@ -1287,6 +1511,16 @@ export default function AdminUpload() {
                       )}
                     </div>
                   )}
+
+                  <p className="mt-2 text-xs text-ink-400">
+                    Pickup Branch must resolve to exactly{' '}
+                    <span className="font-medium text-ink-600">CSBA - Parqal</span> or{' '}
+                    <span className="font-medium text-ink-600">CSBA - BGC</span> (spacing, punctuation, and
+                    case are ignored when matching). 2307 Attached must be a single{' '}
+                    <span className="font-mono font-medium text-ink-600">Y</span> or{' '}
+                    <span className="font-mono font-medium text-ink-600">N</span> character — full words like
+                    "Yes"/"No" are flagged, not auto-corrected.
+                  </p>
 
                   {/* KPI summary row — same visual language as the checks
                       register and dashboard, so every admin page reads the
@@ -1668,9 +1902,11 @@ export default function AdminUpload() {
                               <PreviewCell
                                 value={r.pickup_branch}
                                 missing={r.flags.missingPickupBranch}
-                                invalid={r.flags.pickupBranchFormat}
+                                invalid={r.flags.invalidPickupBranch}
                                 tooltip={
-                                  r.flags.pickupBranchFormat ? 'Expected format e.g. "CSBA - Parqal"' : undefined
+                                  r.flags.invalidPickupBranch
+                                    ? 'Must be exactly "CSBA - Parqal" or "CSBA - BGC"'
+                                    : undefined
                                 }
                               />
                               <PreviewCell
@@ -1686,9 +1922,13 @@ export default function AdminUpload() {
                               />
                               <PreviewCell
                                 value={r.form_2307_attached}
-                                missing={false}
+                                missing={r.flags.missingForm2307Attached}
                                 invalid={r.flags.invalidForm2307Attached}
-                                tooltip={r.flags.invalidForm2307Attached ? 'Must be Y or N' : undefined}
+                                tooltip={
+                                  r.flags.invalidForm2307Attached
+                                    ? 'Must be a single character: Y or N'
+                                    : undefined
+                                }
                               />
                             </tr>
                           )
@@ -1752,7 +1992,10 @@ export default function AdminUpload() {
                   {saving && (
                     <div className="mt-5">
                       <div className="mb-1.5 flex items-center justify-between text-xs text-ink-400">
-                        <span>Importing…</span>
+                        <span key={importStageMessage} className="stage-fade-in flex items-center gap-1.5">
+                          <Loader2 className="h-3 w-3 animate-spin text-teal-500" />
+                          {importStageMessage || 'Importing…'}
+                        </span>
                         <span className="font-mono">{importProgress}%</span>
                       </div>
                       <div
@@ -1761,12 +2004,23 @@ export default function AdminUpload() {
                         aria-valuenow={importProgress}
                         aria-valuemin={0}
                         aria-valuemax={100}
+                        aria-live="polite"
                       >
                         <div
-                          className="h-full rounded-full bg-teal-500 transition-all duration-300"
+                          className="h-full rounded-full bg-gradient-to-r from-teal-400 to-teal-600 transition-[width] duration-200 ease-out"
                           style={{ width: `${Math.max(importProgress, 4)}%` }}
                         />
                       </div>
+                      <style>{`
+                        .stage-fade-in { animation: stage-fade-in 0.25s ease-out; }
+                        @keyframes stage-fade-in {
+                          from { opacity: 0; transform: translateY(2px); }
+                          to { opacity: 1; transform: translateY(0); }
+                        }
+                        @media (prefers-reduced-motion: reduce) {
+                          .stage-fade-in { animation: none; }
+                        }
+                      `}</style>
                     </div>
                   )}
 

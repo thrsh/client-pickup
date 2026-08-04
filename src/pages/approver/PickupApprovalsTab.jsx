@@ -1,92 +1,33 @@
-// src/pages/approver/ApproverHome.jsx
+// Approver-side half of the submit-for-approval flow. Admins submit
+// per-check pickup data; those checks land here as 'pending_approval'.
+// Approve -> picked_up (released). Return -> back to 'reserved' so the
+// submitting admin can fix and resubmit.
 //
-// Approver-side half of the submit-for-approval flow started in
-// AdminPickups.jsx. Admins submit per-check pickup data; those checks land
-// here as 'pending_approval'. For each one an approver decides:
-//   - Approve -> check is marked picked_up (released to the collector).
-//   - Return  -> check goes back to the SAME reservation as 'reserved' so
-//                the submitting admin can fix it and resubmit. It is never
-//                released to the general pool.
+// Branch scoping: profiles.branch stores a machine code; checks.pickup_branch
+// stores the human label. BRANCH_CODE_TO_LABEL is the single translation
+// point — applied server-side in the query and re-asserted client-side as
+// defense in depth. The real boundary is the RLS policy on `checks`.
 //
-// ID VERIFICATION OWNERSHIP CHANGE:
-// Collector identity verification is now captured upstream by the verifier
-// role at intake, and stored on `pickup_reservations` as collector_id_type,
-// collector_id_type_other (free-text label when type = 'other'), and
-// collector_id_number. This page no longer collects or edits that data —
-// it only displays it, and gates Approve on a reservation having a type +
-// number on file (there is no expiry or verified-by column in the schema,
-// so "verified" here just means those two fields are populated).
+// Stale-report checks (non-null report_number) are excluded server-side so
+// the server `count` and rendered rows always agree — the tab badge is
+// always derived from rendered rows, never the raw count.
 //
-// BRANCH SCOPING
-// Approvers only see checks whose pickup_branch matches their own branch.
-// profiles.branch stores a machine-readable code (csba_parqal / csba_bgc /
-// all_branches); checks.pickup_branch stores the human-readable label
-// collectors/verifiers/admins actually typed. BRANCH_CODE_TO_LABEL is the
-// single translation point between the two. The restriction is applied at
-// the query level and re-asserted client-side as defense in depth — the
-// real access boundary is the Postgres RLS policy on `checks`, which must
-// apply the same translation. Admins are branch-agnostic; the existing
-// "Pickup branch" advanced filter still lets them narrow within what they
-// see.
-//
-// CONCURRENT-APPROVER RACE CONDITION:
-// Two approvers can open the same reservation at the same time. Before
-// submitting a decision this page re-fetches the live status AND pickup
-// branch of every targeted check (through a retrying, timeout-bound query)
-// and drops any that another approver already decided or that fell outside
-// this approver's branch scope in the meantime, rather than blindly
-// re-applying a decision to a check that has moved on. This narrows the
-// race window but cannot fully close it client-side — the authoritative
-// fix is for `approver_decide` itself to be atomic per check, e.g.:
-//   UPDATE checks SET status = ... WHERE id = ANY(...) AND status = 'pending_approval'
-//   (checking ROW_COUNT / FOUND per check, the way approver_decide_staled_report does)
-// so a check already claimed by another transaction is simply skipped
-// server-side instead of double-processed. If you share the current
-// `approver_decide` definition, it can be hardened the same way.
-//
-// Requires the approval-workflow migration (admin_submit_for_approval,
-// admin_recall_submission, approver_decide, checks.status =
-// 'pending_approval', profiles table) to have been run first.
+// Concurrent-approver race: before submitting, live status/branch of every
+// targeted check is re-fetched and anything already decided or out of
+// scope is dropped. This narrows but doesn't close the race — the
+// authoritative fix belongs in approver_decide's own atomic
+// UPDATE ... WHERE status = 'pending_approval'.
 //
 // Route-level access is enforced by <ProtectedRoute roles={['approver','admin']}>;
-// the in-component role check below is defense-in-depth only — the real
-// authority is the Postgres RLS policy / approver_decide's own role check.
+// the in-component check below is defense-in-depth only.
+
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
-  RefreshCw,
-  Search,
-  X,
-  Check,
-  RotateCcw,
-  Loader2,
-  AlertTriangle,
-  User,
-  Hash,
-  Layers,
-  ChevronDown,
-  ChevronUp,
-  CheckSquare,
-  Square,
-  MinusSquare,
-  Download,
-  ArrowUpDown,
-  CheckCircle2,
-  ShieldCheck,
-  ShieldAlert,
-  Pause,
-  Play,
-  Stamp,
-  Hourglass,
-  SlidersHorizontal,
-  TrendingUp,
-  Users,
-  Timer,
-  Wallet,
-  Landmark,
-  Building2,
-  Fingerprint,
-  Lock,
-  WifiOff,
+  RefreshCw, Search, X, Check, RotateCcw, Loader2, AlertTriangle, User, Hash, Layers,
+  ChevronDown, ChevronUp, CheckSquare, Square, MinusSquare, Download, ArrowUpDown,
+  CheckCircle2, ShieldCheck, ShieldAlert, Pause, Play, Stamp, Hourglass,
+  SlidersHorizontal, TrendingUp, Users, Timer, Wallet, Landmark, Building2,
+  Fingerprint, Lock, Inbox,
 } from 'lucide-react'
 import { supabase } from '../../lib/supabaseClient'
 import { Input } from '../../components/ui/input'
@@ -97,7 +38,6 @@ import { useProfile, hasRole } from '../../context/ProfileContext'
 const POLL_INTERVAL_MS = 20000
 const SUCCESS_FLASH_MS = 900
 const ALLOWED_ROLES = ['approver', 'admin']
-// Keep in sync with AdminPickups.jsx so both pages agree on "taking too long."
 const PENDING_WARN_MINUTES = 60
 const PENDING_CRITICAL_MINUTES = 240
 const REMARKS_MAX_LEN = 200
@@ -106,9 +46,8 @@ const RETRY_DELAYS_MS = [400, 1200]
 const FETCH_TIMEOUT_MS = 20000
 
 const BRANCH_COLUMN = 'pickup_branch'
+const STALE_REPORT_COLUMN = 'report_number'
 
-// profiles.branch (code) -> checks.pickup_branch (label). Single
-// translation point — update here if either vocabulary changes.
 const BRANCH_CODE_TO_LABEL = {
   csba_parqal: 'CSBA - Parqal',
   csba_bgc: 'CSBA - BGC',
@@ -120,19 +59,11 @@ function resolveBranchLabel(code) {
   return BRANCH_CODE_TO_LABEL[code] || null
 }
 
-// Any of these columns being non-empty on a `checks` row means it belongs
-// to a Staled Check Report (see StaleWatchPanel.jsx / verifier_submit_stale_checks_for_approval),
-// not a pickup reservation — that flow is reviewed in ApproverStaleReports.jsx.
-// Kept as a list until the real column name is confirmed against the schema.
-const STALE_REPORT_FIELD_CANDIDATES = ['stale_report_number', 'staled_report_number', 'report_number']
-
 function isStaleReportCheck(row) {
-  return STALE_REPORT_FIELD_CANDIDATES.some((key) => row?.[key] !== null && row?.[key] !== undefined && row?.[key] !== '')
+  const v = row?.[STALE_REPORT_COLUMN]
+  return v !== null && v !== undefined && v !== ''
 }
 
-// Known values for pickup_reservations.collector_id_type; anything else
-// (including 'other', which pairs with collector_id_type_other for a
-// free-text label) falls back to labelForIdType() below.
 const ID_TYPE_LABELS = {
   passport: 'Passport',
   national_id: 'National ID (PhilSys)',
@@ -173,30 +104,21 @@ const UNKNOWN_BRANCH_LABEL = 'Unspecified'
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 function normalizeBank(bank) {
-  const trimmed = typeof bank === 'string' ? bank.trim() : ''
-  return trimmed || UNKNOWN_BANK_LABEL
+  return (typeof bank === 'string' ? bank.trim() : '') || UNKNOWN_BANK_LABEL
 }
-
 function normalizeBranch(branch) {
-  const trimmed = typeof branch === 'string' ? branch.trim() : ''
-  return trimmed || UNKNOWN_BRANCH_LABEL
+  return (typeof branch === 'string' ? branch.trim() : '') || UNKNOWN_BRANCH_LABEL
 }
-
 function branchKey(branch) {
   return normalizeBranch(branch).trim().toLowerCase()
 }
 
-// collector_id_type is 'other' paired with a free-text collector_id_type_other,
-// or one of the known ID_TYPE_LABELS values.
 function labelForIdType(idType, idTypeOther) {
   if (!idType) return null
   if (idType === 'other') return idTypeOther?.trim() || 'Other ID'
   return ID_TYPE_LABELS[idType] || idType
 }
 
-// Reads the verifier-entered ID fields off an embedded reservation row.
-// Returns null if nothing has been recorded yet. Centralized here so a
-// schema rename only needs to change one place.
 function getReservationIdInfo(reservation) {
   if (!reservation || !reservation.collector_id_type) return null
   return {
@@ -206,8 +128,8 @@ function getReservationIdInfo(reservation) {
   }
 }
 
-// There's no expiry or verified-by tracking in the schema — "verified"
-// here means the verifier recorded a type and number, nothing more.
+// No expiry/verified-by tracking in the schema — "verified" just means a
+// type and number were recorded.
 function idInfoStatus(idInfo) {
   if (!idInfo || !idInfo.idType || !idInfo.idNumber) return 'missing'
   return 'verified'
@@ -215,22 +137,13 @@ function idInfoStatus(idInfo) {
 
 function formatIdSummary(idInfo) {
   if (!idInfo) return 'No ID on file'
-  const label = labelForIdType(idInfo.idType, idInfo.idTypeOther)
-  return `${label} #${idInfo.idNumber}`
+  return `${labelForIdType(idInfo.idType, idInfo.idTypeOther)} #${idInfo.idNumber}`
 }
 
-// Records which on-file ID a release was matched against, for the audit
-// trail in the check's own remarks (approvals otherwise carry none).
 function formatReleaseRemark(idInfo) {
   return `Released — ID on file: ${formatIdSummary(idInfo)}`
 }
 
-// One row per check pending approval, sourced from `checks` directly (the
-// same table/column the dashboard's "Awaiting your decision" KPI reads)
-// rather than from `pickup_reservations`, since a reservation's own status
-// can lag behind the status of the checks inside it. The reservation is
-// embedded only for display (collector name, ID on file) and for the id
-// approver_decide needs.
 function buildPendingRows(checks) {
   return (checks || [])
     .filter((c) => !isStaleReportCheck(c))
@@ -260,9 +173,6 @@ function buildPendingRows(checks) {
     })
 }
 
-// Defense-in-depth: strips rows outside the active branch scope even
-// though the query is already scoped server-side. requiredBranch === null
-// means no restriction (admin, unscoped).
 function enforceBranchScope(rows, requiredBranch) {
   if (!requiredBranch) return rows
   const required = branchKey(requiredBranch)
@@ -273,12 +183,7 @@ function groupByReservation(rows) {
   const map = new Map()
   rows.forEach((row) => {
     if (!map.has(row.reservationId)) {
-      map.set(row.reservationId, {
-        reservationId: row.reservationId,
-        collectorName: row.collectorName,
-        idInfo: row.idInfo,
-        items: [],
-      })
+      map.set(row.reservationId, { reservationId: row.reservationId, collectorName: row.collectorName, idInfo: row.idInfo, items: [] })
     }
     map.get(row.reservationId).items.push(row)
   })
@@ -289,14 +194,10 @@ function matchesSearch(items, term) {
   if (!term) return true
   const needle = term.toLowerCase()
   return items.some((c) =>
-    [c.payee, c.payor, c.check_no, c.collectorName, c.or_no, c.bank]
-      .filter(Boolean)
-      .some((field) => String(field).toLowerCase().includes(needle))
+    [c.payee, c.payor, c.check_no, c.collectorName, c.or_no, c.bank].filter(Boolean).some((f) => String(f).toLowerCase().includes(needle))
   )
 }
 
-// Sums in integer cents to avoid floating-point drift on repeated addition,
-// then converts back — keeps large-batch totals exact to the peso.
 function orderTotal(items) {
   const cents = items.reduce((sum, c) => {
     const n = Number(c.amount)
@@ -307,17 +208,14 @@ function orderTotal(items) {
 
 function earliestSubmittedAt(items) {
   const times = items.map((c) => c.submitted_at).filter(Boolean).map((t) => new Date(t).getTime())
-  if (times.length === 0) return null
-  return Math.min(...times)
+  return times.length === 0 ? null : Math.min(...times)
 }
 
 function formatMinutesDuration(mins) {
   if (mins === null || mins === undefined || Number.isNaN(mins)) return '—'
   const whole = Math.max(0, Math.round(mins))
   if (whole < 60) return `${whole}m`
-  const hrs = Math.floor(whole / 60)
-  const rem = whole % 60
-  return `${hrs}h ${rem}m`
+  return `${Math.floor(whole / 60)}h ${whole % 60}m`
 }
 
 function safeCurrency(amount) {
@@ -327,22 +225,14 @@ function safeCurrency(amount) {
 
 function classifyError(err) {
   const message = err?.message || String(err || 'Something went wrong')
-  if (err?.name === 'AbortError') {
-    return { type: 'network', message: 'That took too long to respond. Please try again.' }
-  }
-  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
-    return { type: 'network', message: "You're offline. Reconnect and try again." }
-  }
-  if (/failed to fetch|network|timeout|econnreset|502|503|504/i.test(message)) {
-    return { type: 'network', message: 'Network error reaching the server. Please try again.' }
-  }
+  if (err?.name === 'AbortError') return { type: 'network', message: 'That took too long to respond. Please try again.' }
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return { type: 'network', message: "You're offline. Reconnect and try again." }
+  if (/failed to fetch|network|timeout|econnreset|502|503|504/i.test(message)) return { type: 'network', message: 'Network error reaching the server. Please try again.' }
   return { type: 'validation', message }
 }
 
-// Retries transient failures with backoff and enforces a hard timeout via
-// the shared AbortSignal. `buildQuery` must construct a fresh query per
-// call — Supabase builders execute on await, so re-awaiting one instance
-// won't actually retry the request.
+// buildQuery must construct a fresh query per call — Supabase builders
+// execute on await, so re-awaiting one instance won't actually retry.
 async function runSupabaseQuery(buildQuery, signal) {
   let lastError = null
   for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt += 1) {
@@ -361,37 +251,20 @@ async function runSupabaseQuery(buildQuery, signal) {
   throw lastError
 }
 
-const BANK_BADGE_PALETTE = [
-  'bg-teal-100 text-teal-700',
-  'bg-blue-100 text-blue-700',
-  'bg-purple-100 text-purple-700',
-  'bg-amber-100 text-amber-700',
-  'bg-rose-100 text-rose-700',
-  'bg-indigo-100 text-indigo-700',
-  'bg-cyan-100 text-cyan-700',
-  'bg-lime-100 text-lime-700',
-]
-
-// Deterministic color per bank name (hashed) so the same bank always gets
-// the same badge color without a hardcoded, easily-stale bank->color map.
-function bankBadgeClass(bank) {
-  if (bank === UNKNOWN_BANK_LABEL) return 'bg-ink-100 text-ink-500'
-  let hash = 0
-  for (let i = 0; i < bank.length; i += 1) hash = (hash * 31 + bank.charCodeAt(i)) >>> 0
-  return BANK_BADGE_PALETTE[hash % BANK_BADGE_PALETTE.length]
+function safeNotify(callback, payload) {
+  try {
+    callback?.(payload)
+  } catch (err) {
+    console.error('[PickupApprovalsTab] onSynced callback threw:', err)
+  }
 }
 
+// Single consistent light-teal chip for every bank — no per-bank rainbow
+// palette, to stay within teal / light-teal / light-orange / white.
 function BankBadge({ bank, className }) {
   const label = normalizeBank(bank)
   return (
-    <span
-      className={cn(
-        'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium',
-        bankBadgeClass(label),
-        className
-      )}
-      title={label}
-    >
+    <span className={cn('inline-flex items-center gap-1 rounded-full bg-teal-50 px-2 py-0.5 text-[11px] font-medium text-teal-700', className)} title={label}>
       <Landmark className="h-3 w-3 shrink-0" />
       <span className="max-w-[110px] truncate">{label}</span>
     </span>
@@ -401,13 +274,7 @@ function BankBadge({ bank, className }) {
 function BranchBadge({ branch, className }) {
   const label = normalizeBranch(branch)
   return (
-    <span
-      className={cn(
-        'inline-flex items-center gap-1 rounded-full border border-ink-200 bg-white px-2 py-0.5 text-[11px] font-medium text-ink-600',
-        className
-      )}
-      title={label}
-    >
+    <span className={cn('inline-flex items-center gap-1 rounded-full border border-ink-200 bg-white px-2 py-0.5 text-[11px] font-medium text-ink-600', className)} title={label}>
       <Building2 className="h-3 w-3 shrink-0" />
       <span className="max-w-[110px] truncate">{label}</span>
     </span>
@@ -417,10 +284,7 @@ function BranchBadge({ branch, className }) {
 function BranchScopeBadge({ branch, locked }) {
   return (
     <span
-      className={cn(
-        'inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium',
-        locked ? 'border-teal-200 bg-teal-50 text-teal-700' : 'border-ink-200 bg-white text-ink-600'
-      )}
+      className={cn('inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium', locked ? 'border-teal-200 bg-teal-50 text-teal-700' : 'border-ink-200 bg-white text-ink-600')}
       title={locked ? 'Your view is scoped to your assigned branch' : 'Viewing across all branches'}
     >
       {locked ? <Lock className="h-3 w-3" /> : <Building2 className="h-3 w-3" />}
@@ -430,33 +294,21 @@ function BranchScopeBadge({ branch, locked }) {
 }
 
 function IdStatusBadge({ idInfo, className }) {
-  const status = idInfoStatus(idInfo)
-  const config = {
-    verified: { icon: ShieldCheck, cls: 'bg-teal-100 text-teal-700', label: 'ID on file' },
-    missing: { icon: ShieldAlert, cls: 'bg-ink-100 text-ink-500', label: 'No ID on file' },
-  }[status]
-  const Icon = config.icon
+  const verified = idInfoStatus(idInfo) === 'verified'
+  const Icon = verified ? ShieldCheck : ShieldAlert
   return (
     <span
-      className={cn('inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium', config.cls, className)}
+      className={cn('inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium', verified ? 'bg-teal-100 text-teal-700' : 'bg-orange-100 text-orange-700', className)}
       title={formatIdSummary(idInfo)}
     >
       <Icon className="h-3 w-3 shrink-0" />
-      {config.label}
+      {verified ? 'ID on file' : 'No ID on file'}
     </span>
   )
 }
 
-// Font sizes tried in order, largest first, until the text fits its
-// container without overflowing. If even the smallest still overflows,
-// the container's own `truncate` class takes over and ellipsizes it.
 const FIT_TEXT_STEPS = ['text-sm', 'text-[13px]', 'text-xs', 'text-[11px]', 'text-[10px]']
 
-// Shrink-to-fit label for cells with limited, variable width (payee names
-// range from a few characters to entire company names). Tries each step in
-// FIT_TEXT_STEPS until the text no longer overflows its container, then
-// falls back to standard truncation with an ellipsis and a full-text
-// tooltip so nothing is ever silently cut off without a way to read it.
 function FitText({ text, className }) {
   const ref = useRef(null)
   const [stepIndex, setStepIndex] = useState(0)
@@ -465,7 +317,6 @@ function FitText({ text, className }) {
   useLayoutEffect(() => {
     const el = ref.current
     if (!el) return
-
     function fit() {
       let step = 0
       el.style.fontSize = ''
@@ -476,7 +327,6 @@ function FitText({ text, className }) {
       }
       setStepIndex(step)
     }
-
     fit()
     const observer = new ResizeObserver(fit)
     observer.observe(el)
@@ -491,7 +341,6 @@ function FitText({ text, className }) {
 }
 
 export default function PickupApprovalsTab({ active = true, refreshToken = 0, onSynced }) {
-
   const { role, name, branch: myBranchCode, loading: profileLoading, error: profileError } = useProfile()
   const onSyncedRef = useRef(onSynced)
   useEffect(() => { onSyncedRef.current = onSynced }, [onSynced])
@@ -506,7 +355,7 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
   const effectiveBranch = branchLocked ? myBranchLabel : null
 
   const [groups, setGroups] = useState([])
-  const [totalPendingCount, setTotalPendingCount] = useState(0)
+  const [serverTotalCount, setServerTotalCount] = useState(0)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [loadError, setLoadError] = useState('')
@@ -516,7 +365,7 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
   const [autoRefresh, setAutoRefresh] = useState(true)
   const [expandedIds, setExpandedIds] = useState(() => new Set())
   const [selectedCheckIds, setSelectedCheckIds] = useState(() => new Set())
-  const [confirmAction, setConfirmAction] = useState(null) // { group, checks } or { groups, bulk: true }
+  const [confirmAction, setConfirmAction] = useState(null)
   const [actioning, setActioning] = useState(false)
   const [actionError, setActionError] = useState('')
   const [successFlash, setSuccessFlash] = useState(null)
@@ -524,8 +373,6 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
   const [lastUpdated, setLastUpdated] = useState(null)
   const [now, setNow] = useState(Date.now())
 
-  // Advanced filters — all optional, all compose (AND). Dropdown options
-  // are derived live from the loaded queue so they never drift from reality.
   const [showAdvancedFilters, setShowAdvancedFilters] = useState(false)
   const [collectorFilter, setCollectorFilter] = useState('all')
   const [submitterFilter, setSubmitterFilter] = useState('all')
@@ -545,6 +392,7 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
   const successTimerRef = useRef(null)
   const searchInputRef = useRef(null)
   const lastFocusedElRef = useRef(null)
+  const prevRefreshTokenRef = useRef(refreshToken)
 
   useEffect(() => {
     isMountedRef.current = true
@@ -561,13 +409,8 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
   useEffect(() => {
     if (!authorized || !active || !canQuery) return
     const tick = setInterval(() => setNow(Date.now()), 1000)
-    const poll = setInterval(() => {
-      if (autoRefresh) load(false)
-    }, POLL_INTERVAL_MS)
-    return () => {
-      clearInterval(tick)
-      clearInterval(poll)
-    }
+    const poll = setInterval(() => { if (autoRefresh) load(false) }, POLL_INTERVAL_MS)
+    return () => { clearInterval(tick); clearInterval(poll) }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoRefresh, authorized, active, canQuery, effectiveBranch])
 
@@ -578,7 +421,6 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
     load(false)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshToken, authorized, canQuery])
-  const prevRefreshTokenRef = useRef(refreshToken)
 
   useEffect(() => {
     function handleKeyDown(e) {
@@ -621,27 +463,29 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
           .select(
             `id, status, row_number, payee, payor, check_no, check_date, amount, or_no,
              ar_collected, attached_2307, remarks, submitted_by_name, submitted_at,
-             reservation_id, bank, report_number, pickup_branch,
+             reservation_id, bank, ${STALE_REPORT_COLUMN}, pickup_branch,
              pickup_reservations(id, collector_name, status, collector_id_type, collector_id_type_other, collector_id_number)`,
             { count: 'exact' }
           )
           .eq('status', 'pending_approval')
+          .is(STALE_REPORT_COLUMN, null)
 
-        if (effectiveBranch) {
-
-          query = query.ilike(BRANCH_COLUMN, effectiveBranch)
-        }
+        if (effectiveBranch) query = query.ilike(BRANCH_COLUMN, effectiveBranch)
 
         return query.order('submitted_at', { ascending: true }).limit(MAX_PENDING_ROWS).abortSignal(controller.signal)
       }
 
       const { data, count } = await runSupabaseQuery(buildQuery, controller.signal)
-
       if (!isMountedRef.current || requestId !== requestIdRef.current) return
 
       const rows = enforceBranchScope(buildPendingRows(data || []), effectiveBranch)
+
+      if (process.env.NODE_ENV !== 'production' && typeof count === 'number' && count !== rows.length) {
+        console.warn(`[PickupApprovalsTab] server count (${count}) != rendered rows (${rows.length})`)
+      }
+
       setGroups(groupByReservation(rows))
-      setTotalPendingCount(count ?? rows.length)
+      setServerTotalCount(typeof count === 'number' ? count : rows.length)
       setLastUpdated(Date.now())
       setSelectedCheckIds((prev) => {
         if (prev.size === 0) return prev
@@ -649,7 +493,8 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
         const next = new Set([...prev].filter((id) => validIds.has(id)))
         return next.size === prev.size ? prev : next
       })
-      onSyncedRef.current?.({ count: count ?? rows.length, lastUpdated: Date.now() })
+
+      safeNotify(onSyncedRef.current, { count: rows.length, lastUpdated: Date.now() })
     } catch (err) {
       if (err?.name === 'AbortError' || controller.signal.aborted) return
       if (!isMountedRef.current || requestId !== requestIdRef.current) return
@@ -666,15 +511,11 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
   }, [canQuery, effectiveBranch])
 
   function minutesWaiting(submittedAtMs) {
-    if (!submittedAtMs) return 0
-    return Math.max(0, Math.round((now - submittedAtMs) / 60000))
+    return submittedAtMs ? Math.max(0, Math.round((now - submittedAtMs) / 60000)) : 0
   }
-
   function formatWaiting(submittedAtMs) {
-    if (!submittedAtMs) return '—'
-    return formatMinutesDuration(minutesWaiting(submittedAtMs))
+    return submittedAtMs ? formatMinutesDuration(minutesWaiting(submittedAtMs)) : '—'
   }
-
   function pendingUrgency(submittedAtMs) {
     const mins = minutesWaiting(submittedAtMs)
     if (mins >= PENDING_CRITICAL_MINUTES) return 'critical'
@@ -682,58 +523,31 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
     return 'normal'
   }
 
-  const collectorOptions = useMemo(() => {
-    const set = new Set(groups.map((g) => g.collectorName).filter(Boolean))
-    return [...set].sort((a, b) => a.localeCompare(b))
-  }, [groups])
-
-  const submitterOptions = useMemo(() => {
-    const set = new Set(groups.flatMap((g) => g.items.map((c) => c.submitted_by_name)).filter(Boolean))
-    return [...set].sort((a, b) => a.localeCompare(b))
-  }, [groups])
+  const collectorOptions = useMemo(() => [...new Set(groups.map((g) => g.collectorName).filter(Boolean))].sort((a, b) => a.localeCompare(b)), [groups])
+  const submitterOptions = useMemo(() => [...new Set(groups.flatMap((g) => g.items.map((c) => c.submitted_by_name)).filter(Boolean))].sort((a, b) => a.localeCompare(b)), [groups])
 
   const bankOptions = useMemo(() => {
     const set = new Set(groups.flatMap((g) => g.items.map((c) => normalizeBank(c.bank))))
-    return [...set].sort((a, b) => {
-      if (a === UNKNOWN_BANK_LABEL) return 1
-      if (b === UNKNOWN_BANK_LABEL) return -1
-      return a.localeCompare(b)
-    })
+    return [...set].sort((a, b) => (a === UNKNOWN_BANK_LABEL ? 1 : b === UNKNOWN_BANK_LABEL ? -1 : a.localeCompare(b)))
   }, [groups])
 
   const branchOptions = useMemo(() => {
     const set = new Set(groups.flatMap((g) => g.items.map((c) => normalizeBranch(c.pickupBranch))))
-    return [...set].sort((a, b) => {
-      if (a === UNKNOWN_BRANCH_LABEL) return 1
-      if (b === UNKNOWN_BRANCH_LABEL) return -1
-      return a.localeCompare(b)
-    })
+    return [...set].sort((a, b) => (a === UNKNOWN_BRANCH_LABEL ? 1 : b === UNKNOWN_BRANCH_LABEL ? -1 : a.localeCompare(b)))
   }, [groups])
 
-  const activeFilterCount = useMemo(() => {
-    return [
-      collectorFilter !== 'all',
-      submitterFilter !== 'all',
-      bankFilter !== 'all',
-      branchFilter !== 'all',
-      arFilter !== 'all',
-      urgencyFilter !== 'all',
-      idStatusFilter !== 'all',
-      amountMin !== '',
-      amountMax !== '',
-    ].filter(Boolean).length
-  }, [collectorFilter, submitterFilter, bankFilter, branchFilter, arFilter, urgencyFilter, idStatusFilter, amountMin, amountMax])
+  const activeFilterCount = useMemo(
+    () =>
+      [
+        collectorFilter !== 'all', submitterFilter !== 'all', bankFilter !== 'all', branchFilter !== 'all',
+        arFilter !== 'all', urgencyFilter !== 'all', idStatusFilter !== 'all', amountMin !== '', amountMax !== '',
+      ].filter(Boolean).length,
+    [collectorFilter, submitterFilter, bankFilter, branchFilter, arFilter, urgencyFilter, idStatusFilter, amountMin, amountMax]
+  )
 
   function clearAdvancedFilters() {
-    setCollectorFilter('all')
-    setSubmitterFilter('all')
-    setBankFilter('all')
-    setBranchFilter('all')
-    setArFilter('all')
-    setUrgencyFilter('all')
-    setIdStatusFilter('all')
-    setAmountMin('')
-    setAmountMax('')
+    setCollectorFilter('all'); setSubmitterFilter('all'); setBankFilter('all'); setBranchFilter('all')
+    setArFilter('all'); setUrgencyFilter('all'); setIdStatusFilter('all'); setAmountMin(''); setAmountMax('')
   }
 
   const visibleGroups = useMemo(() => {
@@ -764,25 +578,16 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
 
     list = list.map((g) => ({ ...g, total: orderTotal(g.items), submittedAtMs: earliestSubmittedAt(g.items) }))
 
-    if (urgencyFilter === 'stale') {
-      list = list.filter((g) => g.submittedAtMs && minutesWaiting(g.submittedAtMs) >= PENDING_WARN_MINUTES)
-    } else if (urgencyFilter === 'critical') {
-      list = list.filter((g) => g.submittedAtMs && minutesWaiting(g.submittedAtMs) >= PENDING_CRITICAL_MINUTES)
-    }
+    if (urgencyFilter === 'stale') list = list.filter((g) => g.submittedAtMs && minutesWaiting(g.submittedAtMs) >= PENDING_WARN_MINUTES)
+    else if (urgencyFilter === 'critical') list = list.filter((g) => g.submittedAtMs && minutesWaiting(g.submittedAtMs) >= PENDING_CRITICAL_MINUTES)
 
     list.sort((a, b) => {
       switch (sortBy) {
-        case 'submitted_desc':
-          return (b.submittedAtMs || 0) - (a.submittedAtMs || 0)
-        case 'amount_desc':
-          return b.total - a.total
-        case 'amount_asc':
-          return a.total - b.total
-        case 'collector_asc':
-          return String(a.collectorName || '').localeCompare(String(b.collectorName || ''))
-        case 'submitted_asc':
-        default:
-          return (a.submittedAtMs || 0) - (b.submittedAtMs || 0)
+        case 'submitted_desc': return (b.submittedAtMs || 0) - (a.submittedAtMs || 0)
+        case 'amount_desc': return b.total - a.total
+        case 'amount_asc': return a.total - b.total
+        case 'collector_asc': return String(a.collectorName || '').localeCompare(String(b.collectorName || ''))
+        default: return (a.submittedAtMs || 0) - (b.submittedAtMs || 0)
       }
     })
 
@@ -790,50 +595,34 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [groups, search, sortBy, urgencyFilter, collectorFilter, submitterFilter, bankFilter, branchFilter, idStatusFilter, amountMin, amountMax, now])
 
-  // Headline KPIs are deliberately computed off the full `groups` dataset
-  // (not `visibleGroups`) so they stay accurate while an approver is
-  // drilled into a filtered slice below.
+  // Computed off `groups` (not `visibleGroups`) so KPIs stay accurate while
+  // filtered down.
   const summary = useMemo(() => {
     const allItems = groups.flatMap((g) => g.items)
-    const waitMinutesList = groups
-      .map((g) => earliestSubmittedAt(g.items))
-      .filter(Boolean)
-      .map((t) => Math.max(0, Math.round((now - t) / 60000)))
-
-    const stale = waitMinutesList.filter((m) => m >= PENDING_WARN_MINUTES).length
-    const critical = waitMinutesList.filter((m) => m >= PENDING_CRITICAL_MINUTES).length
-    const avgWaitMinutes = waitMinutesList.length > 0 ? waitMinutesList.reduce((s, m) => s + m, 0) / waitMinutesList.length : 0
-    const maxWaitMinutes = waitMinutesList.length > 0 ? Math.max(...waitMinutesList) : 0
-    const uniqueCollectors = new Set(groups.map((g) => g.collectorName).filter(Boolean)).size
-    const uniqueBanks = new Set(allItems.map((c) => normalizeBank(c.bank))).size
-    const totalValue = orderTotal(allItems)
-    const avgCheckAmount = allItems.length > 0 ? totalValue / allItems.length : 0
-    const arNotCollected = allItems.filter((c) => c.ar_collected === false).length
-    const idNotVerified = groups.filter((g) => idInfoStatus(g.idInfo) !== 'verified').length
+    const waitMinutesList = groups.map((g) => earliestSubmittedAt(g.items)).filter(Boolean).map((t) => Math.max(0, Math.round((now - t) / 60000)))
 
     return {
       orders: groups.length,
       checks: allItems.length,
-      totalValue,
-      avgCheckAmount,
-      stale,
-      critical,
-      avgWaitMinutes,
-      maxWaitMinutes,
-      uniqueCollectors,
-      uniqueBanks,
-      arNotCollected,
-      idNotVerified,
+      totalValue: orderTotal(allItems),
+      avgCheckAmount: allItems.length > 0 ? orderTotal(allItems) / allItems.length : 0,
+      stale: waitMinutesList.filter((m) => m >= PENDING_WARN_MINUTES).length,
+      critical: waitMinutesList.filter((m) => m >= PENDING_CRITICAL_MINUTES).length,
+      avgWaitMinutes: waitMinutesList.length > 0 ? waitMinutesList.reduce((s, m) => s + m, 0) / waitMinutesList.length : 0,
+      maxWaitMinutes: waitMinutesList.length > 0 ? Math.max(...waitMinutesList) : 0,
+      uniqueCollectors: new Set(groups.map((g) => g.collectorName).filter(Boolean)).size,
+      uniqueBanks: new Set(allItems.map((c) => normalizeBank(c.bank))).size,
+      arNotCollected: allItems.filter((c) => c.ar_collected === false).length,
+      idNotVerified: groups.filter((g) => idInfoStatus(g.idInfo) !== 'verified').length,
     }
   }, [groups, now])
 
-  const isTruncated = totalPendingCount >= MAX_PENDING_ROWS
+  const isTruncated = serverTotalCount >= MAX_PENDING_ROWS
 
   function toggleExpand(reservationId) {
     setExpandedIds((prev) => {
       const next = new Set(prev)
-      if (next.has(reservationId)) next.delete(reservationId)
-      else next.add(reservationId)
+      next.has(reservationId) ? next.delete(reservationId) : next.add(reservationId)
       return next
     })
   }
@@ -841,8 +630,7 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
   function toggleSelectCheck(checkId) {
     setSelectedCheckIds((prev) => {
       const next = new Set(prev)
-      if (next.has(checkId)) next.delete(checkId)
-      else next.add(checkId)
+      next.has(checkId) ? next.delete(checkId) : next.add(checkId)
       return next
     })
   }
@@ -852,8 +640,7 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
       const ids = group.items.map((c) => c.checkId)
       const allSelected = ids.every((id) => prev.has(id))
       const next = new Set(prev)
-      if (allSelected) ids.forEach((id) => next.delete(id))
-      else ids.forEach((id) => next.add(id))
+      ids.forEach((id) => (allSelected ? next.delete(id) : next.add(id)))
       return next
     })
   }
@@ -889,18 +676,9 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
     clearTimeout(successTimerRef.current)
     setSuccessFlash(null)
     setConfirmAction(null)
-    requestAnimationFrame(() => {
-      lastFocusedElRef.current?.focus?.()
-    })
+    requestAnimationFrame(() => lastFocusedElRef.current?.focus?.())
   }, [])
 
-  // Re-reads live status AND pickup branch for the given check ids right
-  // before a decision is submitted, through a retrying, timeout-bound
-  // query. Anything no longer 'pending_approval', or that moved outside
-  // this approver's branch scope, was already claimed by another approver
-  // (or recalled/reassigned) between load and confirm — those ids are
-  // excluded from the RPC call instead of being resubmitted. This narrows
-  // the race window; it does not close it — see the header comment.
   async function fetchLiveCheckState(checkIds, signal) {
     if (checkIds.length === 0) return new Map()
     const { data } = await runSupabaseQuery(
@@ -918,14 +696,8 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
 
   async function runDecision(decisionsByCheckId) {
     if (!confirmAction || actioning) return
-    if (!authorized) {
-      setActionError("You don't have permission to decide on checks.")
-      return
-    }
-    if (branchLocked && !myBranchLabel) {
-      setActionError('Your account has no assigned branch. Contact an admin before submitting decisions.')
-      return
-    }
+    if (!authorized) return setActionError("You don't have permission to decide on checks.")
+    if (branchLocked && !myBranchLabel) return setActionError('Your account has no assigned branch. Contact an admin before submitting decisions.')
 
     setActioning(true)
     setActionError('')
@@ -941,7 +713,6 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
       const allCheckIds = targets.flatMap((t) => t.items.map((c) => c.checkId))
       const liveState = await fetchLiveCheckState(allCheckIds, controller.signal)
       let staleCount = 0
-
       let approvedTotal = 0
       let returnedTotal = 0
       const results = []
@@ -961,15 +732,10 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
           return { check_id: c.checkId, decision: 'return', remarks: d.remarks.trim() }
         })
 
-        // approver_decide is SECURITY DEFINER and re-checks the caller's
-        // role / auth.uid() server-side — the `authorized` check above is
-        // UX only, never the real access boundary. It should also be the
-        // layer that closes the race window entirely (atomic per-check
-        // UPDATE ... WHERE status = 'pending_approval'); this client-side
-        // revalidation only reduces its size.
+        // approver_decide is SECURITY DEFINER and re-checks role/auth.uid()
+        // server-side — the `authorized` check above is UX only.
         // eslint-disable-next-line no-await-in-loop
-        const res = await supabase.rpc('approver_decide', { p_reservation_id: t.reservationId, p_decisions })
-        results.push(res)
+        results.push(await supabase.rpc('approver_decide', { p_reservation_id: t.reservationId, p_decisions }))
       }
 
       if (!isMountedRef.current) return
@@ -999,16 +765,11 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
         setSuccessFlash(null)
         setConfirmAction(null)
         setSelectedCheckIds(new Set())
-        requestAnimationFrame(() => {
-          lastFocusedElRef.current?.focus?.()
-        })
+        requestAnimationFrame(() => lastFocusedElRef.current?.focus?.())
       }, SUCCESS_FLASH_MS)
 
       load(false)
-      showToast(
-        failed > 0 ? `${summaryMsg}. ${failed} reservation(s) failed — check and retry.` : summaryMsg,
-        failed > 0 || staleCount > 0 ? 'warning' : 'success'
-      )
+      showToast(failed > 0 ? `${summaryMsg}. ${failed} reservation(s) failed — check and retry.` : summaryMsg, failed > 0 || staleCount > 0 ? 'warning' : 'success')
     } catch (err) {
       if (!isMountedRef.current) return
       setActionError(classifyError(err).message)
@@ -1019,65 +780,42 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
   }
 
   function exportCsv() {
-    const headers = ['Collector', 'ID on file', 'Bank', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount', 'Receipt', 'AR collected', '2307 Attached', 'Remarks', 'Submitted by', 'Submitted at']
-    const rows = [headers]
-    visibleGroups.forEach((g) => {
-      g.items.forEach((c) => {
-        rows.push([
-          g.collectorName || '',
-          formatIdSummary(g.idInfo),
-          normalizeBank(c.bank),
-          c.check_no || '',
-          c.payee || '',
-          c.payor || '',
-          c.check_date || '',
-          c.amount ?? '',
-          c.or_no || '',
-          c.ar_collected === null || c.ar_collected === undefined ? '' : c.ar_collected ? 'Yes' : 'No',
-          c.attached_2307 === null || c.attached_2307 === undefined ? '' : c.attached_2307 ? 'Yes' : 'No',
-          c.remarks || '',
-          c.submitted_by_name || '',
-          c.submitted_at || '',
-        ])
+    try {
+      const headers = ['Collector', 'ID on file', 'Bank', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount', 'Receipt', 'AR collected', '2307 Attached', 'Remarks', 'Submitted by', 'Submitted at']
+      const rows = [headers]
+      visibleGroups.forEach((g) => {
+        g.items.forEach((c) => {
+          rows.push([
+            g.collectorName || '', formatIdSummary(g.idInfo), normalizeBank(c.bank), c.check_no || '',
+            c.payee || '', c.payor || '', c.check_date || '', c.amount ?? '', c.or_no || '',
+            c.ar_collected === null || c.ar_collected === undefined ? '' : c.ar_collected ? 'Yes' : 'No',
+            c.attached_2307 === null || c.attached_2307 === undefined ? '' : c.attached_2307 ? 'Yes' : 'No',
+            c.remarks || '', c.submitted_by_name || '', c.submitted_at || '',
+          ])
+        })
       })
-    })
-    const csv = rows
-      .map((row) =>
-        row
-          .map((cell) => {
-            const str = String(cell ?? '')
-            return /[",\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str
-          })
-          .join(',')
-      )
-      .join('\n')
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `pending-approval-${new Date().toISOString().slice(0, 10)}.csv`
-    document.body.appendChild(a)
-    a.click()
-    a.remove()
-    URL.revokeObjectURL(url)
+      const csv = rows.map((row) => row.map((cell) => { const s = String(cell ?? ''); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s }).join(',')).join('\n')
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `pending-approval-${new Date().toISOString().slice(0, 10)}.csv`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+    } catch {
+      showToast('Could not export CSV. Please try again.', 'warning')
+    }
   }
 
   const activeSortLabel = SORT_OPTIONS.find((o) => o.value === sortBy)?.label || 'Sort'
   const hasActiveFilter =
-    !!search.trim() ||
-    urgencyFilter !== 'all' ||
-    collectorFilter !== 'all' ||
-    submitterFilter !== 'all' ||
-    bankFilter !== 'all' ||
-    branchFilter !== 'all' ||
-    arFilter !== 'all' ||
-    idStatusFilter !== 'all' ||
-    amountMin !== '' ||
-    amountMax !== ''
+    !!search.trim() || urgencyFilter !== 'all' || collectorFilter !== 'all' || submitterFilter !== 'all' ||
+    bankFilter !== 'all' || branchFilter !== 'all' || arFilter !== 'all' || idStatusFilter !== 'all' ||
+    amountMin !== '' || amountMax !== ''
 
-  if (profileLoading) {
-    return <div className="flex min-h-[40vh] items-center justify-center text-sm text-ink-300">Loading…</div>
-  }
+  if (profileLoading) return <div className="flex min-h-[40vh] items-center justify-center text-sm text-ink-300">Loading…</div>
   if (profileError) return <ProfileLoadError error={profileError} />
   if (!authorized) return <AccessDenied />
   if (!canQuery) return myBranchUnmapped ? <UnmappedBranch code={myBranchCode} /> : <NoBranchAssigned />
@@ -1086,30 +824,22 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
     <div className="pb-20 sm:pb-0">
       <div className="mb-6 flex flex-wrap items-start justify-between gap-3">
         <div className="flex items-start gap-3">
-          <span className="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-dashed border-ledger-stamp/40 bg-ledger-stamp/10 text-ledger-stampDark">
-            <Stamp className="h-4.5 w-4.5" />
-          </span>
           <div>
             <div className="flex flex-wrap items-center gap-2">
-              <p className="font-mono text-[11px] uppercase tracking-[0.2em] text-ledger-stampDark/80">Verification queue</p>
+              <p className="font-mono text-[11px] uppercase tracking-[0.2em] text-teal-700/80">Verification queue</p>
               <BranchScopeBadge branch={effectiveBranch} locked={branchLocked} />
             </div>
             <h1 className="font-display text-2xl font-semibold text-ink-900">Pending approvals</h1>
             <p className="mt-1 text-sm text-ink-400">
-              {name ? `Signed in as ${name}. ` : ''}Match each check against what was submitted, then approve for
-              release or return it to the admin to fix a mistake. Identity is verified by the verifier at intake.
+              {name ? `Signed in as ${name}. ` : ''}Match each check against what was submitted, then approve for release or return it to the admin to fix a mistake. Identity is verified by the verifier at intake.
             </p>
           </div>
         </div>
         <div className="flex items-center gap-2">
-          {lastUpdated && (
-            <span className="hidden font-mono text-[11px] text-ink-300 sm:inline">
-              Updated {Math.max(0, Math.round((now - lastUpdated) / 1000))}s ago
-            </span>
-          )}
+          {lastUpdated && <span className="hidden font-mono text-[11px] text-ink-300 sm:inline">Updated {Math.max(0, Math.round((now - lastUpdated) / 1000))}s ago</span>}
           <button
             onClick={() => setAutoRefresh((v) => !v)}
-            className="flex items-center gap-1.5 rounded-md border border-ink-200 px-2.5 py-2 text-xs font-medium text-ink-600 hover:bg-ink-50"
+            className="flex items-center gap-1.5 rounded-md border border-ink-200 px-2.5 py-2 text-xs font-medium text-ink-600 transition hover:bg-ink-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500"
             title={autoRefresh ? 'Pause auto-refresh' : 'Resume auto-refresh'}
           >
             {autoRefresh ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
@@ -1118,7 +848,7 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
           <button
             onClick={() => load(false)}
             disabled={refreshing || loading}
-            className="flex items-center gap-1.5 rounded-md border border-ink-200 px-3 py-2 text-sm font-medium text-ink-600 hover:bg-ink-50 disabled:opacity-50"
+            className="flex items-center gap-1.5 rounded-md border border-ink-200 px-3 py-2 text-sm font-medium text-ink-600 transition hover:bg-ink-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500 disabled:opacity-50"
           >
             <RefreshCw className={cn('h-3.5 w-3.5', refreshing && 'animate-spin')} />
             <span className="hidden sm:inline">Refresh</span>
@@ -1127,10 +857,9 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
       </div>
 
       {isTruncated && (
-        <div className="mb-4 flex items-center gap-2 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
+        <div className="mb-4 flex items-center gap-2 rounded-md border border-orange-200 bg-orange-50 px-4 py-3 text-sm text-orange-700">
           <AlertTriangle className="h-4 w-4 shrink-0" />
-          Showing the first {MAX_PENDING_ROWS} pickup checks awaiting approval. The queue has grown past what this
-          page loads at once — ask engineering to raise the load limit or add pagination.
+          Showing the first {MAX_PENDING_ROWS} pickup checks awaiting approval. The queue has grown past what this page loads at once — ask engineering to raise the load limit or add pagination.
         </div>
       )}
 
@@ -1140,53 +869,27 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
             <LedgerStatCard icon={Layers} label="Orders" value={summary.orders} />
             <LedgerStatCard icon={Hash} label="Checks awaiting" value={summary.checks} />
             <LedgerStatCard icon={Wallet} label="Total value" value={formatCurrency(summary.totalValue)} />
-            <LedgerStatCard
-              icon={TrendingUp}
-              label="Avg. check amount"
-              value={summary.checks > 0 ? formatCurrency(summary.avgCheckAmount) : '—'}
-            />
+            <LedgerStatCard icon={TrendingUp} label="Avg. check amount" value={summary.checks > 0 ? formatCurrency(summary.avgCheckAmount) : '—'} />
           </div>
 
           <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-7">
-            <button onClick={() => setUrgencyFilter((f) => (f === 'stale' ? 'all' : 'stale'))} className="text-left">
-              <Card
-                className={cn(
-                  'relative overflow-hidden border-ink-100 p-4 transition',
-                  summary.stale > 0 && 'border-orange-300 bg-orange-50',
-                  urgencyFilter === 'stale' && 'ring-2 ring-orange-400'
-                )}
-              >
+            <button onClick={() => setUrgencyFilter((f) => (f === 'stale' ? 'all' : 'stale'))} className="text-left focus-visible:outline-none">
+              <Card className={cn('relative overflow-hidden border-ink-100 p-4 transition', summary.stale > 0 && 'border-orange-200 bg-orange-50', urgencyFilter === 'stale' && 'ring-2 ring-orange-400')}>
                 <div className="flex items-center gap-2">
-                  <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-orange-100 text-orange-600">
-                    <Hourglass className="h-3.5 w-3.5" />
-                  </span>
+                  <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-orange-100 text-orange-600"><Hourglass className="h-3.5 w-3.5" /></span>
                   <p className="font-mono text-[10px] uppercase tracking-wide text-ink-400">Waiting {PENDING_WARN_MINUTES}m+</p>
                 </div>
-                <p className={cn('mt-1.5 font-display text-2xl font-semibold', summary.stale > 0 ? 'text-orange-600' : 'text-ink-900')}>
-                  {summary.stale}
-                </p>
+                <p className={cn('mt-1.5 font-display text-2xl font-semibold', summary.stale > 0 ? 'text-orange-600' : 'text-ink-900')}>{summary.stale}</p>
               </Card>
             </button>
 
-            <button onClick={() => setUrgencyFilter((f) => (f === 'critical' ? 'all' : 'critical'))} className="text-left">
-              <Card
-                className={cn(
-                  'relative overflow-hidden border-ink-100 p-4 transition',
-                  summary.critical > 0 && 'border-red-300 bg-red-50',
-                  urgencyFilter === 'critical' && 'ring-2 ring-red-400'
-                )}
-              >
+            <button onClick={() => setUrgencyFilter((f) => (f === 'critical' ? 'all' : 'critical'))} className="text-left focus-visible:outline-none">
+              <Card className={cn('relative overflow-hidden border-ink-100 p-4 transition', summary.critical > 0 && 'border-orange-300 bg-orange-100/60', urgencyFilter === 'critical' && 'ring-2 ring-orange-500')}>
                 <div className="flex items-center gap-2">
-                  <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-red-100 text-red-600">
-                    <AlertTriangle className="h-3.5 w-3.5" />
-                  </span>
-                  <p className="font-mono text-[10px] uppercase tracking-wide text-ink-400">
-                    Waiting {Math.round(PENDING_CRITICAL_MINUTES / 60)}h+
-                  </p>
+                  <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-orange-200 text-orange-700"><AlertTriangle className="h-3.5 w-3.5" /></span>
+                  <p className="font-mono text-[10px] uppercase tracking-wide text-ink-400">Waiting {Math.round(PENDING_CRITICAL_MINUTES / 60)}h+</p>
                 </div>
-                <p className={cn('mt-1.5 font-display text-2xl font-semibold', summary.critical > 0 ? 'text-red-600' : 'text-ink-900')}>
-                  {summary.critical}
-                </p>
+                <p className={cn('mt-1.5 font-display text-2xl font-semibold', summary.critical > 0 ? 'text-orange-700' : 'text-ink-900')}>{summary.critical}</p>
               </Card>
             </button>
 
@@ -1194,13 +897,8 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
             <LedgerStatCard icon={Hourglass} label="Longest wait" value={formatMinutesDuration(summary.maxWaitMinutes)} />
             <LedgerStatCard icon={Users} label="Collectors" value={summary.uniqueCollectors} />
             <LedgerStatCard icon={Landmark} label="Banks" value={summary.uniqueBanks} />
-            <button onClick={() => setIdStatusFilter((f) => (f === 'all' ? 'missing' : 'all'))} className="text-left">
-              <LedgerStatCard
-                icon={Fingerprint}
-                label="Orders needing ID"
-                value={summary.idNotVerified}
-                accent={summary.idNotVerified > 0 ? 'warning' : undefined}
-              />
+            <button onClick={() => setIdStatusFilter((f) => (f === 'all' ? 'missing' : 'all'))} className="text-left focus-visible:outline-none">
+              <LedgerStatCard icon={Fingerprint} label="Orders needing ID" value={summary.idNotVerified} accent={summary.idNotVerified > 0 ? 'warning' : undefined} />
             </button>
           </div>
         </>
@@ -1225,14 +923,8 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
           </div>
 
           <div className="relative shrink-0">
-            <button
-              onClick={() => setSortMenuOpen((v) => !v)}
-              className="flex w-full items-center justify-between gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm font-medium text-ink-600 hover:bg-ink-50 sm:w-auto"
-            >
-              <span className="flex items-center gap-1.5">
-                <ArrowUpDown className="h-3.5 w-3.5" />
-                {activeSortLabel}
-              </span>
+            <button onClick={() => setSortMenuOpen((v) => !v)} className="flex w-full items-center justify-between gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm font-medium text-ink-600 hover:bg-ink-50 sm:w-auto">
+              <span className="flex items-center gap-1.5"><ArrowUpDown className="h-3.5 w-3.5" />{activeSortLabel}</span>
               <ChevronDown className="h-3.5 w-3.5 text-ink-400" />
             </button>
             {sortMenuOpen && (
@@ -1256,25 +948,16 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
 
           <button
             onClick={() => setShowAdvancedFilters((v) => !v)}
-            className={cn(
-              'flex shrink-0 items-center gap-1.5 rounded-md border px-3 py-2 text-sm font-medium hover:bg-ink-50',
-              activeFilterCount > 0 ? 'border-teal-300 bg-teal-50 text-teal-700' : 'border-ink-200 text-ink-600'
-            )}
+            className={cn('flex shrink-0 items-center gap-1.5 rounded-md border px-3 py-2 text-sm font-medium hover:bg-ink-50', activeFilterCount > 0 ? 'border-teal-300 bg-teal-50 text-teal-700' : 'border-ink-200 text-ink-600')}
           >
             <SlidersHorizontal className="h-3.5 w-3.5" />
             <span>Filters</span>
-            {activeFilterCount > 0 && (
-              <span className="rounded-full bg-teal-600 px-1.5 py-0.5 text-[10px] font-semibold text-white">{activeFilterCount}</span>
-            )}
+            {activeFilterCount > 0 && <span className="rounded-full bg-teal-600 px-1.5 py-0.5 text-[10px] font-semibold text-white">{activeFilterCount}</span>}
             {showAdvancedFilters ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
           </button>
         </div>
 
-        <button
-          onClick={exportCsv}
-          disabled={visibleGroups.length === 0}
-          className="flex items-center gap-1.5 rounded-md border border-ink-200 px-3 py-2 text-xs font-medium text-ink-600 hover:bg-ink-50 disabled:opacity-40"
-        >
+        <button onClick={exportCsv} disabled={visibleGroups.length === 0} className="flex items-center gap-1.5 rounded-md border border-ink-200 px-3 py-2 text-xs font-medium text-ink-600 hover:bg-ink-50 disabled:opacity-40">
           <Download className="h-3.5 w-3.5" />
           Export CSV
         </button>
@@ -1284,9 +967,7 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
         <div className="mb-4 grid grid-cols-1 gap-3 rounded-lg border border-ink-100 bg-ink-50/50 p-3.5 sm:grid-cols-2 lg:grid-cols-4">
           <FilterSelect label="Collector" value={collectorFilter} onChange={setCollectorFilter} options={[{ value: 'all', label: 'All collectors' }, ...collectorOptions.map((c) => ({ value: c, label: c }))]} />
           <FilterSelect label="Bank" value={bankFilter} onChange={setBankFilter} options={[{ value: 'all', label: 'All banks' }, ...bankOptions.map((b) => ({ value: b, label: b }))]} />
-          {isAdmin && (
-            <FilterSelect label="Pickup branch" value={branchFilter} onChange={setBranchFilter} options={[{ value: 'all', label: 'All branches' }, ...branchOptions.map((b) => ({ value: b, label: b }))]} />
-          )}
+          {isAdmin && <FilterSelect label="Pickup branch" value={branchFilter} onChange={setBranchFilter} options={[{ value: 'all', label: 'All branches' }, ...branchOptions.map((b) => ({ value: b, label: b }))]} />}
           <FilterSelect label="Submitted by" value={submitterFilter} onChange={setSubmitterFilter} options={[{ value: 'all', label: 'Anyone' }, ...submitterOptions.map((s) => ({ value: s, label: s }))]} />
           <FilterSelect label="AR collected" value={arFilter} onChange={setArFilter} options={AR_FILTER_OPTIONS} />
           <FilterSelect label="Waiting time" value={urgencyFilter} onChange={setUrgencyFilter} options={URGENCY_FILTER_OPTIONS} />
@@ -1295,43 +976,25 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
           <div>
             <label className="mb-1 block font-mono text-[11px] uppercase tracking-wide text-ink-400">Min amount</label>
             <input
-              type="number"
-              inputMode="decimal"
-              min="0"
-              step="0.01"
-              value={amountMin}
+              type="number" inputMode="decimal" min="0" step="0.01" value={amountMin}
               onChange={(e) => setAmountMin(e.target.value)}
-              onBlur={() => {
-                if (amountMin !== '' && amountMax !== '' && Number(amountMin) > Number(amountMax)) setAmountMax(amountMin)
-              }}
+              onBlur={() => { if (amountMin !== '' && amountMax !== '' && Number(amountMin) > Number(amountMax)) setAmountMax(amountMin) }}
               placeholder="0.00"
               className="w-full rounded-md border border-ink-200 bg-white px-2.5 py-1.5 text-sm text-ink-700 focus:outline-none focus:ring-1 focus:ring-teal-500"
             />
           </div>
-
           <div>
             <label className="mb-1 block font-mono text-[11px] uppercase tracking-wide text-ink-400">Max amount</label>
             <input
-              type="number"
-              inputMode="decimal"
-              min="0"
-              step="0.01"
-              value={amountMax}
+              type="number" inputMode="decimal" min="0" step="0.01" value={amountMax}
               onChange={(e) => setAmountMax(e.target.value)}
-              onBlur={() => {
-                if (amountMin !== '' && amountMax !== '' && Number(amountMax) < Number(amountMin)) setAmountMin(amountMax)
-              }}
+              onBlur={() => { if (amountMin !== '' && amountMax !== '' && Number(amountMax) < Number(amountMin)) setAmountMin(amountMax) }}
               placeholder="No limit"
               className="w-full rounded-md border border-ink-200 bg-white px-2.5 py-1.5 text-sm text-ink-700 focus:outline-none focus:ring-1 focus:ring-teal-500"
             />
           </div>
-
           <div className="flex items-end sm:col-span-2 lg:justify-end">
-            <button
-              onClick={clearAdvancedFilters}
-              disabled={activeFilterCount === 0}
-              className="rounded-md border border-ink-200 px-3.5 py-1.5 text-xs font-medium text-ink-500 hover:bg-ink-50 disabled:cursor-not-allowed disabled:opacity-40"
-            >
+            <button onClick={clearAdvancedFilters} disabled={activeFilterCount === 0} className="rounded-md border border-ink-200 px-3.5 py-1.5 text-xs font-medium text-ink-500 hover:bg-ink-50 disabled:cursor-not-allowed disabled:opacity-40">
               Clear filters
             </button>
           </div>
@@ -1339,21 +1002,16 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
       )}
 
       {loadError && (
-        <div className="mb-4 flex items-center justify-between gap-3 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-          <span className="flex items-center gap-2">
-            <AlertTriangle className="h-4 w-4 shrink-0" />
-            {loadError}
-          </span>
-          <button onClick={() => load(loading)} className="rounded-md border border-red-300 px-3 py-1 text-xs font-medium text-red-700 hover:bg-red-100">
-            Retry
-          </button>
+        <div className="mb-4 flex items-center justify-between gap-3 rounded-md border border-orange-200 bg-orange-50 px-4 py-3 text-sm text-orange-700">
+          <span className="flex items-center gap-2"><AlertTriangle className="h-4 w-4 shrink-0" />{loadError}</span>
+          <button onClick={() => load(loading)} className="rounded-md border border-orange-300 px-3 py-1 text-xs font-medium text-orange-700 hover:bg-orange-100">Retry</button>
         </div>
       )}
 
       {loading ? (
         <ListSkeleton />
       ) : visibleGroups.length === 0 ? (
-        <EmptyState hasFilter={hasActiveFilter} branchLabel={effectiveBranch || 'your branch'} />
+        <EmptyState hasFilter={hasActiveFilter} branchLabel={effectiveBranch || 'your branch'} onClearFilters={() => { clearAdvancedFilters(); setSearch('') }} />
       ) : (
         <div className="space-y-2.5">
           {visibleGroups.map((g) => (
@@ -1378,9 +1036,7 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
           <div className="mx-auto flex max-w-3xl items-center justify-between gap-3">
             <span className="text-sm font-medium text-ink-700">{selectedCount} check{selectedCount === 1 ? '' : 's'} selected</span>
             <div className="flex items-center gap-2">
-              <button onClick={() => setSelectedCheckIds(new Set())} className="rounded-md px-3 py-1.5 text-xs font-medium text-ink-500 hover:bg-ink-50">
-                Clear
-              </button>
+              <button onClick={() => setSelectedCheckIds(new Set())} className="rounded-md px-3 py-1.5 text-xs font-medium text-ink-500 hover:bg-ink-50">Clear</button>
               <button onClick={openReviewForSelected} className="flex items-center gap-1.5 rounded-md bg-teal-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-teal-700">
                 <ShieldCheck className="h-3.5 w-3.5" />
                 Review selected
@@ -1390,10 +1046,7 @@ export default function PickupApprovalsTab({ active = true, refreshToken = 0, on
         </div>
       )}
 
-      {confirmAction && (
-        <ReviewModal action={confirmAction} onCancel={closeConfirm} onConfirm={runDecision} loading={actioning} error={actionError} successFlash={successFlash} />
-      )}
-
+      {confirmAction && <ReviewModal action={confirmAction} onCancel={closeConfirm} onConfirm={runDecision} loading={actioning} error={actionError} successFlash={successFlash} />}
       {toast && <Toast message={toast.message} variant={toast.variant} />}
     </div>
   )
@@ -1403,14 +1056,8 @@ function FilterSelect({ label, value, onChange, options }) {
   return (
     <div>
       <label className="mb-1 block font-mono text-[11px] uppercase tracking-wide text-ink-400">{label}</label>
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className="w-full rounded-md border border-ink-200 bg-white px-2.5 py-1.5 text-sm text-ink-700 focus:outline-none focus:ring-1 focus:ring-teal-500"
-      >
-        {options.map((o) => (
-          <option key={o.value} value={o.value}>{o.label}</option>
-        ))}
+      <select value={value} onChange={(e) => onChange(e.target.value)} className="w-full rounded-md border border-ink-200 bg-white px-2.5 py-1.5 text-sm text-ink-700 focus:outline-none focus:ring-1 focus:ring-teal-500">
+        {options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
       </select>
     </div>
   )
@@ -1418,10 +1065,10 @@ function FilterSelect({ label, value, onChange, options }) {
 
 function LedgerStatCard({ icon: Icon, label, value, accent }) {
   return (
-    <Card className={cn('relative overflow-hidden border-ink-100 p-4', accent === 'warning' && 'border-orange-200 bg-orange-50/60')}>
-      <div className="pointer-events-none absolute -right-4 -top-4 h-16 w-16 rounded-full border-2 border-dashed border-ledger-stamp/30" aria-hidden="true" />
+    <Card className={cn('relative overflow-hidden border-ink-100 p-4', accent === 'warning' && 'border-orange-200 bg-orange-50')}>
+      <div className="pointer-events-none absolute -right-4 -top-4 h-16 w-16 rounded-full border-2 border-dashed border-teal-200" aria-hidden="true" />
       <div className="relative flex items-center gap-2">
-        <span className={cn('flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-ledger-stamp/10 text-ledger-stampDark', accent === 'warning' && 'bg-orange-100 text-orange-600')}>
+        <span className={cn('flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-teal-50 text-teal-700', accent === 'warning' && 'bg-orange-100 text-orange-600')}>
           <Icon className="h-3.5 w-3.5" />
         </span>
         <p className="font-mono text-[10px] uppercase tracking-wide text-ink-400">{label}</p>
@@ -1433,8 +1080,8 @@ function LedgerStatCard({ icon: Icon, label, value, accent }) {
 
 function ProfileLoadError({ error }) {
   return (
-    <div className="flex flex-col items-center rounded-lg border border-dashed border-orange-200 bg-orange-50/40 px-4 py-16 text-center">
-      <AlertTriangle className="h-8 w-8 text-orange-300" />
+    <div className="flex flex-col items-center rounded-lg border border-dashed border-orange-200 bg-orange-50 px-4 py-16 text-center">
+      <AlertTriangle className="h-8 w-8 text-orange-400" />
       <p className="mt-3 text-lg font-semibold text-ink-700">Couldn't verify your account permissions</p>
       <p className="mt-1 max-w-sm text-sm text-ink-400">{error}</p>
     </div>
@@ -1443,44 +1090,38 @@ function ProfileLoadError({ error }) {
 
 function AccessDenied() {
   return (
-    <div className="flex flex-col items-center rounded-lg border border-dashed border-red-200 bg-red-50/40 px-4 py-16 text-center">
-      <ShieldAlert className="h-8 w-8 text-red-300" />
+    <div className="flex flex-col items-center rounded-lg border border-dashed border-orange-200 bg-orange-50 px-4 py-16 text-center">
+      <ShieldAlert className="h-8 w-8 text-orange-400" />
       <p className="mt-3 text-lg font-semibold text-ink-700">You don't have access to this page</p>
-      <p className="mt-1 max-w-sm text-sm text-ink-400">
-        Approving checks for release requires the approver or admin role. If this seems wrong, ask an admin to check your account's role.
-      </p>
+      <p className="mt-1 max-w-sm text-sm text-ink-400">Approving checks for release requires the approver or admin role. If this seems wrong, ask an admin to check your account's role.</p>
     </div>
   )
 }
 
 function NoBranchAssigned() {
   return (
-    <div className="flex flex-col items-center rounded-lg border border-dashed border-amber-200 bg-amber-50/40 px-4 py-16 text-center">
-      <Lock className="h-8 w-8 text-amber-300" />
+    <div className="flex flex-col items-center rounded-lg border border-dashed border-orange-200 bg-orange-50 px-4 py-16 text-center">
+      <Lock className="h-8 w-8 text-orange-400" />
       <p className="mt-3 text-lg font-semibold text-ink-700">Your account isn't linked to a branch yet</p>
-      <p className="mt-1 max-w-sm text-sm text-ink-400">
-        Pickup approvals are scoped per branch. Ask an admin to assign your account to a branch before reviewing checks here.
-      </p>
+      <p className="mt-1 max-w-sm text-sm text-ink-400">Pickup approvals are scoped per branch. Ask an admin to assign your account to a branch before reviewing checks here.</p>
     </div>
   )
 }
 
 function UnmappedBranch({ code }) {
   return (
-    <div className="flex flex-col items-center rounded-lg border border-dashed border-amber-200 bg-amber-50/40 px-4 py-16 text-center">
-      <Lock className="h-8 w-8 text-amber-300" />
+    <div className="flex flex-col items-center rounded-lg border border-dashed border-orange-200 bg-orange-50 px-4 py-16 text-center">
+      <Lock className="h-8 w-8 text-orange-400" />
       <p className="mt-3 text-lg font-semibold text-ink-700">Your branch isn't recognized</p>
-      <p className="mt-1 max-w-sm text-sm text-ink-400">
-        Your account is assigned branch code "{code}", which isn't mapped to a pickup branch yet. Ask an admin to add it before reviewing checks here.
-      </p>
+      <p className="mt-1 max-w-sm text-sm text-ink-400">Your account is assigned branch code "{code}", which isn't mapped to a pickup branch yet. Ask an admin to add it before reviewing checks here.</p>
     </div>
   )
 }
 
 function Toast({ message, variant }) {
   return (
-    <div className="fixed bottom-20 left-1/2 z-50 -translate-x-1/2 sm:bottom-6">
-      <div className={cn('flex items-center gap-2 rounded-md px-4 py-2.5 text-sm font-medium text-white shadow-lg', variant === 'warning' ? 'bg-orange-600' : 'bg-ink-900')}>
+    <div className="fixed bottom-20 left-1/2 z-50 -translate-x-1/2 sm:bottom-6" role="status" aria-live="polite">
+      <div className={cn('flex items-center gap-2 rounded-md px-4 py-2.5 text-sm font-medium text-white shadow-lg', variant === 'warning' ? 'bg-orange-600' : 'bg-teal-700')}>
         <CheckCircle2 className="h-4 w-4 shrink-0" />
         {message}
       </div>
@@ -1498,8 +1139,7 @@ function ApprovalGroupRow({ group, waitingLabel, urgencyLevel, expanded, onToggl
   const distinctBanks = useMemo(() => [...new Set(items.map((c) => normalizeBank(c.bank)))], [items])
   const distinctBranches = useMemo(() => [...new Set(items.map((c) => normalizeBranch(c.pickupBranch)))], [items])
 
-  const borderClass =
-    urgencyLevel === 'critical' ? 'border-red-300' : urgencyLevel === 'warning' ? 'border-orange-300' : idStatus !== 'verified' ? 'border-amber-200' : 'border-ink-100'
+  const borderClass = urgencyLevel === 'critical' ? 'border-orange-300' : urgencyLevel === 'warning' ? 'border-orange-200' : idStatus !== 'verified' ? 'border-orange-100' : 'border-ink-100'
 
   return (
     <Card className={cn('overflow-hidden p-0', borderClass)}>
@@ -1512,43 +1152,27 @@ function ApprovalGroupRow({ group, waitingLabel, urgencyLevel, expanded, onToggl
           <div className="flex min-w-0 flex-1 items-center gap-2">
             <User className="h-4 w-4 shrink-0 text-ink-400" />
             <div className="min-w-0">
-              <span className="truncate font-display font-medium text-ink-900" title={group.collectorName || undefined}>
-                {group.collectorName || 'Unknown collector'}
-              </span>
-              {items[0]?.submitted_by_name && (
-                <p className="truncate font-mono text-xs text-ink-400" title={items[0].submitted_by_name}>
-                  Submitted by {items[0].submitted_by_name}
-                </p>
-              )}
+              <span className="truncate font-display font-medium text-ink-900" title={group.collectorName || undefined}>{group.collectorName || 'Unknown collector'}</span>
+              {items[0]?.submitted_by_name && <p className="truncate font-mono text-xs text-ink-400" title={items[0].submitted_by_name}>Submitted by {items[0].submitted_by_name}</p>}
             </div>
           </div>
 
           <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 pl-6 text-xs text-ink-500 sm:pl-0">
-            <span className="flex items-center gap-1 rounded-full bg-ledger-amber/15 px-2 py-0.5 font-medium text-ledger-amber">
-              <Layers className="h-3 w-3" />
-              {items.length} awaiting
-            </span>
+            <span className="flex items-center gap-1 rounded-full bg-teal-50 px-2 py-0.5 font-medium text-teal-700"><Layers className="h-3 w-3" />{items.length} awaiting</span>
             <IdStatusBadge idInfo={group.idInfo} />
-            {distinctBranches.length <= 2 ? (
-              distinctBranches.map((b) => <BranchBadge key={b} branch={b} />)
-            ) : (
+            {distinctBranches.length <= 2 ? distinctBranches.map((b) => <BranchBadge key={b} branch={b} />) : (
               <span className="inline-flex items-center gap-1 rounded-full border border-ink-200 bg-white px-2 py-0.5 text-[11px] font-medium text-ink-600" title={distinctBranches.join(', ')}>
-                <Building2 className="h-3 w-3 shrink-0" />
-                {distinctBranches.length} branches
+                <Building2 className="h-3 w-3 shrink-0" />{distinctBranches.length} branches
               </span>
             )}
-            {distinctBanks.length <= 2 ? (
-              distinctBanks.map((b) => <BankBadge key={b} bank={b} />)
-            ) : (
-              <span className="inline-flex items-center gap-1 rounded-full bg-ink-100 px-2 py-0.5 text-[11px] font-medium text-ink-500" title={distinctBanks.join(', ')}>
-                <Landmark className="h-3 w-3 shrink-0" />
-                {distinctBanks.length} banks
+            {distinctBanks.length <= 2 ? distinctBanks.map((b) => <BankBadge key={b} bank={b} />) : (
+              <span className="inline-flex items-center gap-1 rounded-full bg-teal-50 px-2 py-0.5 text-[11px] font-medium text-teal-700" title={distinctBanks.join(', ')}>
+                <Landmark className="h-3 w-3 shrink-0" />{distinctBanks.length} banks
               </span>
             )}
             <span className="font-mono font-semibold text-ink-800">{formatCurrency(total)}</span>
-            <span className={cn('flex items-center gap-1 font-mono font-medium', urgencyLevel === 'critical' ? 'text-red-600' : urgencyLevel === 'warning' ? 'text-orange-600' : 'text-ink-500')}>
-              <Hourglass className="h-3.5 w-3.5" />
-              Waiting {waitingLabel}
+            <span className={cn('flex items-center gap-1 font-mono font-medium', urgencyLevel === 'critical' ? 'text-orange-700' : urgencyLevel === 'warning' ? 'text-orange-600' : 'text-ink-500')}>
+              <Hourglass className="h-3.5 w-3.5" />Waiting {waitingLabel}
             </span>
             {expanded ? <ChevronUp className="h-4 w-4 text-ink-300" /> : <ChevronDown className="h-4 w-4 text-ink-300" />}
           </div>
@@ -1582,15 +1206,10 @@ function ApprovalGroupRow({ group, waitingLabel, urgencyLevel, expanded, onToggl
                       </button>
                     </td>
                     <td className="px-4 py-3 font-mono text-xs text-ink-700">
-                      <span className="flex items-start gap-1">
-                        <Hash className="mt-0.5 h-3 w-3 shrink-0 text-ink-300" />
-                        <span className="break-all">{c.check_no ?? '—'}</span>
-                      </span>
+                      <span className="flex items-start gap-1"><Hash className="mt-0.5 h-3 w-3 shrink-0 text-ink-300" /><span className="break-all">{c.check_no ?? '—'}</span></span>
                     </td>
                     <td className="px-2 py-2.5"><BankBadge bank={c.bank} /></td>
-                    <td className="max-w-[140px] px-2 py-2.5 font-medium text-ink-900">
-                      <FitText text={c.payee} />
-                    </td>
+                    <td className="max-w-[140px] px-2 py-2.5 font-medium text-ink-900"><FitText text={c.payee} /></td>
                     <td className="max-w-[140px] truncate px-2 py-2.5 text-ink-600" title={c.payor || undefined}>{c.payor || '—'}</td>
                     <td className="px-4 py-2.5 text-right font-mono font-medium text-ink-700">{safeCurrency(c.amount)}</td>
                     <td className="px-2 py-2.5 font-mono text-xs text-ink-700" title={c.or_no || undefined}>{c.or_no || '—'}</td>
@@ -1615,10 +1234,7 @@ function ApprovalGroupRow({ group, waitingLabel, urgencyLevel, expanded, onToggl
             </table>
           </div>
           <div className="flex flex-wrap items-center justify-between gap-2 border-t border-dashed border-ink-100 bg-ink-50/40 px-4 py-3">
-            <span className="flex items-center gap-1.5 text-xs text-ink-500">
-              <Fingerprint className="h-3.5 w-3.5 text-ink-400" />
-              {formatIdSummary(group.idInfo)}
-            </span>
+            <span className="flex items-center gap-1.5 text-xs text-ink-500"><Fingerprint className="h-3.5 w-3.5 text-ink-400" />{formatIdSummary(group.idInfo)}</span>
             <button onClick={onReview} className="flex items-center gap-1.5 rounded-md bg-teal-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-teal-700">
               <ShieldCheck className="h-3.5 w-3.5" />
               Review this order
@@ -1630,9 +1246,6 @@ function ApprovalGroupRow({ group, waitingLabel, urgencyLevel, expanded, onToggl
   )
 }
 
-// Every check starts as "approve" — for a queue that's usually correct,
-// this keeps the approver's job to "click through the good ones, stop and
-// act on the bad ones." Remarks only matter for a return.
 function buildInitialDecisions(checks) {
   const initial = {}
   checks.forEach((c) => { initial[c.checkId] = { decision: 'approve', remarks: '' } })
@@ -1666,41 +1279,23 @@ function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash
   }, [])
 
   const { approveCount, returnCount, decisionsComplete, firstIncompleteId } = useMemo(() => {
-    let approve = 0
-    let ret = 0
-    let complete = true
-    let firstIncomplete = null
+    let approve = 0, ret = 0, complete = true, firstIncomplete = null
     allChecks.forEach((c) => {
       const d = decisions[c.checkId]
-      if (!d) {
-        complete = false
-        if (!firstIncomplete) firstIncomplete = c.checkId
-        return
-      }
-      if (d.decision === 'approve') {
-        approve += 1
-        return
-      }
+      if (!d) { complete = false; if (!firstIncomplete) firstIncomplete = c.checkId; return }
+      if (d.decision === 'approve') { approve += 1; return }
       ret += 1
-      if (!d.remarks?.trim()) {
-        complete = false
-        if (!firstIncomplete) firstIncomplete = c.checkId
-      }
+      if (!d.remarks?.trim()) { complete = false; if (!firstIncomplete) firstIncomplete = c.checkId }
     })
     return { approveCount: approve, returnCount: ret, decisionsComplete: complete, firstIncompleteId: firstIncomplete }
   }, [decisions, allChecks])
 
-  // Reservations with at least one check currently set to "approve" — a
-  // release is about to happen, so each one must have a valid, unexpired
-  // ID already on file from the verifier. Approving is blocked otherwise;
-  // the approver cannot enter ID details here.
   const groupsNeedingId = useMemo(
     () => reservationGroups.filter((g) => g.items.some((c) => (decisions[c.checkId]?.decision || 'approve') === 'approve')),
     [reservationGroups, decisions]
   )
   const idBlockedGroups = useMemo(() => groupsNeedingId.filter((g) => idInfoStatus(g.idInfo) !== 'verified'), [groupsNeedingId])
-  const idComplete = idBlockedGroups.length === 0
-  const allComplete = decisionsComplete && idComplete
+  const allComplete = decisionsComplete && idBlockedGroups.length === 0
 
   useEffect(() => {
     cancelButtonRef.current?.focus()
@@ -1711,12 +1306,11 @@ function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash
 
   useEffect(() => {
     function handleKeyDown(e) {
-      if (e.key === 'Escape' && !loading) { onCancel(); return }
+      if (e.key === 'Escape' && !loading) return onCancel()
       if (e.key === 'Tab' && dialogRef.current) {
         const focusable = Array.from(dialogRef.current.querySelectorAll(FOCUSABLE_SELECTOR)).filter((el) => el.offsetParent !== null)
         if (focusable.length === 0) return
-        const first = focusable[0]
-        const last = focusable[focusable.length - 1]
+        const first = focusable[0], last = focusable[focusable.length - 1]
         if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus() }
         else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus() }
       }
@@ -1743,45 +1337,32 @@ function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash
         <div className="flex shrink-0 items-center justify-between border-b border-dashed border-ink-100 bg-ink-50/50 px-6 py-4">
           <div>
             <h2 id="review-modal-title" className="flex items-center gap-2 font-display text-xl font-semibold text-ink-900">
-              <Stamp className="h-5 w-5 text-ledger-stampDark" />
+              <Stamp className="h-5 w-5 text-teal-700" />
               Verify and decide
             </h2>
-            <p className="mt-0.5 font-mono text-[11px] uppercase tracking-wide text-ink-400">
-              {allChecks.length} check{allChecks.length === 1 ? '' : 's'} · {formatCurrency(total)}
-            </p>
+            <p className="mt-0.5 font-mono text-[11px] uppercase tracking-wide text-ink-400">{allChecks.length} check{allChecks.length === 1 ? '' : 's'} · {formatCurrency(total)}</p>
           </div>
-          <button onClick={onCancel} disabled={loading} className="text-ink-300 hover:text-ink-600 disabled:opacity-40" aria-label="Close">
-            <X className="h-5 w-5" />
-          </button>
+          <button onClick={onCancel} disabled={loading} className="text-ink-300 hover:text-ink-600 disabled:opacity-40" aria-label="Close"><X className="h-5 w-5" /></button>
         </div>
 
         <div className="flex-1 overflow-y-auto px-6 py-4">
           <p className="text-sm text-ink-600">
-            Physically match each check against what was entered. <span className="font-medium text-ink-800">Approve</span> what
-            checks out for release. <span className="font-medium text-ink-800">Return</span> anything with a fixable mistake back
-            to the submitting admin — a return requires a short reason.
+            Physically match each check against what was entered. <span className="font-medium text-ink-800">Approve</span> what checks out for release.{' '}
+            <span className="font-medium text-ink-800">Return</span> anything with a fixable mistake back to the submitting admin — a return requires a short reason.
           </p>
 
           <div className="mt-3 mb-3 flex flex-wrap items-center gap-1.5">
             <span className="rounded-full bg-teal-100 px-2.5 py-1 text-xs font-medium text-teal-700">{approveCount} to approve</span>
-            {returnCount > 0 && <span className="rounded-full bg-amber-100 px-2.5 py-1 text-xs font-medium text-amber-700">{returnCount} to return</span>}
+            {returnCount > 0 && <span className="rounded-full bg-orange-100 px-2.5 py-1 text-xs font-medium text-orange-700">{returnCount} to return</span>}
           </div>
 
           <div className="overflow-hidden rounded-lg border border-ink-100">
             <div className="max-h-[42vh] overflow-y-auto">
               <table className="w-full table-fixed text-sm">
                 <colgroup>
-                  <col className="w-[12%]" />
-                  <col className="w-[8%]" />
-                  <col className="w-[9%]" />
-                  <col className="w-[11%]" />
-                  <col className="w-[7%]" />
-                  <col className="w-[8%]" />
-                  <col className="w-[7%]" />
-                  <col className="w-[5%]" />
-                  <col className="w-[5%]" />
-                  <col className="w-[14%]" />
-                  <col className="w-[14%]" />
+                  <col className="w-[12%]" /><col className="w-[8%]" /><col className="w-[9%]" /><col className="w-[11%]" />
+                  <col className="w-[7%]" /><col className="w-[8%]" /><col className="w-[7%]" /><col className="w-[5%]" />
+                  <col className="w-[5%]" /><col className="w-[14%]" /><col className="w-[14%]" />
                 </colgroup>
                 <thead className="sticky top-0 z-10 bg-ink-50 shadow-[0_1px_0_rgba(0,0,0,0.04)]">
                   <tr className="text-left font-mono text-[11px] uppercase tracking-wide text-ink-400">
@@ -1805,18 +1386,13 @@ function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash
                     const missingReason = requiresReason && !d.remarks?.trim()
                     const flagRow = showValidation && missingReason
                     return (
-                      <tr key={c.checkId ?? idx} className={cn('align-top transition-colors', d.decision === 'return' && 'bg-amber-50/50', flagRow && 'bg-orange-50 ring-1 ring-inset ring-orange-300')}>
+                      <tr key={c.checkId ?? idx} className={cn('align-top transition-colors', d.decision === 'return' && 'bg-orange-50/60', flagRow && 'bg-orange-100 ring-1 ring-inset ring-orange-300')}>
                         <td className="px-4 py-3 font-mono text-xs text-ink-700">
-                          <span className="flex items-start gap-1">
-                            <Hash className="mt-0.5 h-3 w-3 shrink-0 text-ink-300" />
-                            <span className="break-all">{c.check_no ?? '—'}</span>
-                          </span>
+                          <span className="flex items-start gap-1"><Hash className="mt-0.5 h-3 w-3 shrink-0 text-ink-300" /><span className="break-all">{c.check_no ?? '—'}</span></span>
                         </td>
                         <td className="px-4 py-3"><BranchBadge branch={c.pickupBranch} /></td>
                         <td className="px-4 py-3"><BankBadge bank={c.bank} /></td>
-                        <td className="px-4 py-3 font-medium text-ink-900">
-                          <FitText text={c.payee} />
-                        </td>
+                        <td className="px-4 py-3 font-medium text-ink-900"><FitText text={c.payee} /></td>
                         <td className="truncate px-4 py-3 text-ink-600" title={c.payor || undefined}>{c.payor ?? '—'}</td>
                         <td className="px-4 py-3 text-right font-mono text-ink-700">{safeCurrency(c.amount)}</td>
                         <td className="truncate px-4 py-3 font-mono text-xs text-ink-700" title={c.or_no || undefined}>{c.or_no ?? '—'}</td>
@@ -1839,7 +1415,7 @@ function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash
                               onClick={() => updateDecision(c.checkId, 'return')}
                               title="Send back to admin for correction"
                               aria-pressed={d.decision === 'return'}
-                              className={cn('flex items-center gap-1 rounded border px-2 py-1.5 text-xs font-medium transition focus:outline-none focus:ring-1 focus:ring-amber-500', d.decision === 'return' ? 'border-amber-600 bg-amber-600 text-white' : 'border-ink-200 text-ink-500 hover:bg-ink-50')}
+                              className={cn('flex items-center gap-1 rounded border px-2 py-1.5 text-xs font-medium transition focus:outline-none focus:ring-1 focus:ring-orange-500', d.decision === 'return' ? 'border-orange-500 bg-orange-500 text-white' : 'border-ink-200 text-ink-500 hover:bg-ink-50')}
                             >
                               <RotateCcw className="h-3.5 w-3.5" />
                               Return
@@ -1864,10 +1440,7 @@ function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash
                               />
                               <div className="flex items-center justify-between">
                                 {flagRow ? (
-                                  <span className="flex items-center gap-1 text-[11px] text-orange-600">
-                                    <AlertTriangle className="h-3 w-3 shrink-0" />
-                                    Reason required
-                                  </span>
+                                  <span className="flex items-center gap-1 text-[11px] text-orange-600"><AlertTriangle className="h-3 w-3 shrink-0" />Reason required</span>
                                 ) : <span />}
                                 <span className="text-[11px] text-ink-300">{d.remarks.length}/{REMARKS_MAX_LEN}</span>
                               </div>
@@ -1892,56 +1465,36 @@ function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash
           </div>
 
           {showValidation && !decisionsComplete && (
-            <p className="mt-2 flex items-center gap-1.5 text-xs text-orange-600">
-              <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-              Enter a reason for every returned check before confirming.
-            </p>
+            <p className="mt-2 flex items-center gap-1.5 text-xs text-orange-600"><AlertTriangle className="h-3.5 w-3.5 shrink-0" />Enter a reason for every returned check before confirming.</p>
           )}
 
           {returnCount > 0 && (
-            <div className="mt-3 flex items-start gap-2 rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-700">
+            <div className="mt-3 flex items-start gap-2 rounded-md bg-orange-50 px-3 py-2 text-xs text-orange-700">
               <RotateCcw className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-              Returned checks go back to the submitting admin's Active list — the collector's reservation is
-              unaffected and nobody else can claim it while it's corrected.
+              Returned checks go back to the submitting admin's Active list — the collector's reservation is unaffected and nobody else can claim it while it's corrected.
             </div>
           )}
 
-          {/* Read-only ID summary per reservation being released to — data
-              entered upstream by the verifier. Approving is blocked for any
-              reservation without a valid, unexpired ID on file. */}
           {groupsNeedingId.length > 0 && (
             <div className="mt-5">
-              <p className="mb-2 flex items-center gap-1.5 font-mono text-[11px] uppercase tracking-wide text-ink-400">
-                <Fingerprint className="h-3.5 w-3.5" />
-                Identity on file (recorded by verifier)
-              </p>
+              <p className="mb-2 flex items-center gap-1.5 font-mono text-[11px] uppercase tracking-wide text-ink-400"><Fingerprint className="h-3.5 w-3.5" />Identity on file (recorded by verifier)</p>
               <div className="flex flex-col gap-2.5">
                 {groupsNeedingId.map((g) => {
-                  const status = idInfoStatus(g.idInfo)
+                  const blocked = idInfoStatus(g.idInfo) !== 'verified'
                   const releasingCount = g.items.filter((c) => (decisions[c.checkId]?.decision || 'approve') === 'approve').length
-                  const blocked = status !== 'verified'
                   return (
-                    <div key={g.reservationId} className={cn('flex flex-wrap items-center justify-between gap-2 rounded-lg border p-3.5', blocked ? 'border-orange-300 bg-orange-50/60' : 'border-ink-100 bg-ink-50/30')}>
+                    <div key={g.reservationId} className={cn('flex flex-wrap items-center justify-between gap-2 rounded-lg border p-3.5', blocked ? 'border-orange-200 bg-orange-50' : 'border-ink-100 bg-ink-50/30')}>
                       <div className="flex min-w-0 flex-col gap-1">
                         <span className="flex items-center gap-1.5 text-sm font-semibold text-ink-800">
                           <User className="h-3.5 w-3.5 text-ink-400" />
                           {g.collectorName || 'Unknown collector'}
-                          <span className="rounded-full bg-teal-100 px-2 py-0.5 text-[11px] font-medium text-teal-700">
-                            Releasing {releasingCount} check{releasingCount === 1 ? '' : 's'}
-                          </span>
+                          <span className="rounded-full bg-teal-100 px-2 py-0.5 text-[11px] font-medium text-teal-700">Releasing {releasingCount} check{releasingCount === 1 ? '' : 's'}</span>
                         </span>
-                        <span className="flex items-center gap-1.5 text-xs text-ink-600">
-                          <Fingerprint className="h-3 w-3 text-ink-400" />
-                          {formatIdSummary(g.idInfo)}
-                        </span>
+                        <span className="flex items-center gap-1.5 text-xs text-ink-600"><Fingerprint className="h-3 w-3 text-ink-400" />{formatIdSummary(g.idInfo)}</span>
                       </div>
                       <div className="flex items-center gap-2">
                         <IdStatusBadge idInfo={g.idInfo} />
-                        {blocked && (
-                          <span className="text-[11px] font-medium text-orange-600">
-                            Cannot release — ask the verifier to confirm identity for this collector first.
-                          </span>
-                        )}
+                        {blocked && <span className="text-[11px] font-medium text-orange-600">Cannot release — ask the verifier to confirm identity for this collector first.</span>}
                       </div>
                     </div>
                   )
@@ -1950,18 +1503,11 @@ function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash
             </div>
           )}
 
-          {error && (
-            <p className="mt-3 flex items-center gap-1.5 text-sm text-red-600">
-              <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-              {error}
-            </p>
-          )}
+          {error && <p className="mt-3 flex items-center gap-1.5 text-sm text-orange-600"><AlertTriangle className="h-3.5 w-3.5 shrink-0" />{error}</p>}
         </div>
 
         <div className="flex shrink-0 items-center justify-end gap-2 border-t border-dashed border-ink-100 px-6 py-4">
-          <button ref={cancelButtonRef} onClick={onCancel} disabled={loading} className="rounded-md border border-ink-200 px-4 py-2 text-sm font-medium text-ink-600 hover:bg-ink-50 disabled:opacity-40">
-            Cancel
-          </button>
+          <button ref={cancelButtonRef} onClick={onCancel} disabled={loading} className="rounded-md border border-ink-200 px-4 py-2 text-sm font-medium text-ink-600 hover:bg-ink-50 disabled:opacity-40">Cancel</button>
           <button onClick={handleConfirmClick} disabled={loading} className="flex items-center gap-2 rounded-md bg-teal-600 px-4 py-2 text-sm font-semibold text-white hover:bg-teal-700 disabled:cursor-not-allowed disabled:opacity-60">
             {loading && <Loader2 className="h-4 w-4 animate-spin" />}
             Confirm decisions
@@ -1970,9 +1516,7 @@ function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash
 
         {successFlash && (
           <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-white/95 backdrop-blur-sm">
-            <div className="flex h-14 w-14 items-center justify-center rounded-full bg-teal-100">
-              <Check className="h-7 w-7 text-teal-600" strokeWidth={3} />
-            </div>
+            <div className="flex h-14 w-14 items-center justify-center rounded-full bg-teal-100"><Check className="h-7 w-7 text-teal-600" strokeWidth={3} /></div>
             <p className="text-sm font-semibold text-ink-800">{successFlash.message}</p>
           </div>
         )}
@@ -1983,22 +1527,19 @@ function ReviewModal({ action, onCancel, onConfirm, loading, error, successFlash
 
 function ListSkeleton() {
   return (
-    <div className="space-y-2.5">
-      {Array.from({ length: 4 }).map((_, i) => (
-        <div key={i} className="h-16 animate-pulse rounded-lg border border-ink-100 bg-ink-50/60" />
-      ))}
+    <div className="space-y-2.5" aria-hidden="true">
+      {Array.from({ length: 4 }).map((_, i) => <div key={i} className="h-16 animate-pulse rounded-lg border border-ink-100 bg-ink-50/60" />)}
     </div>
   )
 }
 
-function EmptyState({ hasFilter, branchLabel }) {
+function EmptyState({ hasFilter, branchLabel, onClearFilters }) {
   return (
     <div className="flex flex-col items-center rounded-lg border border-dashed border-ink-200 px-4 py-16 text-center">
-      <ShieldCheck className="h-8 w-8 text-ink-200" />
+      {hasFilter ? <Search className="h-8 w-8 text-ink-200" /> : <Inbox className="h-8 w-8 text-ink-200" />}
       <p className="mt-3 font-display text-lg font-semibold text-ink-700">{hasFilter ? 'No matching checks' : 'Nothing awaiting approval'}</p>
-      <p className="mt-1 max-w-sm text-sm text-ink-400">
-        {hasFilter ? 'Try a different search or filter combination, or clear your filters.' : `Checks submitted for ${branchLabel} will show up here for verification.`}
-      </p>
+      <p className="mt-1 max-w-sm text-sm text-ink-400">{hasFilter ? 'Try a different search or filter combination.' : `Checks submitted for ${branchLabel} will show up here for verification.`}</p>
+      {hasFilter && <button onClick={onClearFilters} className="mt-4 rounded-md border border-ink-200 px-3.5 py-1.5 text-xs font-medium text-ink-600 hover:bg-ink-50">Clear filters</button>}
     </div>
   )
 }

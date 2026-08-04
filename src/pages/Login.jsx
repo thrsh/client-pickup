@@ -6,7 +6,24 @@
 // profiles.role, read from the database, never by anything in the URL or
 // form. RequireRole still gates every protected route on the real role.
 //
-// v3 — visual pass:
+// v4 — layout + session-security pass:
+//  - Split brand/form layout on larger screens (single column on mobile),
+//    so the trust signals (2FA, RA 10173, role-based access) get real
+//    visual space instead of being crammed into the card footer.
+//  - Session lifetime is now tab-scoped: see the storage strategy comment
+//    in ../lib/supabaseClient.js. Close the tab (or the browser) and the
+//    next visit requires signing in again — there is nothing to configure
+//    here in Login.jsx for that, it's a property of the Supabase client
+//    itself, which is the correct place for it to live.
+//  - FIXED: the password-verification session (thrown away before OTP) was
+//    being closed with a bare `supabase.auth.signOut()`, which defaults to
+//    `{ scope: 'global' }` and revokes EVERY session for that user — so
+//    signing in on a new device was silently signing the person out of
+//    their other open tabs/devices. Now scoped to `{ scope: 'local' }`.
+//  - FIXED: the "check your email" screen for password reset had a raw
+//    `\u2019` sitting in JSX text (not inside a string literal), so it was
+//    rendering as the literal six characters `\u2019` instead of an
+//    apostrophe.
 //  - No gradients anywhere (solid fills only, per design direction).
 //  - Deliberate motion: entrance animation on load, a mode-switch
 //    transition between signin/otp/forgot, a shake on validation failure,
@@ -33,6 +50,7 @@ import {
   WifiOff,
   FileText,
   ShieldAlert,
+  Fingerprint,
 } from 'lucide-react'
 import { supabase } from '../lib/supabaseClient'
 import { Input } from '../components/ui/input'
@@ -102,6 +120,12 @@ function MotionStyles() {
 // Stored per-email so the exponential backoff and soft-lock survive page
 // refreshes, remounts, and throttled background tabs (computed from real
 // elapsed time, never from a ticking counter).
+//
+// NOTE: this deliberately still uses localStorage, not sessionStorage. It
+// holds no session/identity material — just "how many OTP resends has this
+// email address asked for recently" — and it needs to survive exactly the
+// tab-close/reopen case that the auth session itself should NOT survive, or
+// someone could dodge the resend cooldown just by opening a new tab.
 // ---------------------------------------------------------------------------
 function normalizeEmail(email) {
   return (email || '').trim().toLowerCase()
@@ -195,6 +219,27 @@ const PORTAL_LABEL = {
   description: 'Sign in to your account.',
   placeholder: 'you@csba.ph',
 }
+
+// Trust signals shown on the brand panel. Each one names an actual
+// property of this login flow (not decoration) — someone reading it
+// should learn something true about how the portal protects their account.
+const TRUST_POINTS = [
+  {
+    icon: KeyRound,
+    title: 'Two-step verification',
+    description: 'Every sign-in needs your password and a one-time code sent to your email.',
+  },
+  {
+    icon: Fingerprint,
+    title: 'Role-based access',
+    description: 'Admin, verifier, and approver accounts each see only what their role permits.',
+  },
+  {
+    icon: ShieldAlert,
+    title: 'RA 10173 compliant',
+    description: 'Your data is handled under the Data Privacy Act of 2012.',
+  },
+]
 
 function validateEmail(value) {
   if (!value.trim()) return 'Email is required.'
@@ -481,6 +526,71 @@ function OtpBoxes({ value, onChange, disabled, inputRef, invalid }) {
   )
 }
 
+// Left-hand brand panel — desktop/tablet only (lg+). Carries the trust
+// signals that used to be squeezed into the form card's footer, and gives
+// the portal an actual identity instead of a bare white card floating on
+// gray. Solid teal fill throughout — no gradients, per design direction.
+function BrandPanel({ logoError, onLogoError }) {
+  return (
+    <div className="relative hidden w-[42%] shrink-0 flex-col justify-between overflow-hidden bg-teal-700 px-10 py-12 text-white lg:flex xl:w-[38%] xl:px-14">
+      <div
+        className="csba-float pointer-events-none absolute -bottom-24 -right-16 h-72 w-72 rounded-full bg-teal-600/60 blur-3xl"
+        aria-hidden="true"
+      />
+      <div
+        className="pointer-events-none absolute -top-10 left-1/3 h-40 w-40 rounded-full bg-teal-800/50 blur-3xl"
+        aria-hidden="true"
+      />
+
+      <div className="relative z-10 flex items-center gap-3">
+        {!logoError ? (
+          <img
+            src="https://csba.ph/logo.png"
+            alt="CSBA logo"
+            className="h-11 w-11 object-contain"
+            onError={onLogoError}
+          />
+        ) : (
+          <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-white/10 text-sm font-bold tracking-wide">
+            CSBA
+          </div>
+        )}
+        <span className="text-sm font-semibold tracking-wide text-teal-50">
+          CSBA Compliance Portal
+        </span>
+      </div>
+
+      <div className="relative z-10 max-w-sm">
+        <h2 className="text-3xl font-bold leading-tight tracking-tight text-white">
+          Built for accountability, not just access.
+        </h2>
+        <p className="mt-3 text-sm leading-relaxed text-teal-100">
+          Admin, verifier, and approver accounts all sign in here — every session is verified,
+          scoped to your role, and logged.
+        </p>
+
+        <ul className="mt-8 flex flex-col gap-5">
+          {TRUST_POINTS.map(({ icon: Icon, title, description }) => (
+            <li key={title} className="flex items-start gap-3">
+              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-white/10">
+                <Icon className="h-4.5 w-4.5 text-teal-50" />
+              </span>
+              <div>
+                <p className="text-sm font-semibold text-white">{title}</p>
+                <p className="mt-0.5 text-xs leading-relaxed text-teal-100">{description}</p>
+              </div>
+            </li>
+          ))}
+        </ul>
+      </div>
+
+      <p className="relative z-10 text-xs text-teal-200">
+        Authorized personnel only. Accounts are managed by CSBA.
+      </p>
+    </div>
+  )
+}
+
 // Single shared login for every role — same form for admin, verifier, and
 // approver accounts.
 export default function Login() {
@@ -568,7 +678,11 @@ export default function Login() {
 
   // If someone already has a live session and lands on this page (e.g. a
   // stale bookmark, or clicking back after signing in), send them straight
-  // to their area instead of re-prompting for credentials.
+  // to their area instead of re-prompting for credentials. Because the
+  // Supabase client is configured with sessionStorage (see
+  // ../lib/supabaseClient.js), this only ever finds a session if the
+  // current TAB has one — a fresh tab, or a reopened browser, always lands
+  // here with nothing to find and falls through to the sign-in form.
   useEffect(() => {
     let cancelled = false
     ;(async () => {
@@ -714,8 +828,15 @@ export default function Login() {
     recordServerAttempt(trimmedEmail, 'password', true)
     setRememberedEmail(rememberEmail ? trimmedEmail : '')
 
-    // Password confirmed correct — but don't trust this session until OTP passes.
-    await supabase.auth.signOut()
+    // Password confirmed correct — but don't trust this session until OTP
+    // passes. IMPORTANT: scope this to 'local'. The default scope is
+    // 'global', which revokes every refresh token this user has anywhere —
+    // so a bare signOut() here would silently log the person out of any
+    // other tab/device they were already signed into, every single time
+    // they logged in again from somewhere new. 'local' only tears down the
+    // session that was just created in THIS tab, which is the one we
+    // actually want to discard.
+    await supabase.auth.signOut({ scope: 'local' })
     setPassword('')
 
     if (otpSendingRef.current) {
@@ -924,9 +1045,9 @@ export default function Login() {
     setLoading(true)
     const { error: resetError } = await supabase.auth.resetPasswordForEmail(
       normalizeEmail(email),
-      // Shared across all three portals — you'll need a /reset-password
-      // route/page wired up (not part of what I've seen of your app so
-      // far) since it's no longer scoped under /verifier.
+      // Shared across all three portals. Wire this up at /reset-password
+      // (see src/pages/ResetPassword.jsx) — it reads the recovery code
+      // Supabase appends to this URL and lets the person set a new password.
       { redirectTo: `${window.location.origin}/reset-password` }
     )
     setLoading(false)
@@ -941,452 +1062,458 @@ export default function Login() {
 
   if (checkingExistingSession) {
     return (
-      <div className="flex min-h-[80vh] items-center justify-center">
+      <div className="flex min-h-[100dvh] items-center justify-center bg-gray-50">
         <div className="h-6 w-6 animate-spin rounded-full border-2 border-teal-600 border-t-transparent" />
       </div>
     )
   }
 
   return (
-    <div className="relative flex min-h-[100dvh] items-center justify-center overflow-hidden bg-gray-50 px-4 py-10 sm:min-h-[80vh] sm:px-6 sm:py-12 lg:px-8">
+    <div className="relative flex min-h-[100dvh] overflow-hidden bg-gray-50">
       <MotionStyles />
 
-      {/* One quiet, slow-drifting solid shape instead of a cluster of
-          blurred gradient blobs — a single deliberate accent, not decoration. */}
-      <div
-        className="csba-float pointer-events-none absolute -top-16 -left-16 h-64 w-64 rounded-full bg-teal-100/60 blur-3xl"
-        aria-hidden="true"
-      />
+      <BrandPanel logoError={logoError} onLogoError={() => setLogoError(true)} />
 
-      <Card className="csba-rise relative w-full max-w-md overflow-hidden border border-gray-200 bg-white shadow-[0_1px_2px_rgba(0,0,0,0.04),0_12px_32px_rgba(15,23,42,0.08)]">
-        {/* Solid brand accent — grows in on load instead of a blended gradient bar */}
-        <div className="flex h-1 w-full overflow-hidden bg-gray-100">
-          <div className="csba-accent h-full w-full bg-teal-600" />
-        </div>
+      <div className="relative flex flex-1 items-center justify-center px-4 py-10 sm:px-6 sm:py-12 lg:px-10">
+        {/* One quiet, slow-drifting solid shape instead of a cluster of
+            blurred gradient blobs — a single deliberate accent, not
+            decoration. Only shown here on mobile/tablet; the brand panel
+            carries its own on lg+. */}
+        <div
+          className="csba-float pointer-events-none absolute -top-16 -left-16 h-64 w-64 rounded-full bg-teal-100/60 blur-3xl lg:hidden"
+          aria-hidden="true"
+        />
 
-        {!isOnline && (
-          <div className="flex items-center justify-center gap-2 bg-amber-50 px-4 py-2 text-xs font-medium text-amber-700">
-            <WifiOff className="h-3.5 w-3.5 shrink-0" />
-            You're offline — reconnect to sign in.
-          </div>
-        )}
-
-        <CardHeader className="items-center space-y-4 pt-8 text-center">
-          <div className="flex flex-col items-center justify-center gap-3">
-            {!logoError ? (
-              <img
-                src="https://csba.ph/logo.png"
-                alt="CSBA logo"
-                className="h-32 w-32 object-contain"
-                onError={() => setLogoError(true)}
-              />
-            ) : (
-              <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-teal-600 text-base font-bold tracking-wide text-white transition-transform duration-200 hover:scale-105">
-                CSBA
-              </div>
-            )}
+        <Card className="csba-rise relative w-full max-w-md overflow-hidden border border-gray-200 bg-white shadow-[0_1px_2px_rgba(0,0,0,0.04),0_12px_32px_rgba(15,23,42,0.08)]">
+          {/* Solid brand accent — grows in on load instead of a blended gradient bar */}
+          <div className="flex h-1 w-full overflow-hidden bg-gray-100">
+            <div className="csba-accent h-full w-full bg-teal-600" />
           </div>
 
-          <div className="space-y-1">
-            <CardTitle className="text-2xl font-bold tracking-tight text-teal-800">
-              {mode === 'signin' && portal.title}
-              {mode === 'otp' && 'Enter verification code'}
-              {mode === 'forgot-form' && 'Reset your password'}
-              {mode === 'forgot-sent' && 'Check your email'}
-            </CardTitle>
-            <CardDescription className="text-sm text-gray-500">
-              {mode === 'signin' && portal.description}
-              {mode === 'otp' && (
-                <>
-                  We sent a 6-digit code to{' '}
-                  <span className="font-medium text-gray-700">{normalizeEmail(email)}</span>. It
-                  expires in 5 minutes.
-                </>
-              )}
-              {mode === 'forgot-form' &&
-                'Enter your verifier email and we\u2019ll send you a link to reset your password.'}
-              {mode === 'forgot-sent' &&
-                'If an account exists for that address, a reset link is on its way. It can take a few minutes to arrive.'}
-            </CardDescription>
-          </div>
-        </CardHeader>
-
-        <CardContent className="px-6 pb-8 sm:px-8">
-          {mode === 'signin' && (
-            <form
-              onSubmit={handleSubmit}
-              noValidate
-              className="csba-rise flex flex-col gap-4"
-            >
-              <div className="space-y-1.5">
-                <label htmlFor="email" className="text-sm font-medium text-gray-700">
-                  Email Address
-                </label>
-                <Input
-                  id="email"
-                  name="email"
-                  type="email"
-                  autoComplete="username"
-                  value={email}
-                  onChange={(e) => {
-                    setEmail(e.target.value)
-                    setFieldErrors((f) => ({ ...f, email: '' }))
-                  }}
-                  onBlur={() => setFieldErrors((f) => ({ ...f, email: validateEmail(email) }))}
-                  placeholder={portal.placeholder}
-                  aria-invalid={!!fieldErrors.email}
-                  aria-describedby={fieldErrors.email ? 'email-error' : undefined}
-                  className={cn(
-                    'text-base transition-shadow duration-150 focus-visible:ring-teal-500 sm:text-sm',
-                    fieldErrors.email && 'border-red-300 focus-visible:ring-red-400'
-                  )}
-                />
-                {fieldErrors.email && (
-                  <p id="email-error" className="csba-rise flex items-center gap-1 text-xs text-red-600">
-                    <AlertCircle className="h-3 w-3 shrink-0" />
-                    {fieldErrors.email}
-                  </p>
-                )}
-              </div>
-
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <label htmlFor="password" className="text-sm font-medium text-gray-700">
-                    Password
-                  </label>
-                  <button
-                    type="button"
-                    onClick={goToForgotPassword}
-                    className="text-xs font-medium text-teal-600 transition-colors hover:text-teal-700 hover:underline"
-                  >
-                    Forgot password?
-                  </button>
-                </div>
-                <div className="relative">
-                  <Input
-                    id="password"
-                    name="password"
-                    type={showPassword ? 'text' : 'password'}
-                    autoComplete="current-password"
-                    value={password}
-                    onChange={(e) => {
-                      setPassword(e.target.value)
-                      setFieldErrors((f) => ({ ...f, password: '' }))
-                    }}
-                    onKeyUp={(e) =>
-                      setCapsLockOn(e.getModifierState ? e.getModifierState('CapsLock') : false)
-                    }
-                    onBlur={() =>
-                      setFieldErrors((f) => ({ ...f, password: validatePassword(password) }))
-                    }
-                    placeholder=""
-                    aria-invalid={!!fieldErrors.password}
-                    aria-describedby={fieldErrors.password ? 'password-error' : undefined}
-                    className={cn(
-                      'pr-10 text-base transition-shadow duration-150 focus-visible:ring-teal-500 sm:text-sm',
-                      fieldErrors.password && 'border-red-300 focus-visible:ring-red-400'
-                    )}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowPassword((v) => !v)}
-                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 transition-colors hover:text-gray-600"
-                    aria-label={showPassword ? 'Hide password' : 'Show password'}
-                  >
-                    {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                  </button>
-                </div>
-                {fieldErrors.password && (
-                  <p id="password-error" className="csba-rise flex items-center gap-1 text-xs text-red-600">
-                    <AlertCircle className="h-3 w-3 shrink-0" />
-                    {fieldErrors.password}
-                  </p>
-                )}
-                {capsLockOn && (
-                  <p className="csba-rise flex items-center gap-1 text-xs text-orange-600">
-                    <AlertCircle className="h-3 w-3 shrink-0" />
-                    Caps Lock is on
-                  </p>
-                )}
-              </div>
-
-              <label className="flex w-fit items-center gap-2 text-xs text-gray-500">
-                <input
-                  type="checkbox"
-                  checked={rememberEmail}
-                  onChange={(e) => setRememberEmail(e.target.checked)}
-                  className="h-3.5 w-3.5 rounded border-gray-300 text-teal-600 transition-colors focus-visible:ring-2 focus-visible:ring-teal-500"
-                />
-                Remember my email on this device
-              </label>
-
-              {/* Data Privacy Act + Terms consent — required to proceed */}
-              <div
-                key={`consent-${shakeTick}`}
-                className={cn(
-                  'space-y-3 rounded-xl border p-3.5 transition-colors duration-200',
-                  consentError
-                    ? 'border-red-200 bg-red-50/50 csba-shake'
-                    : 'border-gray-200 bg-gray-50/60'
-                )}
-              >
-                <ConsentCheckbox
-                  id="consent-privacy"
-                  checked={consents.privacy}
-                  invalid={!!consentError && !consents.privacy}
-                  onChange={(e) => {
-                    setConsents((c) => ({ ...c, privacy: e.target.checked }))
-                    setConsentError('')
-                  }}
-                >
-                  I consent to the collection and processing of my personal data as described in
-                  the{' '}
-                  <button
-                    type="button"
-                    onClick={() => setActiveNotice('privacy')}
-                    className="font-medium text-teal-700 underline underline-offset-2 hover:text-teal-800"
-                  >
-                    Data Privacy Notice
-                  </button>
-                  , in accordance with the Data Privacy Act of 2012 (RA 10173).
-                </ConsentCheckbox>
-
-                <ConsentCheckbox
-                  id="consent-terms"
-                  checked={consents.terms}
-                  invalid={!!consentError && !consents.terms}
-                  onChange={(e) => {
-                    setConsents((c) => ({ ...c, terms: e.target.checked }))
-                    setConsentError('')
-                  }}
-                >
-                  I have read and agree to the{' '}
-                  <button
-                    type="button"
-                    onClick={() => setActiveNotice('terms')}
-                    className="font-medium text-teal-700 underline underline-offset-2 hover:text-teal-800"
-                  >
-                    Terms & Conditions
-                  </button>{' '}
-                  of use of this portal.
-                </ConsentCheckbox>
-
-                {consentError && (
-                  <p className="flex items-center gap-1.5 text-xs text-red-600">
-                    <AlertCircle className="h-3.5 w-3.5 shrink-0" />
-                    {consentError}
-                  </p>
-                )}
-              </div>
-
-              {error && (
-                <div
-                  key={`error-${shakeTick}`}
-                  role="alert"
-                  aria-live="assertive"
-                  className="csba-shake flex items-center gap-2 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-600"
-                >
-                  <AlertCircle className="h-4 w-4 shrink-0" />
-                  <p>{error}</p>
-                </div>
-              )}
-
-              {failedAttempts >= 3 && (
-                <div className="csba-rise flex items-start gap-2 rounded-md border border-teal-200 bg-teal-50 p-3 text-xs text-teal-800">
-                  <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                  <p>
-                    Still having trouble signing in?{' '}
-                    <button
-                      type="button"
-                      onClick={goToForgotPassword}
-                      className="font-medium underline hover:text-teal-900"
-                    >
-                      Reset your password
-                    </button>{' '}
-                    or double-check for typos in your email.
-                  </p>
-                </div>
-              )}
-
-              <Button
-                type="submit"
-                disabled={loading || !isOnline}
-                aria-busy={loading}
-                className="mt-1 h-11 w-full bg-teal-600 text-base font-medium text-white shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:bg-teal-700 hover:shadow-md focus-visible:ring-teal-500 active:translate-y-0 active:scale-[0.99] disabled:translate-y-0 disabled:opacity-60 disabled:shadow-sm sm:text-sm"
-              >
-                {loading ? 'Signing in\u2026' : 'Sign in'}
-              </Button>
-            </form>
-          )}
-
-          {mode === 'otp' && (
-            <form onSubmit={handleOtpSubmit} noValidate className="csba-rise flex flex-col gap-4">
-              <div className="space-y-1.5">
-                <label htmlFor="otp" className="text-sm font-medium text-gray-700">
-                  Verification code
-                </label>
-                <div key={`otp-${otpShakeTick}`} className={otpError ? 'csba-shake' : undefined}>
-                  <OtpBoxes
-                    value={otp}
-                    onChange={handleOtpChange}
-                    disabled={loading || resendsExhausted}
-                    inputRef={otpInputRef}
-                    invalid={!!otpError}
-                  />
-                </div>
-                {otpError && (
-                  <p id="otp-error" className="flex items-center gap-1 text-xs text-red-600">
-                    <AlertCircle className="h-3 w-3 shrink-0" />
-                    {otpError}
-                  </p>
-                )}
-              </div>
-
-              {otpFailedAttempts >= 3 && (
-                <div className="csba-rise flex items-start gap-2 rounded-md border border-teal-200 bg-teal-50 p-3 text-xs text-teal-800">
-                  <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                  <p>
-                    Still not working? Make sure you're using the most recent code sent to your
-                    inbox, or request a new one below.
-                  </p>
-                </div>
-              )}
-
-              <Button
-                type="submit"
-                disabled={loading || otp.length !== OTP_LENGTH || resendsExhausted || !isOnline}
-                aria-busy={loading}
-                className="h-11 w-full bg-teal-600 text-base font-medium text-white shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:bg-teal-700 hover:shadow-md focus-visible:ring-teal-500 active:translate-y-0 active:scale-[0.99] disabled:translate-y-0 disabled:opacity-60 sm:text-sm"
-              >
-                <KeyRound className="mr-2 h-4 w-4" />
-                {loading ? 'Verifying\u2026' : 'Verify & sign in'}
-              </Button>
-
-              <button
-                type="button"
-                onClick={handleResendOtp}
-                disabled={resendCooldown > 0 || loading || otpSendingRef.current || resendsExhausted}
-                className="text-center text-sm font-medium text-teal-600 transition-colors hover:text-teal-700 disabled:cursor-not-allowed disabled:text-gray-400"
-              >
-                {resendsExhausted
-                  ? 'Too many requests \u2014 sign in again shortly'
-                  : resendCooldown > 0
-                  ? `Resend code in ${resendCooldown}s`
-                  : 'Resend code'}
-              </button>
-
-              <button
-                type="button"
-                onClick={goToSignIn}
-                className="flex items-center justify-center gap-1 text-center text-sm font-medium text-gray-500 transition-colors hover:text-gray-700"
-              >
-                <ArrowLeft className="h-3.5 w-3.5" />
-                Back to sign in
-              </button>
-            </form>
-          )}
-
-          {mode === 'forgot-form' && (
-            <form onSubmit={handleForgotSubmit} noValidate className="csba-rise flex flex-col gap-4">
-              <div className="space-y-1.5">
-                <label htmlFor="reset-email" className="text-sm font-medium text-gray-700">
-                  Email Address
-                </label>
-                <Input
-                  id="reset-email"
-                  name="email"
-                  type="email"
-                  autoComplete="username"
-                  value={email}
-                  onChange={(e) => {
-                    setEmail(e.target.value)
-                    setFieldErrors((f) => ({ ...f, email: '' }))
-                  }}
-                  onBlur={() => setFieldErrors((f) => ({ ...f, email: validateEmail(email) }))}
-                  placeholder={portal.placeholder}
-                  aria-invalid={!!fieldErrors.email}
-                  aria-describedby={fieldErrors.email ? 'reset-email-error' : undefined}
-                  className={cn(
-                    'text-base transition-shadow duration-150 focus-visible:ring-teal-500 sm:text-sm',
-                    fieldErrors.email && 'border-red-300 focus-visible:ring-red-400'
-                  )}
-                />
-                {fieldErrors.email && (
-                  <p id="reset-email-error" className="csba-rise flex items-center gap-1 text-xs text-red-600">
-                    <AlertCircle className="h-3 w-3 shrink-0" />
-                    {fieldErrors.email}
-                  </p>
-                )}
-              </div>
-
-              {error && (
-                <div
-                  key={`error-${shakeTick}`}
-                  role="alert"
-                  aria-live="assertive"
-                  className="csba-shake flex items-center gap-2 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-600"
-                >
-                  <AlertCircle className="h-4 w-4 shrink-0" />
-                  <p>{error}</p>
-                </div>
-              )}
-
-              <Button
-                type="submit"
-                disabled={loading || !isOnline}
-                aria-busy={loading}
-                className="mt-2 h-11 w-full bg-teal-600 text-base font-medium text-white shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:bg-teal-700 hover:shadow-md focus-visible:ring-teal-500 active:translate-y-0 active:scale-[0.99] sm:text-sm"
-              >
-                <Mail className="mr-2 h-4 w-4" />
-                {loading ? 'Sending link\u2026' : 'Send reset link'}
-              </Button>
-
-              <button
-                type="button"
-                onClick={goToSignIn}
-                className="text-center text-sm font-medium text-gray-500 transition-colors hover:text-gray-700"
-              >
-                Back to sign in
-              </button>
-            </form>
-          )}
-
-          {mode === 'forgot-sent' && (
-            <div className="csba-rise flex flex-col gap-4">
-              <div className="flex items-start gap-2 rounded-md border border-teal-200 bg-teal-50 p-3 text-sm text-teal-800">
-                <CheckCircle2 className="csba-pop mt-0.5 h-4 w-4 shrink-0" />
-                <p>
-                  Sent to <span className="font-medium">{normalizeEmail(email)}</span>. Didn\u2019t
-                  get it? Check your spam folder, or try again in a few minutes.
-                </p>
-              </div>
-              <Button
-                type="button"
-                onClick={goToSignIn}
-                className="h-11 w-full bg-teal-600 text-base font-medium text-white shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:bg-teal-700 hover:shadow-md focus-visible:ring-teal-500 active:translate-y-0 sm:text-sm"
-              >
-                Back to sign in
-              </Button>
+          {!isOnline && (
+            <div className="flex items-center justify-center gap-2 bg-amber-50 px-4 py-2 text-xs font-medium text-amber-700">
+              <WifiOff className="h-3.5 w-3.5 shrink-0" />
+              You're offline — reconnect to sign in.
             </div>
           )}
 
-          <p className="mt-8 text-center text-xs text-gray-400">
-            Authorized personnel only. Accounts are managed by CSBA.
-          </p>
-          <div className="mt-2 flex flex-wrap items-center justify-center gap-x-3 gap-y-1">
-            {isSecureConnection && (
-              <p className="flex items-center gap-1.5 text-[11px] text-gray-400">
-                <Lock className="h-3 w-3" />
-                Connection encrypted
-              </p>
+          <CardHeader className="items-center space-y-4 pt-8 text-center">
+            <div className="flex flex-col items-center justify-center gap-3 lg:hidden">
+              {!logoError ? (
+                <img
+                  src="https://csba.ph/logo.png"
+                  alt="CSBA logo"
+                  className="h-16 w-16 object-contain"
+                  onError={() => setLogoError(true)}
+                />
+              ) : (
+                <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-teal-600 text-base font-bold tracking-wide text-white transition-transform duration-200 hover:scale-105">
+                  CSBA
+                </div>
+              )}
+            </div>
+
+            <div className="space-y-1">
+              <CardTitle className="text-2xl font-bold tracking-tight text-teal-800">
+                {mode === 'signin' && portal.title}
+                {mode === 'otp' && 'Enter verification code'}
+                {mode === 'forgot-form' && 'Reset your password'}
+                {mode === 'forgot-sent' && 'Check your email'}
+              </CardTitle>
+              <CardDescription className="text-sm text-gray-500">
+                {mode === 'signin' && portal.description}
+                {mode === 'otp' && (
+                  <>
+                    We sent a 6-digit code to{' '}
+                    <span className="font-medium text-gray-700">{normalizeEmail(email)}</span>. It
+                    expires in 5 minutes.
+                  </>
+                )}
+                {mode === 'forgot-form' &&
+                  'Enter your account email and we\u2019ll send you a link to reset your password.'}
+                {mode === 'forgot-sent' &&
+                  'If an account exists for that address, a reset link is on its way. It can take a few minutes to arrive.'}
+              </CardDescription>
+            </div>
+          </CardHeader>
+
+          <CardContent className="px-6 pb-8 sm:px-8">
+            {mode === 'signin' && (
+              <form
+                onSubmit={handleSubmit}
+                noValidate
+                className="csba-rise flex flex-col gap-4"
+              >
+                <div className="space-y-1.5">
+                  <label htmlFor="email" className="text-sm font-medium text-gray-700">
+                    Email Address
+                  </label>
+                  <Input
+                    id="email"
+                    name="email"
+                    type="email"
+                    autoComplete="username"
+                    value={email}
+                    onChange={(e) => {
+                      setEmail(e.target.value)
+                      setFieldErrors((f) => ({ ...f, email: '' }))
+                    }}
+                    onBlur={() => setFieldErrors((f) => ({ ...f, email: validateEmail(email) }))}
+                    placeholder={portal.placeholder}
+                    aria-invalid={!!fieldErrors.email}
+                    aria-describedby={fieldErrors.email ? 'email-error' : undefined}
+                    className={cn(
+                      'text-base transition-shadow duration-150 focus-visible:ring-teal-500 sm:text-sm',
+                      fieldErrors.email && 'border-red-300 focus-visible:ring-red-400'
+                    )}
+                  />
+                  {fieldErrors.email && (
+                    <p id="email-error" className="csba-rise flex items-center gap-1 text-xs text-red-600">
+                      <AlertCircle className="h-3 w-3 shrink-0" />
+                      {fieldErrors.email}
+                    </p>
+                  )}
+                </div>
+
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <label htmlFor="password" className="text-sm font-medium text-gray-700">
+                      Password
+                    </label>
+                    <button
+                      type="button"
+                      onClick={goToForgotPassword}
+                      className="text-xs font-medium text-teal-600 transition-colors hover:text-teal-700 hover:underline"
+                    >
+                      Forgot password?
+                    </button>
+                  </div>
+                  <div className="relative">
+                    <Input
+                      id="password"
+                      name="password"
+                      type={showPassword ? 'text' : 'password'}
+                      autoComplete="current-password"
+                      value={password}
+                      onChange={(e) => {
+                        setPassword(e.target.value)
+                        setFieldErrors((f) => ({ ...f, password: '' }))
+                      }}
+                      onKeyUp={(e) =>
+                        setCapsLockOn(e.getModifierState ? e.getModifierState('CapsLock') : false)
+                      }
+                      onBlur={() =>
+                        setFieldErrors((f) => ({ ...f, password: validatePassword(password) }))
+                      }
+                      placeholder=""
+                      aria-invalid={!!fieldErrors.password}
+                      aria-describedby={fieldErrors.password ? 'password-error' : undefined}
+                      className={cn(
+                        'pr-10 text-base transition-shadow duration-150 focus-visible:ring-teal-500 sm:text-sm',
+                        fieldErrors.password && 'border-red-300 focus-visible:ring-red-400'
+                      )}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword((v) => !v)}
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 transition-colors hover:text-gray-600"
+                      aria-label={showPassword ? 'Hide password' : 'Show password'}
+                    >
+                      {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                    </button>
+                  </div>
+                  {fieldErrors.password && (
+                    <p id="password-error" className="csba-rise flex items-center gap-1 text-xs text-red-600">
+                      <AlertCircle className="h-3 w-3 shrink-0" />
+                      {fieldErrors.password}
+                    </p>
+                  )}
+                  {capsLockOn && (
+                    <p className="csba-rise flex items-center gap-1 text-xs text-orange-600">
+                      <AlertCircle className="h-3 w-3 shrink-0" />
+                      Caps Lock is on
+                    </p>
+                  )}
+                </div>
+
+                <label className="flex w-fit items-center gap-2 text-xs text-gray-500">
+                  <input
+                    type="checkbox"
+                    checked={rememberEmail}
+                    onChange={(e) => setRememberEmail(e.target.checked)}
+                    className="h-3.5 w-3.5 rounded border-gray-300 text-teal-600 transition-colors focus-visible:ring-2 focus-visible:ring-teal-500"
+                  />
+                  Remember my email on this device
+                </label>
+
+                {/* Data Privacy Act + Terms consent — required to proceed */}
+                <div
+                  key={`consent-${shakeTick}`}
+                  className={cn(
+                    'space-y-3 rounded-xl border p-3.5 transition-colors duration-200',
+                    consentError
+                      ? 'border-red-200 bg-red-50/50 csba-shake'
+                      : 'border-gray-200 bg-gray-50/60'
+                  )}
+                >
+                  <ConsentCheckbox
+                    id="consent-privacy"
+                    checked={consents.privacy}
+                    invalid={!!consentError && !consents.privacy}
+                    onChange={(e) => {
+                      setConsents((c) => ({ ...c, privacy: e.target.checked }))
+                      setConsentError('')
+                    }}
+                  >
+                    I consent to the collection and processing of my personal data as described in
+                    the{' '}
+                    <button
+                      type="button"
+                      onClick={() => setActiveNotice('privacy')}
+                      className="font-medium text-teal-700 underline underline-offset-2 hover:text-teal-800"
+                    >
+                      Data Privacy Notice
+                    </button>
+                    , in accordance with the Data Privacy Act of 2012 (RA 10173).
+                  </ConsentCheckbox>
+
+                  <ConsentCheckbox
+                    id="consent-terms"
+                    checked={consents.terms}
+                    invalid={!!consentError && !consents.terms}
+                    onChange={(e) => {
+                      setConsents((c) => ({ ...c, terms: e.target.checked }))
+                      setConsentError('')
+                    }}
+                  >
+                    I have read and agree to the{' '}
+                    <button
+                      type="button"
+                      onClick={() => setActiveNotice('terms')}
+                      className="font-medium text-teal-700 underline underline-offset-2 hover:text-teal-800"
+                    >
+                      Terms & Conditions
+                    </button>{' '}
+                    of use of this portal.
+                  </ConsentCheckbox>
+
+                  {consentError && (
+                    <p className="flex items-center gap-1.5 text-xs text-red-600">
+                      <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+                      {consentError}
+                    </p>
+                  )}
+                </div>
+
+                {error && (
+                  <div
+                    key={`error-${shakeTick}`}
+                    role="alert"
+                    aria-live="assertive"
+                    className="csba-shake flex items-center gap-2 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-600"
+                  >
+                    <AlertCircle className="h-4 w-4 shrink-0" />
+                    <p>{error}</p>
+                  </div>
+                )}
+
+                {failedAttempts >= 3 && (
+                  <div className="csba-rise flex items-start gap-2 rounded-md border border-teal-200 bg-teal-50 p-3 text-xs text-teal-800">
+                    <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    <p>
+                      Still having trouble signing in?{' '}
+                      <button
+                        type="button"
+                        onClick={goToForgotPassword}
+                        className="font-medium underline hover:text-teal-900"
+                      >
+                        Reset your password
+                      </button>{' '}
+                      or double-check for typos in your email.
+                    </p>
+                  </div>
+                )}
+
+                <Button
+                  type="submit"
+                  disabled={loading || !isOnline}
+                  aria-busy={loading}
+                  className="mt-1 h-11 w-full bg-teal-600 text-base font-medium text-white shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:bg-teal-700 hover:shadow-md focus-visible:ring-teal-500 active:translate-y-0 active:scale-[0.99] disabled:translate-y-0 disabled:opacity-60 disabled:shadow-sm sm:text-sm"
+                >
+                  {loading ? 'Signing in\u2026' : 'Sign in'}
+                </Button>
+              </form>
             )}
-            <p className="flex items-center gap-1.5 text-[11px] text-gray-400">
-              <ShieldCheck className="h-3 w-3" />
-              RA 10173 compliant
+
+            {mode === 'otp' && (
+              <form onSubmit={handleOtpSubmit} noValidate className="csba-rise flex flex-col gap-4">
+                <div className="space-y-1.5">
+                  <label htmlFor="otp" className="text-sm font-medium text-gray-700">
+                    Verification code
+                  </label>
+                  <div key={`otp-${otpShakeTick}`} className={otpError ? 'csba-shake' : undefined}>
+                    <OtpBoxes
+                      value={otp}
+                      onChange={handleOtpChange}
+                      disabled={loading || resendsExhausted}
+                      inputRef={otpInputRef}
+                      invalid={!!otpError}
+                    />
+                  </div>
+                  {otpError && (
+                    <p id="otp-error" className="flex items-center gap-1 text-xs text-red-600">
+                      <AlertCircle className="h-3 w-3 shrink-0" />
+                      {otpError}
+                    </p>
+                  )}
+                </div>
+
+                {otpFailedAttempts >= 3 && (
+                  <div className="csba-rise flex items-start gap-2 rounded-md border border-teal-200 bg-teal-50 p-3 text-xs text-teal-800">
+                    <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    <p>
+                      Still not working? Make sure you're using the most recent code sent to your
+                      inbox, or request a new one below.
+                    </p>
+                  </div>
+                )}
+
+                <Button
+                  type="submit"
+                  disabled={loading || otp.length !== OTP_LENGTH || resendsExhausted || !isOnline}
+                  aria-busy={loading}
+                  className="h-11 w-full bg-teal-600 text-base font-medium text-white shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:bg-teal-700 hover:shadow-md focus-visible:ring-teal-500 active:translate-y-0 active:scale-[0.99] disabled:translate-y-0 disabled:opacity-60 sm:text-sm"
+                >
+                  <KeyRound className="mr-2 h-4 w-4" />
+                  {loading ? 'Verifying\u2026' : 'Verify & sign in'}
+                </Button>
+
+                <button
+                  type="button"
+                  onClick={handleResendOtp}
+                  disabled={resendCooldown > 0 || loading || otpSendingRef.current || resendsExhausted}
+                  className="text-center text-sm font-medium text-teal-600 transition-colors hover:text-teal-700 disabled:cursor-not-allowed disabled:text-gray-400"
+                >
+                  {resendsExhausted
+                    ? 'Too many requests \u2014 sign in again shortly'
+                    : resendCooldown > 0
+                    ? `Resend code in ${resendCooldown}s`
+                    : 'Resend code'}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={goToSignIn}
+                  className="flex items-center justify-center gap-1 text-center text-sm font-medium text-gray-500 transition-colors hover:text-gray-700"
+                >
+                  <ArrowLeft className="h-3.5 w-3.5" />
+                  Back to sign in
+                </button>
+              </form>
+            )}
+
+            {mode === 'forgot-form' && (
+              <form onSubmit={handleForgotSubmit} noValidate className="csba-rise flex flex-col gap-4">
+                <div className="space-y-1.5">
+                  <label htmlFor="reset-email" className="text-sm font-medium text-gray-700">
+                    Email Address
+                  </label>
+                  <Input
+                    id="reset-email"
+                    name="email"
+                    type="email"
+                    autoComplete="username"
+                    value={email}
+                    onChange={(e) => {
+                      setEmail(e.target.value)
+                      setFieldErrors((f) => ({ ...f, email: '' }))
+                    }}
+                    onBlur={() => setFieldErrors((f) => ({ ...f, email: validateEmail(email) }))}
+                    placeholder={portal.placeholder}
+                    aria-invalid={!!fieldErrors.email}
+                    aria-describedby={fieldErrors.email ? 'reset-email-error' : undefined}
+                    className={cn(
+                      'text-base transition-shadow duration-150 focus-visible:ring-teal-500 sm:text-sm',
+                      fieldErrors.email && 'border-red-300 focus-visible:ring-red-400'
+                    )}
+                  />
+                  {fieldErrors.email && (
+                    <p id="reset-email-error" className="csba-rise flex items-center gap-1 text-xs text-red-600">
+                      <AlertCircle className="h-3 w-3 shrink-0" />
+                      {fieldErrors.email}
+                    </p>
+                  )}
+                </div>
+
+                {error && (
+                  <div
+                    key={`error-${shakeTick}`}
+                    role="alert"
+                    aria-live="assertive"
+                    className="csba-shake flex items-center gap-2 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-600"
+                  >
+                    <AlertCircle className="h-4 w-4 shrink-0" />
+                    <p>{error}</p>
+                  </div>
+                )}
+
+                <Button
+                  type="submit"
+                  disabled={loading || !isOnline}
+                  aria-busy={loading}
+                  className="mt-2 h-11 w-full bg-teal-600 text-base font-medium text-white shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:bg-teal-700 hover:shadow-md focus-visible:ring-teal-500 active:translate-y-0 active:scale-[0.99] sm:text-sm"
+                >
+                  <Mail className="mr-2 h-4 w-4" />
+                  {loading ? 'Sending link\u2026' : 'Send reset link'}
+                </Button>
+
+                <button
+                  type="button"
+                  onClick={goToSignIn}
+                  className="text-center text-sm font-medium text-gray-500 transition-colors hover:text-gray-700"
+                >
+                  Back to sign in
+                </button>
+              </form>
+            )}
+
+            {mode === 'forgot-sent' && (
+              <div className="csba-rise flex flex-col gap-4">
+                <div className="flex items-start gap-2 rounded-md border border-teal-200 bg-teal-50 p-3 text-sm text-teal-800">
+                  <CheckCircle2 className="csba-pop mt-0.5 h-4 w-4 shrink-0" />
+                  <p>
+                    Sent to <span className="font-medium">{normalizeEmail(email)}</span>. Didn't
+                    get it? Check your spam folder, or try again in a few minutes.
+                  </p>
+                </div>
+                <Button
+                  type="button"
+                  onClick={goToSignIn}
+                  className="h-11 w-full bg-teal-600 text-base font-medium text-white shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:bg-teal-700 hover:shadow-md focus-visible:ring-teal-500 active:translate-y-0 sm:text-sm"
+                >
+                  Back to sign in
+                </Button>
+              </div>
+            )}
+
+            <p className="mt-8 text-center text-xs text-gray-400 lg:hidden">
+              Authorized personnel only. Accounts are managed by CSBA.
             </p>
-          </div>
-        </CardContent>
-      </Card>
+            <div className="mt-2 flex flex-wrap items-center justify-center gap-x-3 gap-y-1">
+              {isSecureConnection && (
+                <p className="flex items-center gap-1.5 text-[11px] text-gray-400">
+                  <Lock className="h-3 w-3" />
+                  Connection encrypted
+                </p>
+              )}
+              <p className="flex items-center gap-1.5 text-[11px] text-gray-400 lg:hidden">
+                <ShieldCheck className="h-3 w-3" />
+                RA 10173 compliant
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
 
       <NoticeSheet notice={activeNotice} onClose={() => setActiveNotice(null)} />
     </div>

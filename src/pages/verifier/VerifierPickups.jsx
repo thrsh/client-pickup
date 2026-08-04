@@ -1,48 +1,3 @@
-// AdminPickups.jsx
-//
-// Submission workflow: admin enters per-check pickup data and submits for
-// approval; an approver (ApproverHome.jsx) then approves/rejects/returns
-// each check. Checks marked "not picked up today" release immediately,
-// skipping approval.
-//
-// ACCESS SCOPE (non-admin / verifier):
-//   - Sees only checks whose pickup_branch matches their own branch, on
-//     ALL three tabs (Active, Pending Approval, History).
-//   - On Pending Approval and History, additionally sees only checks THEY
-//     personally submitted (checks.submitted_by / check_activity_log.submitted_by).
-//   - Both scopes are enforced server-side (inner join + .eq()) and again
-//     client-side as defense-in-depth. Recall / bulk-recall re-check
-//     ownership immediately before calling the RPC.
-//   - The branch filter dropdown is locked to the verifier's own branch and
-//     cannot be changed.
-//
-// RECEIPT TYPE: checks.or_no is a single text column. The admin picks a
-// receipt TYPE (PR/AR/OR) and enters a NUMBER; composeReceiptNo() folds
-// them into "TYPE-NUMBER" before persisting.
-//
-// CHECK-STATUS: a reservation can hold checks in mixed states at once
-// (picked_up / pending_approval / returned). The Active tab always
-// re-filters embedded checks down to ACTIVE_TAB_CHECK_STATUSES, both in
-// load() and again in lineItems().
-//
-// RACE-CONDITION HANDLING:
-//   - load() is guarded by a monotonically increasing requestId so a slow
-//     or out-of-order response can never overwrite a newer one.
-//   - Every submit/recall/bulk-recall re-verifies the reservation's live
-//     status immediately before calling its RPC (see
-//     assertReservationStillActionable()) and aborts with a clear message
-//     if another actor already changed it — closing the window between
-//     opening the modal and confirming.
-//   - Per-reservation action locks (actioningIds) prevent a double click,
-//     or an overlapping action on the same reservation, from firing the
-//     RPC twice.
-//
-// Requires migration_approval_workflow.sql, migration_return_tracking.sql,
-// and migration_collector_id_verification.sql. RPCs used:
-//   admin_submit_for_approval(p_reservation_id, p_check_outcomes,
-//     p_collector_id_type, p_collector_id_type_other, p_collector_id_number)
-//   admin_recall_submission(p_reservation_id, p_check_ids, p_reason)
-//   approver_decide(p_reservation_id, p_decisions)
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Clock,
@@ -72,7 +27,6 @@ import {
   CheckCircle2,
   ShieldCheck,
   XCircle,
-  Hourglass,
   Wallet,
   Timer,
   Flame,
@@ -89,6 +43,7 @@ import { Card } from '../../components/ui/card'
 import { formatCurrency, formatDate, cn } from '../../lib/utils'
 import { BANKS } from '../../lib/banks'
 import { useProfile } from '../../context/ProfileContext'
+
 const PROFILE_BRANCH_TO_PICKUP_BRANCH = {
   csba_parqal: 'CSBA - PARQAL',
   csba_bgc: 'CSBA - BGC',
@@ -97,8 +52,6 @@ const POLL_INTERVAL_MS = 20000
 const EXPIRING_SOON_MINUTES = 15
 const CRITICAL_MINUTES = 5
 const SUCCESS_FLASH_MS = 900
-const PENDING_WARN_MINUTES = 60
-const PENDING_CRITICAL_MINUTES = 240
 
 const RECEIPT_TYPES = ['PR', 'AR', 'OR']
 
@@ -134,7 +87,7 @@ const COLLECTOR_ID_OTHER_LABEL_MAX_LENGTH = 40
 const ACTIVE_TAB_CHECK_STATUSES = new Set(['reserved', 'returned'])
 
 const SORT_OPTIONS = [
-  { value: 'expires_asc', label: 'Expiring soonest', tabs: ['active'] },
+  { value: 'expires_asc', label: 'Expiring soonest', tabs: ['active', 'pending_approval'] },
   { value: 'submitted_asc', label: 'Oldest submitted', tabs: ['pending_approval'] },
   { value: 'submitted_desc', label: 'Newest submitted', tabs: ['pending_approval'] },
   { value: 'reserved_desc', label: 'Newest reserved', tabs: ['active', 'history'] },
@@ -144,9 +97,6 @@ const SORT_OPTIONS = [
   { value: 'collector_asc', label: 'Collector A→Z', tabs: ['active', 'pending_approval', 'history'] },
 ]
 
-// Reservation states an actionable RPC expects to still find live, checked
-// immediately before that RPC fires — see the RACE-CONDITION HANDLING note
-// at the top of this file.
 const EXPECTED_STATUS_BEFORE = {
   submit: 'reserved',
   recall: 'pending_approval',
@@ -163,17 +113,15 @@ function lineItems(reservation, tab) {
       .sort((a, b) => new Date(a.performed_at || 0) - new Date(b.performed_at || 0))
       .forEach((a) => {
         if (!a.check_id) return
-        const entry = byCheck.get(a.check_id) || { or_no: null, ar_collected: null, attached_2307: null }
+        const entry = byCheck.get(a.check_id) || { or_no: null }
         entry.latest = a
         if (a.checks) entry.checks = a.checks
         if (a.or_no !== null && a.or_no !== undefined) entry.or_no = a.or_no
-        if (a.ar_collected !== null && a.ar_collected !== undefined) entry.ar_collected = a.ar_collected
-        if (a.attached_2307 !== null && a.attached_2307 !== undefined) entry.attached_2307 = a.attached_2307
         byCheck.set(a.check_id, entry)
       })
 
     return [...byCheck.values()]
-      .map(({ latest, checks: c, or_no, ar_collected, attached_2307 }) => {
+      .map(({ latest, checks: c, or_no }) => {
         if (!c) return null
         return {
           id: latest.id,
@@ -188,8 +136,6 @@ function lineItems(reservation, tab) {
           amount: c.amount,
           outcome: latest.action,
           or_no,
-          ar_collected,
-          attached_2307,
           remarks: latest.remarks,
         }
       })
@@ -218,8 +164,6 @@ function lineItems(reservation, tab) {
     amount: c.amount,
     outcome: null,
     or_no: tab === 'pending_approval' ? c.or_no ?? null : null,
-    ar_collected: tab === 'pending_approval' ? c.ar_collected ?? null : null,
-    attached_2307: tab === 'pending_approval' ? c.attached_2307 ?? null : null,
     remarks: tab === 'pending_approval' ? c.remarks ?? null : null,
     submittedAt: tab === 'pending_approval' ? c.submitted_at ?? null : null,
     submittedByName: tab === 'pending_approval' ? c.submitted_by_name ?? null : null,
@@ -228,6 +172,7 @@ function lineItems(reservation, tab) {
     returnReason: tab === 'active' ? c.return_reason ?? null : null,
     returnedAt: tab === 'active' ? c.returned_at ?? null : null,
     returnedByName: tab === 'active' ? c.returned_by_name ?? null : null,
+    attached2307: tab === 'active' ? c.form_2307_attached === 'Y' : null,
   }))
 }
 
@@ -332,12 +277,10 @@ export default function AdminPickups() {
   const { profile } = useProfile()
   const currentUserId = profile?.id
   const isAdmin = profile?.role === 'admin'
-  // Verifier's home branch — non-admins are hard-scoped to this branch on
-  // every tab. Admins are never scoped by branch.
-const rawBranch = !isAdmin ? profile?.branch || null : null
-const verifierBranch =
-  rawBranch && rawBranch !== 'all_branches' ? PROFILE_BRANCH_TO_PICKUP_BRANCH[rawBranch] || null : null
-const isBranchRestricted = !isAdmin && !!verifierBranch
+  const rawBranch = !isAdmin ? profile?.branch || null : null
+  const verifierBranch =
+    rawBranch && rawBranch !== 'all_branches' ? PROFILE_BRANCH_TO_PICKUP_BRANCH[rawBranch] || null : null
+  const isBranchRestricted = !isAdmin && !!verifierBranch
 
   const debounceRef = useRef(null)
   const toastTimerRef = useRef(null)
@@ -346,8 +289,6 @@ const isBranchRestricted = !isAdmin && !!verifierBranch
   const successTimerRef = useRef(null)
   const requestIdRef = useRef(0)
   const inFlightRef = useRef(false)
-  // Per-reservation action lock: prevents a double-click or an overlapping
-  // action from firing the same RPC twice for the same reservation.
   const [actioningIds, setActioningIds] = useState(() => new Set())
 
   useEffect(() => {
@@ -358,8 +299,6 @@ const isBranchRestricted = !isAdmin && !!verifierBranch
     }
   }, [])
 
-  // Non-admins are always scoped to their own branch — force the branch
-  // filter and keep it locked regardless of any stale local state.
   useEffect(() => {
     if (!isAdmin && verifierBranch) setBranchFilter(verifierBranch)
   }, [isAdmin, verifierBranch])
@@ -368,7 +307,7 @@ const isBranchRestricted = !isAdmin && !!verifierBranch
     load(true)
     setSelectedIds(new Set())
     setQuickFilter('all')
-    setSortBy(tab === 'active' ? 'expires_asc' : tab === 'pending_approval' ? 'submitted_asc' : 'reserved_desc')
+    setSortBy(tab === 'active' ? 'expires_asc' : tab === 'pending_approval' ? 'expires_asc' : 'reserved_desc')
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab])
 
@@ -434,7 +373,7 @@ const isBranchRestricted = !isAdmin && !!verifierBranch
       setLoadError('')
 
       try {
-        if (tab === 'active') {
+        if (tab === 'active' || tab === 'pending_approval') {
           const { error: reclaimError } = await supabase.rpc('reclaim_expired_reservations')
           if (reclaimError) console.error('reclaim_expired_reservations failed:', reclaimError)
         }
@@ -454,9 +393,9 @@ const isBranchRestricted = !isAdmin && !!verifierBranch
 
         const selectClause =
           tab === 'active'
-            ? `id, collector_name, status, reserved_at, expires_at, picked_up_at, queue_number, queue_date, ${checksJoin}(id, row_number, bank, pickup_branch, payee, payor, check_no, check_date, amount, status, return_reason, returned_at, returned_by_name, submitted_by)`
+            ? `id, collector_name, status, reserved_at, expires_at, picked_up_at, queue_number, queue_date, ${checksJoin}(id, row_number, bank, pickup_branch, payee, payor, check_no, check_date, amount, status, return_reason, returned_at, returned_by_name, submitted_by, form_2307_attached)`
             : tab === 'pending_approval'
-            ? `id, collector_name, status, reserved_at, expires_at, collector_id_type, collector_id_type_other, collector_id_number, queue_number, queue_date, ${checksJoin}(id, row_number, bank, pickup_branch, payee, payor, check_no, check_date, amount, or_no, ar_collected, attached_2307, remarks, submitted_at, submitted_by, submitted_by_name)`
+            ? `id, collector_name, status, reserved_at, expires_at, collector_id_type, collector_id_type_other, collector_id_number, queue_number, queue_date, ${checksJoin}(id, row_number, bank, pickup_branch, payee, payor, check_no, check_date, amount, or_no, remarks, submitted_at, submitted_by, submitted_by_name)`
             : 'id, collector_name, status, reserved_at, expires_at, picked_up_at, collector_id_type, collector_id_type_other, collector_id_number, queue_number, queue_date'
 
         let req = supabase
@@ -491,9 +430,6 @@ const isBranchRestricted = !isAdmin && !!verifierBranch
           }))
         }
 
-        // Defense-in-depth: re-apply every server-side scope client-side so
-        // a future change to the select clause (e.g. a dropped `!inner`)
-        // can never silently leak another verifier's or branch's data.
         if (scopingToOwnSubmissions && currentUserId) {
           rows = rows
             .map((r) => ({
@@ -526,7 +462,7 @@ const isBranchRestricted = !isAdmin && !!verifierBranch
 
           const { data: activity, error: activityError } = await supabase
             .from('check_activity_log')
-            .select('id, reservation_id, check_id, action, or_no, ar_collected, attached_2307, remarks, performed_at, submitted_by')
+            .select('id, reservation_id, check_id, action, or_no, remarks, performed_at, submitted_by')
             .in('reservation_id', ids)
             .order('performed_at', { ascending: true })
 
@@ -593,8 +529,6 @@ const isBranchRestricted = !isAdmin && !!verifierBranch
                       check_id: c.id,
                       action: syntheticOutcome,
                       or_no: null,
-                      ar_collected: null,
-                      attached_2307: null,
                       remarks: null,
                       performed_at: null,
                       checks: c,
@@ -607,9 +541,6 @@ const isBranchRestricted = !isAdmin && !!verifierBranch
 
             rows = rows.map((r) => ({ ...r, activity: byReservation.get(r.id) || [] }))
 
-            // Branch scoping for history: a verifier only sees logged checks
-            // from their own branch, on top of the submitted_by scoping
-            // already applied above.
             if (!isAdmin && verifierBranch) {
               rows = rows.map((r) => ({
                 ...r,
@@ -678,27 +609,6 @@ const isBranchRestricted = !isAdmin && !!verifierBranch
     return 'normal'
   }
 
-  function minutesWaiting(submittedAtMs) {
-    if (!submittedAtMs) return 0
-    return Math.max(0, Math.round((now - submittedAtMs) / 60000))
-  }
-
-  function formatWaiting(submittedAtMs) {
-    if (!submittedAtMs) return '—'
-    const mins = minutesWaiting(submittedAtMs)
-    if (mins < 60) return `Waiting ${mins}m`
-    const hrs = Math.floor(mins / 60)
-    const rem = mins % 60
-    return `Waiting ${hrs}h ${rem}m`
-  }
-
-  function pendingUrgency(submittedAtMs) {
-    const mins = minutesWaiting(submittedAtMs)
-    if (mins >= PENDING_CRITICAL_MINUTES) return 'critical'
-    if (mins >= PENDING_WARN_MINUTES) return 'warning'
-    return 'normal'
-  }
-
   const visibleReservations = useMemo(() => {
     const term = searchTerm.trim()
     let list = reservations.filter((r) => matchesSearch(r, sortedLineItems(r, tab), term))
@@ -709,11 +619,8 @@ const isBranchRestricted = !isAdmin && !!verifierBranch
     if (tab === 'active' && quickFilter === 'returned') {
       list = list.filter((r) => sortedLineItems(r, 'active').some((c) => c.checkStatus === 'returned'))
     }
-    if (tab === 'pending_approval' && quickFilter === 'stale') {
-      list = list.filter((r) => {
-        const submittedAtMs = earliestSubmittedAt(sortedLineItems(r, 'pending_approval'))
-        return submittedAtMs && minutesWaiting(submittedAtMs) >= PENDING_WARN_MINUTES
-      })
+    if (tab === 'pending_approval' && quickFilter === 'expiring') {
+      list = list.filter((r) => minutesLeft(r.expires_at) <= EXPIRING_SOON_MINUTES)
     }
     if (tab === 'history' && quickFilter !== 'all') {
       list = list.filter((r) => sortedLineItems(r, 'history').some((c) => c.outcome === quickFilter))
@@ -769,31 +676,12 @@ const isBranchRestricted = !isAdmin && !!verifierBranch
 
   const pendingSummary = useMemo(() => {
     if (tab !== 'pending_approval') return null
-    let totalChecks = 0
-    let stale = 0
-    let critical = 0
-    let totalValue = 0
-    let earliestMs = null
-    reservations.forEach((r) => {
-      const items = sortedLineItems(r, 'pending_approval')
-      totalChecks += items.length
-      totalValue += orderTotal(items)
-      const submittedAtMs = earliestSubmittedAt(items)
-      if (submittedAtMs) {
-        const waited = minutesWaiting(submittedAtMs)
-        if (waited >= PENDING_WARN_MINUTES) stale += 1
-        if (waited >= PENDING_CRITICAL_MINUTES) critical += 1
-        if (earliestMs === null || submittedAtMs < earliestMs) earliestMs = submittedAtMs
-      }
-    })
-    return {
-      total: reservations.length,
-      totalChecks,
-      totalValue,
-      stale,
-      critical,
-      oldestWaitingLabel: earliestMs ? formatWaiting(earliestMs) : null,
-    }
+    const minutesLeftAll = reservations.map((r) => minutesLeft(r.expires_at))
+    const expiringSoon = minutesLeftAll.filter((m) => m <= EXPIRING_SOON_MINUTES).length
+    const critical = minutesLeftAll.filter((m) => m <= CRITICAL_MINUTES).length
+    const totalChecks = reservations.reduce((sum, r) => sum + sortedLineItems(r, 'pending_approval').length, 0)
+    const totalValue = reservations.reduce((sum, r) => sum + orderTotal(sortedLineItems(r, 'pending_approval')), 0)
+    return { total: reservations.length, totalChecks, totalValue, expiringSoon, critical }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reservations, tab, now])
 
@@ -898,9 +786,7 @@ const isBranchRestricted = !isAdmin && !!verifierBranch
 
       if (entry.include) {
         const orNo = composeReceiptNo(entry)
-        if (!orNo || entry.collected === null || entry.collected === undefined || entry.attached2307 === null || entry.attached2307 === undefined) {
-          return { reason: 'incomplete', checkId: c.checkId }
-        }
+        if (!orNo) return { reason: 'incomplete', checkId: c.checkId }
         const normalized = orNo.toLowerCase()
         if (seenOrNos.has(normalized)) return { reason: 'duplicate', checkId: c.checkId }
         seenOrNos.set(normalized, c.checkId)
@@ -911,10 +797,6 @@ const isBranchRestricted = !isAdmin && !!verifierBranch
     return null
   }
 
-  // Re-verifies a reservation's live status right before its RPC call, so
-  // the window between opening the modal and confirming can never let two
-  // actors act on the same reservation. Returns an error string, or null if
-  // it's safe to proceed.
   async function assertReservationStillActionable(reservationId, actionType) {
     const expected = EXPECTED_STATUS_BEFORE[actionType]
     const { data, error } = await supabase
@@ -1038,7 +920,7 @@ const isBranchRestricted = !isAdmin && !!verifierBranch
               ? 'Each check being picked up needs its own unique receipt type + number.'
               : problem.reason === 'missing-reason'
               ? 'Enter a reason for every check left off the pickup.'
-              : 'Select a receipt type, enter its number, and set AR collected and 2307 Attached status for every check being picked up.'
+              : 'Select a receipt type and enter its number for every check being picked up.'
           )
           return
         }
@@ -1051,8 +933,8 @@ const isBranchRestricted = !isAdmin && !!verifierBranch
               check_id: c.checkId,
               picked_up: true,
               or_no: composeReceiptNo(entry),
-              ar_collected: entry.collected,
-              attached_2307: entry.attached2307,
+              ar_collected: entry.receiptType === 'AR',
+              attached_2307: !!c.attached2307,
               remarks: null,
             }
           }
@@ -1129,9 +1011,9 @@ const isBranchRestricted = !isAdmin && !!verifierBranch
     const isPending = tab === 'pending_approval'
     const isActive = tab === 'active'
     const headers = isHistory
-      ? ['Queue #', 'Collector', 'Collector ID type', 'Collector ID no.', 'Status', 'Reserved at', 'Resolved at', 'Bank', 'Pickup branch', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount', 'Outcome', 'OR no.', 'AR collected', '2307 Attached', 'Remarks']
+      ? ['Queue #', 'Collector', 'Collector ID type', 'Collector ID no.', 'Status', 'Reserved at', 'Resolved at', 'Bank', 'Pickup branch', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount', 'Outcome', 'Receipt no.', 'Remarks']
       : isPending
-      ? ['Queue #', 'Collector', 'Collector ID type', 'Collector ID no.', 'Status', 'Reserved at', 'Bank', 'Pickup branch', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount', 'OR no.', 'AR collected', '2307 Attached', 'Remarks', 'Submitted by', 'Submitted at']
+      ? ['Queue #', 'Collector', 'Collector ID type', 'Collector ID no.', 'Status', 'Reserved at', 'Bank', 'Pickup branch', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount', 'Receipt no.', 'Remarks', 'Submitted by', 'Submitted at']
       : isActive
       ? ['Queue #', 'Collector', 'Status', 'Reserved at', 'Bank', 'Pickup branch', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount', 'Check status', 'Return reason', 'Returned by', 'Returned at']
       : ['Queue #', 'Collector', 'Status', 'Reserved at', 'Bank', 'Pickup branch', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount']
@@ -1145,9 +1027,9 @@ const isBranchRestricted = !isAdmin && !!verifierBranch
       if (items.length === 0) {
         rows.push(
           isHistory
-            ? [queueCode, r.collector_name || '', formatCollectorId(r) ? (r.collector_id_type === 'other' ? (r.collector_id_type_other || 'Other ID') : (COLLECTOR_ID_TYPE_LABELS[r.collector_id_type] || '')) : '', r.collector_id_number || '', r.status || '', r.reserved_at || '', r.picked_up_at || '', '', '', '', '', '', '', '', '', '', '', '', '']
+            ? [queueCode, r.collector_name || '', formatCollectorId(r) ? (r.collector_id_type === 'other' ? (r.collector_id_type_other || 'Other ID') : (COLLECTOR_ID_TYPE_LABELS[r.collector_id_type] || '')) : '', r.collector_id_number || '', r.status || '', r.reserved_at || '', r.picked_up_at || '', '', '', '', '', '', '', '', '', '', '']
             : isPending
-            ? [queueCode, r.collector_name || '', formatCollectorId(r) ? (r.collector_id_type === 'other' ? (r.collector_id_type_other || 'Other ID') : (COLLECTOR_ID_TYPE_LABELS[r.collector_id_type] || '')) : '', r.collector_id_number || '', r.status || '', r.reserved_at || '', '', '', '', '', '', '', '', '', '', '', '', '', '']
+            ? [queueCode, r.collector_name || '', formatCollectorId(r) ? (r.collector_id_type === 'other' ? (r.collector_id_type_other || 'Other ID') : (COLLECTOR_ID_TYPE_LABELS[r.collector_id_type] || '')) : '', r.collector_id_number || '', r.status || '', r.reserved_at || '', '', '', '', '', '', '', '', '', '', '']
             : isActive
             ? [queueCode, r.collector_name || '', r.status || '', r.reserved_at || '', '', '', '', '', '', '', '', '', '', '']
             : [queueCode, r.collector_name || '', r.status || '', r.reserved_at || '', '', '', '', '', '', '']
@@ -1164,10 +1046,7 @@ const isBranchRestricted = !isAdmin && !!verifierBranch
                 r.collector_id_type === 'other' ? (r.collector_id_type_other || 'Other ID') : (COLLECTOR_ID_TYPE_LABELS[r.collector_id_type] || ''),
                 r.collector_id_number || '', r.status || '', r.reserved_at || '', r.picked_up_at || '',
                 c.bank || '', branchLabel, c.check_no || '', c.payee || '', c.payor || '', c.check_date || '', c.amount ?? '',
-                c.outcome || '', c.or_no || '',
-                c.ar_collected === null || c.ar_collected === undefined ? '' : c.ar_collected ? 'Yes' : 'No',
-                c.attached_2307 === null || c.attached_2307 === undefined ? '' : c.attached_2307 ? 'Yes' : 'No',
-                c.remarks || '',
+                c.outcome || '', c.or_no || '', c.remarks || '',
               ]
             : isPending
             ? [
@@ -1175,10 +1054,7 @@ const isBranchRestricted = !isAdmin && !!verifierBranch
                 r.collector_id_type === 'other' ? (r.collector_id_type_other || 'Other ID') : (COLLECTOR_ID_TYPE_LABELS[r.collector_id_type] || ''),
                 r.collector_id_number || '', r.status || '', r.reserved_at || '',
                 c.bank || '', branchLabel, c.check_no || '', c.payee || '', c.payor || '', c.check_date || '', c.amount ?? '',
-                c.or_no || '',
-                c.ar_collected === null || c.ar_collected === undefined ? '' : c.ar_collected ? 'Yes' : 'No',
-                c.attached_2307 === null || c.attached_2307 === undefined ? '' : c.attached_2307 ? 'Yes' : 'No',
-                c.remarks || '', c.submittedByName || '', c.submittedAt || '',
+                c.or_no || '', c.remarks || '', c.submittedByName || '', c.submittedAt || '',
               ]
             : isActive
             ? [
@@ -1277,11 +1153,11 @@ const isBranchRestricted = !isAdmin && !!verifierBranch
 
       {tab === 'pending_approval' && pendingSummary && (
         <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
-          <KpiCard icon={ShieldCheck} label="Awaiting approval" value={loading ? null : pendingSummary.total} secondary={loading ? null : pendingSummary.oldestWaitingLabel ? `Oldest: ${pendingSummary.oldestWaitingLabel}` : null} accent="lightTeal" />
+          <KpiCard icon={ShieldCheck} label="Awaiting approval" value={loading ? null : pendingSummary.total} accent="lightTeal" />
           <KpiCard icon={Hash} label="Checks submitted" value={loading ? null : pendingSummary.totalChecks} secondary={loading ? null : formatCurrency(pendingSummary.totalValue)} accent="ink" />
           <KpiCard icon={Wallet} label="Total value" value={loading ? null : formatCurrency(pendingSummary.totalValue)} secondary={loading ? null : `${formatCurrency(pendingSummary.totalValue / (pendingSummary.total || 1))} avg/submission`} accent="sky" />
-          <KpiCard icon={Hourglass} label={`Waiting ${PENDING_WARN_MINUTES}m+`} value={loading ? null : pendingSummary.stale} secondary={loading ? null : `${pendingSummary.critical} of these ${PENDING_CRITICAL_MINUTES}m+`} accent={!loading && pendingSummary.stale > 0 ? 'amber' : 'ink'} active={quickFilter === 'stale'} onClick={() => setQuickFilter((f) => (f === 'stale' ? 'all' : 'stale'))} />
-          <KpiCard icon={Flame} label={`Critical ${PENDING_CRITICAL_MINUTES}m+`} value={loading ? null : pendingSummary.critical} secondary={!loading && pendingSummary.critical > 0 ? 'Escalate to an approver' : null} accent={!loading && pendingSummary.critical > 0 ? 'red' : 'ink'} />
+          <KpiCard icon={Timer} label={`Expiring ≤ ${EXPIRING_SOON_MINUTES}m`} value={loading ? null : pendingSummary.expiringSoon} secondary={loading ? null : `${pendingSummary.critical} of these ≤ ${CRITICAL_MINUTES}m`} accent={!loading && pendingSummary.expiringSoon > 0 ? 'orange' : 'ink'} active={quickFilter === 'expiring'} onClick={() => setQuickFilter((f) => (f === 'expiring' ? 'all' : 'expiring'))} />
+          <KpiCard icon={Flame} label={`Critical ≤ ${CRITICAL_MINUTES}m`} value={loading ? null : pendingSummary.critical} secondary={!loading && pendingSummary.critical > 0 ? 'Escalate to an approver' : null} accent={!loading && pendingSummary.critical > 0 ? 'red' : 'ink'} />
         </div>
       )}
 
@@ -1352,9 +1228,9 @@ const isBranchRestricted = !isAdmin && !!verifierBranch
             ref={searchInputRef}
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
-            placeholder="Search collector, check #, payee, payor, OR no., bank, or branch... (press /)"
+            placeholder="Search collector, check #, payee, payor, receipt no., bank, or branch... (press /)"
             className="border-ink-200 pl-9 pr-8 text-sm focus-visible:ring-teal-500"
-            aria-label="Search collector name, check number, payee, payor, OR no., bank, or branch"
+            aria-label="Search collector name, check number, payee, payor, receipt no., bank, or branch"
           />
           {searchTerm && (
             <button onClick={() => setSearchTerm('')} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-ink-300 hover:text-ink-600" aria-label="Clear search">
@@ -1431,7 +1307,7 @@ const isBranchRestricted = !isAdmin && !!verifierBranch
         <div className="space-y-2.5">
           {visibleReservations.map((r) => {
             const items = sortedLineItems(r, tab)
-            const submittedAtMs = tab === 'pending_approval' ? earliestSubmittedAt(items) : null
+            const hasExpiry = tab === 'active' || tab === 'pending_approval'
             return (
               <ReservationRow
                 key={r.id}
@@ -1439,10 +1315,9 @@ const isBranchRestricted = !isAdmin && !!verifierBranch
                 items={items}
                 total={orderTotal(items)}
                 tab={tab}
-                minutesLeft={tab === 'active' ? minutesLeft(r.expires_at) : null}
-                countdownLabel={tab === 'active' ? formatCountdown(r.expires_at) : null}
-                urgencyLevel={tab === 'active' ? urgency(r.expires_at) : tab === 'pending_approval' ? pendingUrgency(submittedAtMs) : 'normal'}
-                waitingLabel={tab === 'pending_approval' ? formatWaiting(submittedAtMs) : null}
+                minutesLeft={hasExpiry ? minutesLeft(r.expires_at) : null}
+                countdownLabel={hasExpiry ? formatCountdown(r.expires_at) : null}
+                urgencyLevel={hasExpiry ? urgency(r.expires_at) : 'normal'}
                 expanded={expandedIds.has(r.id)}
                 onToggleExpand={() => toggleExpand(r.id)}
                 selectable={selectable}
@@ -1645,6 +1520,14 @@ function OutcomeBadge({ outcome }) {
       </span>
     )
   }
+  if (outcome === 'submitted_for_approval') {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full bg-sky-100 px-2 py-0.5 text-[11px] font-medium text-sky-700">
+        <Send className="h-3 w-3" />
+        Submitted
+      </span>
+    )
+  }
   if (outcome === 'released') {
     return (
       <span className="inline-flex items-center gap-1 rounded-full bg-slate-200 px-2 py-0.5 text-[11px] font-medium text-slate-600">
@@ -1689,7 +1572,7 @@ function OutcomeBadge({ outcome }) {
 }
 
 function ReservationRow({
-  reservation, items, total, tab, minutesLeft, countdownLabel, urgencyLevel, waitingLabel,
+  reservation, items, total, tab, countdownLabel, urgencyLevel,
   expanded, onToggleExpand, selectable, selected, onToggleSelect, onConfirmPickup, onRecall, locked,
 }) {
   const checkCount = items.length
@@ -1697,6 +1580,7 @@ function ReservationRow({
   const isHistory = tab === 'history'
   const isPending = tab === 'pending_approval'
   const isActive = tab === 'active'
+  const hasExpiry = isActive || isPending
   const anyReturned = isActive && items.some((c) => c.checkStatus === 'returned')
   const returnedCount = isActive ? items.filter((c) => c.checkStatus === 'returned').length : 0
 
@@ -1770,15 +1654,10 @@ function ReservationRow({
               {checkCount} check{checkCount === 1 ? '' : 's'}
             </span>
             <span className="font-mono font-semibold text-ink-800">{formatCurrency(total)}</span>
-            {tab === 'active' ? (
+            {hasExpiry ? (
               <span className={cn('flex items-center gap-1 font-mono font-medium', urgencyLevel === 'critical' ? 'text-red-600' : urgencyLevel === 'warning' ? 'text-orange-600' : 'text-teal-700')}>
                 <Clock className="h-3.5 w-3.5" />
                 {countdownLabel}
-              </span>
-            ) : isPending ? (
-              <span className={cn('flex items-center gap-1 font-mono font-medium', urgencyLevel === 'critical' ? 'text-red-600' : urgencyLevel === 'warning' ? 'text-orange-600' : 'text-amber-600')}>
-                <Hourglass className="h-3.5 w-3.5" />
-                {waitingLabel}
               </span>
             ) : (
               <span>
@@ -1814,14 +1693,10 @@ function ReservationRow({
                     {isActive && anyReturned && <th className="px-2 py-2 font-medium">Return reason</th>}
                     {isActive && anyReturned && <th className="px-2 py-2 font-medium">Returned by</th>}
                     {isActive && anyReturned && <th className="px-4 py-2 font-medium">Returned at</th>}
-                    {isPending && <th className="px-2 py-2 font-medium">OR no.</th>}
-                    {isPending && <th className="px-2 py-2 font-medium">AR collected</th>}
-                    {isPending && <th className="px-2 py-2 font-medium">2307 Attached</th>}
+                    {isPending && <th className="px-2 py-2 font-medium">Receipt no.</th>}
                     {isPending && <th className="px-4 py-2 font-medium">Remarks</th>}
                     {isHistory && <th className="px-2 py-2 font-medium">Outcome</th>}
-                    {isHistory && <th className="px-2 py-2 font-medium">OR no.</th>}
-                    {isHistory && <th className="px-2 py-2 font-medium">AR collected</th>}
-                    {isHistory && <th className="px-2 py-2 font-medium">2307 Attached</th>}
+                    {isHistory && <th className="px-2 py-2 font-medium">Receipt no.</th>}
                     {isHistory && <th className="px-4 py-2 font-medium">Remarks</th>}
                   </tr>
                 </thead>
@@ -1863,45 +1738,9 @@ function ReservationRow({
                         </td>
                       )}
                       {isPending && <td className="px-2 py-2.5 font-mono text-xs text-ink-600">{c.or_no || '—'}</td>}
-                      {isPending && (
-                        <td className="px-2 py-2.5">
-                          {c.ar_collected === null || c.ar_collected === undefined ? '—' : c.ar_collected ? (
-                            <span className="rounded-full bg-teal-100 px-2 py-0.5 text-[11px] font-medium text-teal-700">Yes</span>
-                          ) : (
-                            <span className="rounded-full bg-orange-100 px-2 py-0.5 text-[11px] font-medium text-orange-700">No</span>
-                          )}
-                        </td>
-                      )}
-                      {isPending && (
-                        <td className="px-2 py-2.5">
-                          {c.attached_2307 === null || c.attached_2307 === undefined ? '—' : c.attached_2307 ? (
-                            <span className="rounded-full bg-teal-100 px-2 py-0.5 text-[11px] font-medium text-teal-700">Yes</span>
-                          ) : (
-                            <span className="rounded-full bg-orange-100 px-2 py-0.5 text-[11px] font-medium text-orange-700">No</span>
-                          )}
-                        </td>
-                      )}
                       {isPending && <td className="max-w-[220px] px-4 py-2.5 text-xs text-ink-500">{c.remarks || '—'}</td>}
                       {isHistory && <td className="px-2 py-2.5"><OutcomeBadge outcome={c.outcome} /></td>}
                       {isHistory && <td className="px-2 py-2.5 font-mono text-xs text-ink-600">{c.or_no || '—'}</td>}
-                      {isHistory && (
-                        <td className="px-2 py-2.5">
-                          {c.ar_collected === null || c.ar_collected === undefined ? '—' : c.ar_collected ? (
-                            <span className="rounded-full bg-teal-100 px-2 py-0.5 text-[11px] font-medium text-teal-700">Yes</span>
-                          ) : (
-                            <span className="rounded-full bg-orange-100 px-2 py-0.5 text-[11px] font-medium text-orange-700">No</span>
-                          )}
-                        </td>
-                      )}
-                      {isHistory && (
-                        <td className="px-2 py-2.5">
-                          {c.attached_2307 === null || c.attached_2307 === undefined ? '—' : c.attached_2307 ? (
-                            <span className="rounded-full bg-teal-100 px-2 py-0.5 text-[11px] font-medium text-teal-700">Yes</span>
-                          ) : (
-                            <span className="rounded-full bg-orange-100 px-2 py-0.5 text-[11px] font-medium text-orange-700">No</span>
-                          )}
-                        </td>
-                      )}
                       {isHistory && <td className="max-w-[220px] px-4 py-2.5 text-xs text-ink-500">{c.remarks || '—'}</td>}
                     </tr>
                   ))}
@@ -1910,8 +1749,8 @@ function ReservationRow({
                   <tr className="border-t border-ink-100 bg-ink-50/40">
                     <td colSpan={7} className="px-4 py-2 text-right text-xs font-medium text-ink-500">Order total</td>
                     <td className="px-4 py-2 text-right font-mono font-semibold text-ink-900">{formatCurrency(total)}</td>
-                    {isHistory && <td colSpan={5} />}
-                    {isPending && <td colSpan={4} />}
+                    {isHistory && <td colSpan={3} />}
+                    {isPending && <td colSpan={2} />}
                     {isActive && <td colSpan={anyReturned ? 4 : 1} />}
                   </tr>
                 </tfoot>
@@ -1958,7 +1797,7 @@ function ReservationRow({
 function buildInitialCheckEntries(checks) {
   const initial = {}
   checks.forEach((c) => {
-    initial[c.checkId] = { include: true, receiptType: '', receiptNo: '', collected: null, attached2307: null, remarks: '' }
+    initial[c.checkId] = { include: true, receiptType: '', receiptNo: '', remarks: '' }
   })
   return initial
 }
@@ -1987,8 +1826,6 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
         include: value,
         receiptType: value ? prev[checkId]?.receiptType || '' : '',
         receiptNo: value ? prev[checkId]?.receiptNo || '' : '',
-        collected: value ? prev[checkId]?.collected ?? null : null,
-        attached2307: value ? prev[checkId]?.attached2307 ?? null : null,
         remarks: '',
       },
     }))
@@ -2001,14 +1838,6 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
   const updateReceiptNo = useCallback((checkId, value) => {
     const digitsOnly = value.replace(/\D/g, '')
     setOrEntries((prev) => ({ ...prev, [checkId]: { ...prev[checkId], receiptNo: digitsOnly.slice(0, RECEIPT_NUMBER_MAX_LENGTH) } }))
-  }, [])
-
-  const updateCollected = useCallback((checkId, value) => {
-    setOrEntries((prev) => ({ ...prev, [checkId]: { ...prev[checkId], collected: value } }))
-  }, [])
-
-  const updateAttached2307 = useCallback((checkId, value) => {
-    setOrEntries((prev) => ({ ...prev, [checkId]: { ...prev[checkId], attached2307: value } }))
   }, [])
 
   const updateRemarks = useCallback((checkId, value) => {
@@ -2037,10 +1866,8 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
       if (entry.include) {
         included += 1
         const orNo = composeReceiptNo(entry)
-        const hasCollectedAnswer = entry.collected !== null && entry.collected !== undefined
-        const hasAttachedAnswer = entry.attached2307 !== null && entry.attached2307 !== undefined
-        if (orNo && hasCollectedAnswer && hasAttachedAnswer) completed += 1
         if (orNo) {
+          completed += 1
           const key = orNo.toLowerCase()
           seenCounts[key] = (seenCounts[key] || 0) + 1
         }
@@ -2236,14 +2063,12 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
 
               <div className="flex flex-col gap-3">
                 {checks.map((c, idx) => {
-                  const entry = orEntries[c.checkId] || { include: true, receiptType: '', receiptNo: '', collected: null, attached2307: null, remarks: '' }
+                  const entry = orEntries[c.checkId] || { include: true, receiptType: '', receiptNo: '', remarks: '' }
                   const composedReceipt = composeReceiptNo(entry)
                   const isDuplicate = entry.include && composedReceipt && duplicateOrNos.has(composedReceipt.toLowerCase())
                   const needsReason = !entry.include
                   const missingReason = needsReason && !entry.remarks?.trim()
-                  const rowIncomplete = entry.include
-                    ? !composedReceipt || entry.collected === null || entry.collected === undefined || entry.attached2307 === null || entry.attached2307 === undefined
-                    : missingReason
+                  const rowIncomplete = entry.include ? !composedReceipt : missingReason
                   const wasReturned = c.checkStatus === 'returned'
                   const rowComplete = !rowIncomplete && !isDuplicate
 
@@ -2299,47 +2124,29 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
                       </div>
 
                       {entry.include ? (
-                        <div className="grid grid-cols-1 gap-4 px-4 py-4 sm:grid-cols-2 lg:grid-cols-3">
-                          <div>
-                            <label className="mb-1.5 flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-ink-400">
-                              <ReceiptText className="h-3 w-3" />
-                              Receipt
-                            </label>
-                            <div className="flex gap-1.5">
-                              <select ref={idx === 0 ? firstReceiptFieldRef : undefined} value={entry.receiptType} onChange={(e) => updateReceiptType(c.checkId, e.target.value)} aria-label={`Receipt type for check ${c.check_no || idx + 1}`} className="w-20 rounded-md border border-ink-200 px-2 py-2 text-xs text-ink-800 focus:outline-none focus:ring-2 focus:ring-teal-500/40">
-                                <option value="">Type</option>
-                                {RECEIPT_TYPES.map((rt) => <option key={rt} value={rt}>{rt}</option>)}
-                              </select>
-                              <input
-                                type="text"
-                                inputMode="numeric"
-                                value={entry.receiptNo}
-                                onChange={(e) => updateReceiptNo(c.checkId, e.target.value)}
-                                placeholder="Number"
-                                maxLength={RECEIPT_NUMBER_MAX_LENGTH}
-                                disabled={!entry.receiptType}
-                                aria-label={`Receipt number for check ${c.check_no || idx + 1}`}
-                                className={cn('min-w-0 flex-1 rounded-md border px-2 py-2 text-xs text-ink-800 focus:outline-none focus:ring-2 focus:ring-teal-500/40 disabled:bg-ink-50 disabled:text-ink-300', isDuplicate ? 'border-red-400' : 'border-ink-200')}
-                              />
-                            </div>
-                            {isDuplicate && <p className="mt-1 text-[10px] font-medium text-red-600">Already used above</p>}
+                        <div className="px-4 py-4">
+                          <label className="mb-1.5 flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-ink-400">
+                            <ReceiptText className="h-3 w-3" />
+                            Receipt
+                          </label>
+                          <div className="flex max-w-sm gap-1.5">
+                            <select ref={idx === 0 ? firstReceiptFieldRef : undefined} value={entry.receiptType} onChange={(e) => updateReceiptType(c.checkId, e.target.value)} aria-label={`Receipt type for check ${c.check_no || idx + 1}`} className="w-24 rounded-md border border-ink-200 px-2 py-2 text-xs text-ink-800 focus:outline-none focus:ring-2 focus:ring-teal-500/40">
+                              <option value="">Type</option>
+                              {RECEIPT_TYPES.map((rt) => <option key={rt} value={rt}>{rt}</option>)}
+                            </select>
+                            <input
+                              type="text"
+                              inputMode="numeric"
+                              value={entry.receiptNo}
+                              onChange={(e) => updateReceiptNo(c.checkId, e.target.value)}
+                              placeholder="Number"
+                              maxLength={RECEIPT_NUMBER_MAX_LENGTH}
+                              disabled={!entry.receiptType}
+                              aria-label={`Receipt number for check ${c.check_no || idx + 1}`}
+                              className={cn('min-w-0 flex-1 rounded-md border px-2 py-2 text-xs text-ink-800 focus:outline-none focus:ring-2 focus:ring-teal-500/40 disabled:bg-ink-50 disabled:text-ink-300', isDuplicate ? 'border-red-400' : 'border-ink-200')}
+                            />
                           </div>
-
-                          <div>
-                            <label className="mb-1.5 block text-[10px] font-semibold uppercase tracking-wide text-ink-400">AR collected</label>
-                            <div className="flex gap-1.5" role="group" aria-label={`AR collected for check ${c.check_no || idx + 1}`}>
-                              <YesNoButton active={entry.collected === true} onClick={() => updateCollected(c.checkId, true)} label="Yes" tone="positive" />
-                              <YesNoButton active={entry.collected === false} onClick={() => updateCollected(c.checkId, false)} label="No" tone="neutral" />
-                            </div>
-                          </div>
-
-                          <div>
-                            <label className="mb-1.5 block text-[10px] font-semibold uppercase tracking-wide text-ink-400">2307 Attached</label>
-                            <div className="flex gap-1.5" role="group" aria-label={`2307 Attached for check ${c.check_no || idx + 1}`}>
-                              <YesNoButton active={entry.attached2307 === true} onClick={() => updateAttached2307(c.checkId, true)} label="Yes" tone="positive" />
-                              <YesNoButton active={entry.attached2307 === false} onClick={() => updateAttached2307(c.checkId, false)} label="No" tone="neutral" />
-                            </div>
-                          </div>
+                          {isDuplicate && <p className="mt-1 text-[10px] font-medium text-red-600">Already used above</p>}
                         </div>
                       ) : (
                         <div className="px-4 py-4">
@@ -2365,7 +2172,7 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
               {!allComplete && (
                 <p className="mt-3 flex items-center gap-1.5 rounded-lg bg-orange-50 px-3 py-2 text-xs text-orange-700">
                   <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-                  {hasDuplicates ? 'Each check being picked up needs its own unique receipt type + number.' : 'Every check needs an outcome: receipt type & number, AR collected, and 2307 Attached status if picking up, or a reason if not.'}
+                  {hasDuplicates ? 'Each check being picked up needs its own unique receipt type + number.' : 'Every check needs an outcome: a receipt type & number if picking up, or a reason if not.'}
                 </p>
               )}
             </div>
@@ -2486,15 +2293,6 @@ function SummaryPill({ label, value, tone = 'neutral', mono = false }) {
       <p className={cn('text-sm font-semibold leading-tight', mono && 'font-mono')}>{value}</p>
       <p className="text-[9px] uppercase tracking-wide opacity-70">{label}</p>
     </div>
-  )
-}
-
-function YesNoButton({ active, onClick, label, tone }) {
-  const activeClass = tone === 'positive' ? 'border-teal-600 bg-teal-600 text-white' : 'border-ink-700 bg-ink-700 text-white'
-  return (
-    <button type="button" onClick={onClick} aria-pressed={active} className={cn('flex-1 rounded-md border px-2 py-2 text-xs font-medium transition', active ? activeClass : 'border-ink-200 text-ink-500 hover:bg-ink-50')}>
-      {label}
-    </button>
   )
 }
 

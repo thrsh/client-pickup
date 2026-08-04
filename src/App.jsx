@@ -5,7 +5,7 @@ import { ToastProvider } from './components/ui/toast'
 import ProtectedRoute from './components/ProtectedRoute'
 import RequireRole from './components/RequireRole'
 import RoleHome from './components/RoleHome'
-import VerifierLayout from './components/VerifierLayout' // renamed from AdminLayout
+import VerifierLayout from './components/VerifierLayout'
 import ApproverLayout from './components/ApproverLayout'
 import AdminLayout from './components/AdminLayout'
 import { useAuth } from './hooks/useAuth'
@@ -13,8 +13,9 @@ import { ProfileProvider } from './context/ProfileContext'
 
 import PublicSearch from './pages/PublicSearch'
 import PublicSearch1 from './pages/PublicSearch1'
-import Login from './pages/Login' // shared login, was VerifierLogin/AdminLogin
-import VerifierDashboard from './pages/verifier/VerifierDashboard' // renamed from admin/AdminDashboard
+import Login from './pages/Login'
+import ResetPassword from './pages/ResetPassword'
+import VerifierDashboard from './pages/verifier/VerifierDashboard'
 import VerifierUpload from './pages/verifier/VerifierUpload'
 import VerifierChecks from './pages/verifier/VerifierChecks'
 import VerifierPickups from './pages/verifier/VerifierPickups'
@@ -36,9 +37,8 @@ export default function App() {
   const { user } = useAuth()
 
   return (
-    // ProfileProvider fetches profiles.role ONCE per session and shares it
-    // through context — RequireRole, RoleHome, Navbar, and every page
-    // checking role all read the exact same value at the exact same time.
+    // ProfileProvider resolves profiles.role once per session so
+    // RequireRole, RoleHome, and Navbar all read the same value.
     <ProfileProvider>
       <ToastProvider>
         <div className="min-h-screen">
@@ -47,21 +47,18 @@ export default function App() {
             <Route path="/" element={<PublicSearch />} />
             <Route path="/collector" element={<PublicSearch1 />} />
 
-            {/* One login for every role — admin, verifier, and approver
-                accounts all sign in here. See Login.jsx: where someone
-                ends up afterward is decided by their real profiles.role,
-                not by anything in the URL. */}
+            {/* Shared login for all roles; destination is decided by
+                profiles.role, not the URL. */}
             <Route path="/login" element={<Login />} />
-            {/* Backward-compat: anyone with an old bookmarked/shared link
-                to the previous per-role login paths still lands somewhere
-                that works. */}
             <Route path="/admin/login" element={<Navigate to="/login" replace />} />
             <Route path="/verifier/login" element={<Navigate to="/login" replace />} />
             <Route path="/approver/login" element={<Navigate to="/login" replace />} />
 
-            {/* Landing pad for anyone whose role doesn't match the area
-                they hit — sends them to wherever they actually belong
-                instead of the old fixed-string redirectTo ping-pong. */}
+            {/* Public: only a short-lived Supabase recovery session exists
+                here, not a full authenticated session — must stay outside
+                ProtectedRoute/RequireRole. */}
+            <Route path="/reset-password" element={<ResetPassword />} />
+
             <Route
               path="/role-home"
               element={
@@ -90,9 +87,6 @@ export default function App() {
               <Route path="account" element={<VerifierAccount />} />
             </Route>
 
-            {/* Admin tier — oversees verifiers/approvers. Dashboard, activity
-                logs (audit trail), user management, reports, and account
-                settings all live under AdminLayout's nav. */}
             <Route
               path="/admin"
               element={
@@ -114,12 +108,10 @@ export default function App() {
               path="/approver"
               element={
                 <ProtectedRoute>
-                  {/* roles (plural) lets verifiers reach the approver area too,
-                      e.g. to cover for someone — drop 'verifier' here if you
-                      want approver strictly separate. Admins are intentionally
-                      NOT included here; give admins that access explicitly
-                      if/when you want it. */}
-                  <RequireRole roles={['approver']} redirectTo="/role-home">
+                  {/* 'verifier' included so verifiers can cover the approver
+                      area; admins are deliberately excluded unless you add
+                      that access explicitly. */}
+                  <RequireRole roles={['approver', 'verifier']} redirectTo="/role-home">
                     <ApproverLayout />
                   </RequireRole>
                 </ProtectedRoute>

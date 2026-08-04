@@ -1,11 +1,20 @@
 // src/pages/verifier/VerifierStaleApprovals.jsx
+//
+// Shows only the reports THIS verifier submitted that are still awaiting
+// an approver's decision (staled_check_reports.decided_at IS NULL). The
+// moment an approver approves or returns a report, it must disappear from
+// this queue — decided reports (approved or returned) live in Report
+// History (StaleReportHistory.jsx), not here. Scoping is enforced both in
+// the query (`.is('decided_at', null)`) and again client-side as
+// defense-in-depth, mirroring the ownership/branch check pattern used in
+// StaleReportHistory.
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   FileClock, Layers, Building2, Loader2, RefreshCw, Inbox, AlertTriangle,
-  CheckCircle2, Clock3, Search, X, SlidersHorizontal, ChevronDown, ChevronUp,
+  Clock3, Search, X, SlidersHorizontal, ChevronDown, ChevronUp,
   ArrowUpDown, Landmark, Hash, BadgeCheck, BadgeX, BadgeHelp, ArrowUp, ArrowDown,
-  RotateCcw, CalendarClock, MessageSquareQuote,
+  RotateCcw,
 } from 'lucide-react'
 import { useProfile } from '../../context/ProfileContext'
 import { supabase } from '../../lib/supabaseClient'
@@ -22,33 +31,20 @@ const UNSPECIFIED_BANK = 'Unspecified bank'
 const UNSPECIFIED_BRANCH = 'No branch on file'
 
 // generated_by is the primary match key. check_date / form_2307_attached
-// feed the badges in the detail table; return_reason / returned_at /
-// returned_by_name feed the return-audit cards — these already exist on
-// `checks` from the general pickup workflow, so no schema change needed,
-// just selecting them.
+// feed the badges in the detail table. decided_at is selected purely as a
+// defense-in-depth guard (see the filter in `load()` below) — it should
+// always be null for every row returned here, since the query itself
+// already scopes to `decided_at IS NULL`.
 const REPORT_COLUMNS =
-  'report_number, generated_by, generated_by_name, generated_at, submitted_at, submitted_by_name, status, decided_at, decided_by_name, approved_count, returned_count, branches, check_ids'
+  'report_number, generated_by, generated_by_name, generated_at, submitted_at, submitted_by_name, status, decided_at, branches, check_ids'
 const CHECK_COLUMNS =
-  'id, amount, bank, pickup_branch, payee, payor, check_no, check_date, form_2307_attached, status, return_reason, returned_at, returned_by_name'
-
-const STATUS_OPTIONS = [
-  { value: 'all', label: 'All statuses' },
-  { value: 'awaiting', label: 'Awaiting decision' },
-  { value: 'decided', label: 'Decided' },
-  { value: 'has_returns', label: 'Has returns' },
-]
+  'id, amount, bank, pickup_branch, payee, payor, check_no, check_date, form_2307_attached, status'
 
 const SORT_OPTIONS = [
   { value: 'generated_desc', label: 'Newest generated first' },
   { value: 'generated_asc', label: 'Oldest generated first' },
   { value: 'amount_desc', label: 'Highest amount' },
   { value: 'amount_asc', label: 'Lowest amount' },
-  { value: 'returns_desc', label: 'Most returned first' },
-]
-
-const AVATAR_PALETTE = [
-  'bg-rose-500', 'bg-orange-500', 'bg-amber-500', 'bg-lime-500', 'bg-emerald-500',
-  'bg-teal-500', 'bg-cyan-500', 'bg-blue-500', 'bg-indigo-500', 'bg-violet-500', 'bg-fuchsia-500',
 ]
 
 function normalizeBank(bank) {
@@ -82,38 +78,6 @@ function formatDateTime(ts) {
   const d = new Date(ts)
   if (Number.isNaN(d.getTime())) return '—'
   return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
-}
-
-// Short relative label ("3h ago") for recent timestamps. Returns null
-// once it's more than 30 days out so the UI falls back to the absolute
-// date/time only — a "42d ago" label reads worse than just the date.
-function formatRelativeTime(ts) {
-  if (!ts) return null
-  const d = new Date(ts)
-  if (Number.isNaN(d.getTime())) return null
-  const diffMs = Date.now() - d.getTime()
-  const diffMin = Math.round(diffMs / 60000)
-  if (diffMin < 1) return 'just now'
-  if (diffMin < 60) return `${diffMin}m ago`
-  const diffHr = Math.round(diffMin / 60)
-  if (diffHr < 24) return `${diffHr}h ago`
-  const diffDay = Math.round(diffHr / 24)
-  if (diffDay < 30) return `${diffDay}d ago`
-  return null
-}
-
-function getInitials(name) {
-  const parts = (name || '').trim().split(/\s+/).filter(Boolean)
-  if (parts.length === 0) return '?'
-  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase()
-  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase()
-}
-
-function avatarColorClass(name) {
-  const s = name || ''
-  let hash = 0
-  for (let i = 0; i < s.length; i += 1) hash = (hash * 31 + s.charCodeAt(i)) >>> 0
-  return AVATAR_PALETTE[hash % AVATAR_PALETTE.length]
 }
 
 // Merge two report arrays into a single de-duplicated list, keyed by
@@ -186,10 +150,10 @@ function Attachment2307Badge({ value }) {
   )
 }
 
-// Per-check disposition, independent of the report-level decided_at
-// badge. A report can be "decided" while individual checks within it
-// ended up with different outcomes — this reads straight off
-// checks.status so the cascade never has to guess.
+// Per-check status within an otherwise-pending report. A report only ever
+// reaches this page while awaiting a decision, so in practice every check
+// on it should read "picked_up"/"pending_approval" — the "returned" branch
+// is kept purely as a defensive fallback in case of stale/inconsistent data.
 function CheckOutcomeBadge({ status }) {
   if (status === 'returned')
     return (
@@ -214,59 +178,17 @@ function CheckOutcomeBadge({ status }) {
   return null
 }
 
-// Report-level status pill with distinct states for fully-confirmed,
-// mixed, and fully-returned outcomes — a report where every check bounced
-// back reads very differently to a verifier than one where a single check
-// was returned, so these get visually distinct treatment rather than one
-// generic "decided" badge.
-function ReportStatusBadge({ report }) {
-  if (!report.decided_at) {
-    return (
-      <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-100 px-3 py-1 text-xs font-semibold text-amber-700 ring-1 ring-inset ring-amber-200">
-        <Clock3 className="h-3 w-3" />
-        Awaiting approver decision
-      </span>
-    )
-  }
-
-  const approved = report.approved_count ?? 0
-  const returned = report.returned_count ?? 0
-
-  if (returned > 0 && approved === 0) {
-    return (
-      <span className="inline-flex items-center gap-1.5 rounded-full bg-orange-100 px-3 py-1 text-xs font-semibold text-orange-700 ring-1 ring-inset ring-orange-200">
-        <RotateCcw className="h-3 w-3" />
-        All {returned} returned to pool
-      </span>
-    )
-  }
-
-  if (returned > 0) {
-    return (
-      <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-100 px-3 py-1 text-xs font-semibold text-amber-700 ring-1 ring-inset ring-amber-200">
-        <CheckCircle2 className="h-3 w-3" />
-        {approved} confirmed · {returned} returned
-      </span>
-    )
-  }
-
+// Every report on this page is, by construction, awaiting a decision —
+// decided reports are excluded at the query level and filtered again
+// defensively in `load()`. So this is a single fixed badge, not a
+// branching status indicator.
+function PendingStatusBadge() {
   return (
-    <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-100 px-3 py-1 text-xs font-semibold text-emerald-700 ring-1 ring-inset ring-emerald-200">
-      <CheckCircle2 className="h-3 w-3" />
-      All {approved} confirmed stale
+    <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-100 px-3 py-1 text-xs font-semibold text-amber-700 ring-1 ring-inset ring-amber-200">
+      <Clock3 className="h-3 w-3" />
+      Awaiting approver decision
     </span>
   )
-}
-
-// Left-border accent so a report's outcome is legible at a glance in the
-// collapsed list, before expanding into the detail table.
-function reportAccentClass(r) {
-  if (!r.decided_at) return 'border-l-4 border-l-amber-400'
-  const approved = r.approved_count ?? 0
-  const returned = r.returned_count ?? 0
-  if (returned > 0 && approved === 0) return 'border-l-4 border-l-orange-500'
-  if (returned > 0) return 'border-l-4 border-l-amber-500'
-  return 'border-l-4 border-l-emerald-500'
 }
 
 function FilterSelect({ label, value, onChange, options }) {
@@ -300,9 +222,7 @@ function SortHeader({ label, active, dir, onClick, className }) {
 }
 
 // Cascading check-level detail table for a single report. Read-only —
-// verifiers submitted these checks, they don't decide on them, so this
-// intentionally has no selection/decision controls (unlike the
-// approver's equivalent table).
+// verifiers submitted these checks, they don't decide on them.
 function ReportChecksTable({ checks }) {
   const [sortKey, setSortKey] = useState('default')
   const [sortDir, setSortDir] = useState('asc')
@@ -402,95 +322,6 @@ function ReportChecksTable({ checks }) {
   )
 }
 
-// A single returned check's audit trail: who returned it, when (absolute
-// + relative), and why. Renders a graceful "no reason recorded" state
-// rather than an empty blank, since return_reason can legitimately be
-// null on rows written before reasons were required.
-function ReturnAuditCard({ check }) {
-  const relative = formatRelativeTime(check.returned_at)
-  const absolute = formatDateTime(check.returned_at)
-
-  return (
-    <div className="group relative overflow-hidden rounded-xl border border-orange-200/70 bg-gradient-to-br from-orange-50/70 via-white to-white p-4 shadow-sm transition duration-150 hover:-translate-y-0.5 hover:shadow-md">
-      <div className="flex items-start justify-between gap-3">
-        <div className="flex min-w-0 items-start gap-3">
-          <span
-            className={cn(
-              'flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-xs font-semibold text-white shadow-sm ring-2 ring-white',
-              avatarColorClass(check.returned_by_name)
-            )}
-          >
-            {getInitials(check.returned_by_name)}
-          </span>
-          <div className="min-w-0">
-            <p className="truncate text-sm font-semibold text-ink-900">{check.returned_by_name || 'Unknown approver'}</p>
-            <p className="mt-0.5 flex flex-wrap items-center gap-x-1 font-mono text-[11px] text-ink-400">
-              <CalendarClock className="h-3 w-3 shrink-0" />
-              <span>{absolute}</span>
-              {relative && <span className="text-ink-300">· {relative}</span>}
-            </p>
-          </div>
-        </div>
-        <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-orange-100 px-2.5 py-1 text-[11px] font-semibold text-orange-700 ring-1 ring-inset ring-orange-200">
-          <RotateCcw className="h-3 w-3" />
-          Returned
-        </span>
-      </div>
-
-      <div className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 border-t border-dashed border-orange-100 pt-3 text-xs text-ink-500">
-        <span className="flex items-center gap-1 font-mono text-ink-600">
-          <Hash className="h-3 w-3 shrink-0 text-ink-300" />
-          {check.check_no || '—'}
-        </span>
-        <span className="text-ink-300">·</span>
-        <span className="max-w-[140px] truncate font-medium text-ink-700" title={check.payee || undefined}>
-          {check.payee || '—'}
-        </span>
-        <span className="text-ink-300">·</span>
-        <span className="font-mono font-semibold text-ink-800">{safeCurrency(check.amount)}</span>
-      </div>
-
-      {check.return_reason ? (
-        <div className="relative mt-3 rounded-lg bg-ink-50/80 px-3 py-2.5">
-          <MessageSquareQuote className="absolute left-2 top-2 h-3.5 w-3.5 text-orange-300" />
-          <p className="pl-5 text-sm italic leading-snug text-ink-700">"{check.return_reason}"</p>
-        </div>
-      ) : (
-        <p className="mt-3 flex items-center gap-1.5 text-xs italic text-ink-300">
-          <BadgeHelp className="h-3 w-3 shrink-0" />
-          No reason was recorded for this return.
-        </p>
-      )}
-    </div>
-  )
-}
-
-// Groups every returned check in a report into a dedicated audit section,
-// separate from the main table — this is the "who returned it, when, and
-// why" detail the verifier actually needs to act on, so it gets its own
-// visual weight instead of being buried as a table cell.
-function ReturnDetailsSection({ checks }) {
-  const returnedChecks = useMemo(() => checks.filter((c) => c.status === 'returned'), [checks])
-  if (returnedChecks.length === 0) return null
-
-  return (
-    <div className="border-t border-dashed border-ink-100 bg-gradient-to-b from-orange-50/50 to-transparent px-4 py-4">
-      <div className="mb-3 flex items-center gap-2">
-        <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-orange-100 text-orange-600">
-          <RotateCcw className="h-3.5 w-3.5" />
-        </span>
-        <h3 className="text-sm font-semibold text-ink-800">Return details</h3>
-        <span className="rounded-full bg-orange-100 px-2 py-0.5 text-[11px] font-semibold text-orange-700">{returnedChecks.length}</span>
-      </div>
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-        {returnedChecks.map((c) => (
-          <ReturnAuditCard key={c.id} check={c} />
-        ))}
-      </div>
-    </div>
-  )
-}
-
 export default function VerifierStaleApprovals() {
   // NOTE: `id` is the verifier's profiles.id (== auth.uid()). If your
   // ProfileContext doesn't currently expose it, add it there — it's the
@@ -505,7 +336,6 @@ export default function VerifierStaleApprovals() {
   const [loadError, setLoadError] = useState('')
 
   const [searchTerm, setSearchTerm] = useState('')
-  const [statusFilter, setStatusFilter] = useState('all')
   const [bankFilter, setBankFilter] = useState('all')
   const [branchFilter, setBranchFilter] = useState('all')
   const [amountMin, setAmountMin] = useState('')
@@ -530,11 +360,13 @@ export default function VerifierStaleApprovals() {
 
       try {
         // Scoped to reports THIS verifier generated, in THIS verifier's
-        // branch. Two independent identity keys (id + name) are merged;
-        // branch is enforced on top of both, mirroring the RLS policy
-        // server-side — this isn't the security boundary (RLS is), it
-        // just keeps the client from requesting rows outside scope and
-        // keeps the "showing your submissions for X" banner accurate.
+        // branch, that are still awaiting an approver's decision. Two
+        // independent identity keys (id + name) are merged; branch and
+        // `decided_at IS NULL` are enforced on top of both, mirroring the
+        // RLS policy server-side. This isn't the security boundary (RLS
+        // is) — it just keeps the client from requesting rows outside
+        // scope and keeps this page's "pending" framing accurate even if
+        // the RPC/RLS drift.
         const branchLabel = !isAllBranches ? pickupBranch : null
 
         const queries = []
@@ -544,6 +376,7 @@ export default function VerifierStaleApprovals() {
             .from('staled_check_reports')
             .select(REPORT_COLUMNS)
             .eq('generated_by', myId)
+            .is('decided_at', null)
             .order('generated_at', { ascending: false })
             .limit(PAGE_SIZE)
           if (branchLabel) q = q.contains('branches', [branchLabel])
@@ -555,6 +388,7 @@ export default function VerifierStaleApprovals() {
             .from('staled_check_reports')
             .select(REPORT_COLUMNS)
             .ilike('generated_by_name', myName)
+            .is('decided_at', null)
             .order('generated_at', { ascending: false })
             .limit(PAGE_SIZE)
           if (branchLabel) q = q.contains('branches', [branchLabel])
@@ -566,7 +400,24 @@ export default function VerifierStaleApprovals() {
           if (error) throw error
         }
 
-        const data = mergeReportsByNumber(...results.map((r) => r.data))
+        let data = mergeReportsByNumber(...results.map((r) => r.data))
+
+        // Defense-in-depth: even though the query already filters on
+        // `decided_at IS NULL`, never trust that alone to keep decided
+        // (approved/returned) reports off this page — drop any that
+        // slipped through and log it so a query/RLS regression is visible
+        // instead of silently showing stale-looking "pending" reports.
+        data = data.filter((r) => {
+          if (r.decided_at) {
+            console.warn(
+              `[VerifierStaleApprovals] Dropped report ${r.report_number}: already decided at ${r.decided_at} ` +
+                `but matched the pending-reports query.`,
+            )
+            return false
+          }
+          return true
+        })
+
         data.sort((a, b) => new Date(b.generated_at) - new Date(a.generated_at))
 
         const allCheckIds = [...new Set(data.flatMap((r) => r.check_ids || []))]
@@ -618,9 +469,9 @@ export default function VerifierStaleApprovals() {
     return () => clearInterval(interval)
   }, [load])
 
-  // Keep only expanded ids that still exist after a refresh, so a report
-  // that dropped out of scope (e.g. filters changed) doesn't leave a
-  // dangling expanded entry around.
+  // A report can leave this page mid-session (an approver decides on it
+  // between polls) — drop any expanded id that no longer appears so we
+  // don't leave a dangling expanded entry around.
   useEffect(() => {
     setExpandedIds((prev) => {
       if (prev.size === 0) return prev
@@ -651,18 +502,16 @@ export default function VerifierStaleApprovals() {
   const activeFilterCount = useMemo(
     () =>
       [
-        statusFilter !== 'all',
         bankFilter !== 'all',
         isAllBranches && branchFilter !== 'all',
         amountMin !== '',
         amountMax !== '',
       ].filter(Boolean).length,
-    [statusFilter, bankFilter, branchFilter, isAllBranches, amountMin, amountMax]
+    [bankFilter, branchFilter, isAllBranches, amountMin, amountMax]
   )
 
   function clearFilters() {
     setSearchTerm('')
-    setStatusFilter('all')
     setBankFilter('all')
     setBranchFilter('all')
     setAmountMin('')
@@ -675,9 +524,6 @@ export default function VerifierStaleApprovals() {
     const max = parseAmountBound(amountMax)
 
     const list = reports.filter((r) => {
-      if (statusFilter === 'awaiting' && r.decided_at) return false
-      if (statusFilter === 'decided' && !r.decided_at) return false
-      if (statusFilter === 'has_returns' && !(r.decided_at && (r.returned_count ?? 0) > 0)) return false
       if (bankFilter !== 'all' && !r.banks.includes(bankFilter)) return false
       if (isAllBranches && branchFilter !== 'all' && !r.branches.includes(branchFilter)) return false
       if (min !== null && r.totalAmount < min) return false
@@ -689,8 +535,6 @@ export default function VerifierStaleApprovals() {
           ...r.branches,
           ...r.checks.map((c) => c.payee),
           ...r.checks.map((c) => c.check_no),
-          ...r.checks.map((c) => c.return_reason),
-          ...r.checks.map((c) => c.returned_by_name),
         ]
         if (!haystack.some((v) => String(v || '').toLowerCase().includes(term))) return false
       }
@@ -705,8 +549,6 @@ export default function VerifierStaleApprovals() {
           return b.totalAmount - a.totalAmount
         case 'amount_asc':
           return a.totalAmount - b.totalAmount
-        case 'returns_desc':
-          return (b.returned_count ?? 0) - (a.returned_count ?? 0)
         case 'generated_desc':
         default:
           return new Date(b.generated_at) - new Date(a.generated_at)
@@ -714,21 +556,16 @@ export default function VerifierStaleApprovals() {
     })
 
     return list
-  }, [reports, searchTerm, statusFilter, bankFilter, branchFilter, isAllBranches, amountMin, amountMax, sortBy])
+  }, [reports, searchTerm, bankFilter, branchFilter, isAllBranches, amountMin, amountMax, sortBy])
 
-  const summary = useMemo(() => {
-    const pending = reports.filter((r) => !r.decided_at)
-    const returnedChecksTotal = reports.reduce((sum, r) => sum + (r.decided_at ? r.returned_count ?? 0 : 0), 0)
-    const reportsWithReturns = reports.filter((r) => r.decided_at && (r.returned_count ?? 0) > 0).length
-    return {
-      totalCount: reports.length,
-      pendingCount: pending.length,
-      pendingChecks: pending.reduce((sum, r) => sum + r.checkCount, 0),
-      pendingAmount: pending.reduce((sum, r) => sum + r.totalAmount, 0),
-      returnedChecksTotal,
-      reportsWithReturns,
-    }
-  }, [reports])
+  const summary = useMemo(
+    () => ({
+      pendingCount: reports.length,
+      pendingChecks: reports.reduce((sum, r) => sum + r.checkCount, 0),
+      pendingAmount: reports.reduce((sum, r) => sum + r.totalAmount, 0),
+    }),
+    [reports]
+  )
 
   if (profileError) {
     return (
@@ -750,20 +587,15 @@ export default function VerifierStaleApprovals() {
 
   return (
     <div>
-     
-
-      {!loading && summary.reportsWithReturns > 0 && (
-        <div className="mb-4 flex items-start gap-3 rounded-xl border border-orange-200 bg-gradient-to-r from-orange-50 via-amber-50 to-orange-50 px-4 py-3 shadow-sm">
-          <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-orange-100 text-orange-600">
-            <RotateCcw className="h-4 w-4" />
+      {!loading && summary.pendingCount > 0 && (
+        <div className="mb-4 flex items-center gap-3 rounded-xl border border-ink-100 bg-white px-4 py-3 shadow-sm">
+          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-amber-100 text-amber-600">
+            <Clock3 className="h-4 w-4" />
           </span>
-          <div className="text-sm">
-            <p className="font-semibold text-orange-800">
-              {summary.returnedChecksTotal} check{summary.returnedChecksTotal === 1 ? '' : 's'} across {summary.reportsWithReturns} report
-              {summary.reportsWithReturns === 1 ? '' : 's'} {summary.returnedChecksTotal === 1 ? 'was' : 'were'} returned to the pool.
-            </p>
-            <p className="mt-0.5 text-orange-700/80">Expand a report below to see who returned each check, when, and why.</p>
-          </div>
+          <p className="text-sm text-ink-600">
+            <span className="font-semibold text-ink-900">{summary.pendingCount}</span> report{summary.pendingCount === 1 ? '' : 's'} awaiting approver
+            decision · {summary.pendingChecks} checks · {formatCurrency(summary.pendingAmount)}
+          </p>
         </div>
       )}
 
@@ -774,7 +606,7 @@ export default function VerifierStaleApprovals() {
             <Input
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
-              placeholder="Search report #, bank, branch, payee, check no, or return reason..."
+              placeholder="Search report #, bank, branch, payee, or check no..."
               className="border-ink-200 pl-8 pr-8 text-xs focus-visible:ring-ledger-stamp"
             />
             {searchTerm && (
@@ -819,8 +651,7 @@ export default function VerifierStaleApprovals() {
         </div>
 
         {showFilters && (
-          <div className="mt-3 grid grid-cols-2 gap-2 border-t border-ink-100 pt-3 sm:grid-cols-3 lg:grid-cols-6">
-            <FilterSelect label="Status" value={statusFilter} onChange={setStatusFilter} options={STATUS_OPTIONS} />
+          <div className="mt-3 grid grid-cols-2 gap-2 border-t border-ink-100 pt-3 sm:grid-cols-3 lg:grid-cols-5">
             <FilterSelect
               label="Bank"
               value={bankFilter}
@@ -874,7 +705,7 @@ export default function VerifierStaleApprovals() {
               </select>
             </div>
             {activeFilterCount > 0 && (
-              <div className="col-span-2 flex items-end sm:col-span-3 lg:col-span-6">
+              <div className="col-span-2 flex items-end sm:col-span-3 lg:col-span-5">
                 <button onClick={clearFilters} className="text-xs font-medium text-ledger-stamp hover:underline">
                   Clear filters
                 </button>
@@ -906,7 +737,7 @@ export default function VerifierStaleApprovals() {
             <Inbox className="h-5 w-5" />
           </span>
           <p className="mt-3 text-sm font-medium text-ink-600">
-            {reports.length === 0 ? "You haven't submitted any stale check reports yet" : 'No reports match your filters'}
+            {reports.length === 0 ? "You don't have any reports awaiting approver decision" : 'No reports match your filters'}
           </p>
           {reports.length > 0 && activeFilterCount > 0 && (
             <button onClick={clearFilters} className="mt-2 text-xs font-medium text-ledger-stamp hover:underline">
@@ -919,20 +750,22 @@ export default function VerifierStaleApprovals() {
           {visibleReports.map((r) => {
             const expanded = expandedIds.has(r.report_number)
             return (
-              <Card key={r.report_number} className={cn('overflow-hidden border-ink-100 p-0 shadow-sm transition-shadow hover:shadow-md', reportAccentClass(r))}>
+              <Card key={r.report_number} className="overflow-hidden border-ink-100 p-0 shadow-sm transition-shadow hover:border-ink-200 hover:shadow-md">
                 <button
                   type="button"
                   onClick={() => toggleExpand(r.report_number)}
                   aria-expanded={expanded}
-                  className="flex w-full flex-col gap-2 px-4 py-3 text-left transition hover:bg-ink-50/60"
+                  className="flex w-full flex-col gap-2 px-4 py-3.5 text-left transition hover:bg-ink-50/60"
                 >
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div className="flex items-center gap-2">
-                      <FileClock className="h-4 w-4 text-amber-500" />
+                      <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-ink-100 text-ink-500">
+                        <FileClock className="h-3.5 w-3.5" />
+                      </span>
                       <span className="font-semibold text-ink-900">Report {r.report_number}</span>
                     </div>
                     <div className="flex items-center gap-2">
-                      <ReportStatusBadge report={r} />
+                      <PendingStatusBadge />
                       {expanded ? <ChevronUp className="h-4 w-4 text-ink-300" /> : <ChevronDown className="h-4 w-4 text-ink-300" />}
                     </div>
                   </div>
@@ -952,14 +785,12 @@ export default function VerifierStaleApprovals() {
                     )}
                     <span>Generated {formatDateTime(r.generated_at)}</span>
                     {r.submitted_at && <span>· Submitted {formatDateTime(r.submitted_at)}</span>}
-                    {r.decided_at && <span>· Decided {formatDate(r.decided_at)} by {r.decided_by_name || '—'}</span>}
                   </div>
                 </button>
 
                 {expanded && (
                   <div className="border-t border-dashed border-ink-100">
                     <ReportChecksTable checks={r.checks} />
-                    <ReturnDetailsSection checks={r.checks} />
                   </div>
                 )}
               </Card>

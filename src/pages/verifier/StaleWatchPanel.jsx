@@ -48,7 +48,7 @@ import {
 import {
   buildStaleCheckReportPdf,
   buildStaleCheckReportWorkbook,
-  findMixedBankBranch,
+  findInvalidBankOrLocationMix,
 } from '../../lib/staleCheckReportDocument'
 
 // ---------------------------------------------------------------------
@@ -147,16 +147,18 @@ function summarizeBy(rows, keyFn, fallbackLabel) {
   return [...map.values()].sort((a, b) => sortKey(a.key).localeCompare(sortKey(b.key)))
 }
 
-// Single source of truth for "what does this set of rows add up to" —
-// used by the confirm dialog and the preview header. Deliberately takes
-// a plain rows array (not ids + a lookup) so it's a pure function of
-// exactly what's being reported.
 function computeReportSummary(rows) {
   let totalAmount = 0
   let staleCount = 0
   let staleAmount = 0
   let warningCount = 0
   let warningAmount = 0
+  let attached2307Count = 0
+  let notAttached2307Count = 0
+  let unset2307Count = 0
+  let oldestCheckDate = null
+  let newestCheckDate = null
+
   for (const row of rows) {
     const amount = Number(row.amount || 0)
     totalAmount += amount
@@ -167,7 +169,18 @@ function computeReportSummary(rows) {
       warningCount += 1
       warningAmount += amount
     }
+
+    const state = attachment2307State(row.form_2307_attached)
+    if (state === 'yes') attached2307Count += 1
+    else if (state === 'no') notAttached2307Count += 1
+    else unset2307Count += 1
+
+    if (row.check_date) {
+      if (!oldestCheckDate || row.check_date < oldestCheckDate) oldestCheckDate = row.check_date
+      if (!newestCheckDate || row.check_date > newestCheckDate) newestCheckDate = row.check_date
+    }
   }
+
   return {
     totalCount: rows.length,
     totalAmount,
@@ -175,6 +188,11 @@ function computeReportSummary(rows) {
     staleAmount,
     warningCount,
     warningAmount,
+    attached2307Count,
+    notAttached2307Count,
+    unset2307Count,
+    oldestCheckDate,
+    newestCheckDate,
     byBranch: summarizeBy(rows, (r) => r.pickup_branch, UNSPECIFIED_BRANCH),
     byBank: summarizeBy(rows, (r) => r.bank, UNSPECIFIED_BANK),
   }
@@ -303,11 +321,46 @@ function Attachment2307Badge({ value }) {
   )
 }
 
-// Three-stage progress indicator for the overall workflow: select checks
-// -> generate the transmittal report -> submit for approval. Purely
-// informational (no click-through) — it exists so a verifier always
-// knows where they stand before opening the transmittal modal, not as
-// another set of controls to manage.
+// Compact labeled field for the "what/where/who" scope strip at the top
+// of the confirm step — Verifier / Pickup location / Bank. Falls back to
+// an em dash rather than rendering blank, and joins multiple values with
+// a comma so it degrades gracefully if the single-bank/location rule
+// above it is ever relaxed later.
+function ScopeField({ label, value, icon: Icon }) {
+  return (
+    <div className="flex items-start gap-2 rounded-md border border-ink-100 bg-ink-50/50 px-2.5 py-2">
+      <Icon className="mt-0.5 h-3.5 w-3.5 shrink-0 text-ink-400" />
+      <div className="min-w-0">
+        <p className="text-[9px] font-semibold uppercase tracking-wide text-ink-400">{label}</p>
+        <p className="truncate text-xs font-semibold text-ink-800" title={value}>
+          {value}
+        </p>
+      </div>
+    </div>
+  )
+}
+
+// Small "N attached / N not attached / N not set" chips for the confirm
+// step's 2307 summary — zero-count states are hidden so the row doesn't
+// clutter with badges that don't apply to this selection.
+function Attachment2307SummaryBadge({ state, count }) {
+  if (!count) return null
+  const styles = {
+    yes: 'bg-emerald-100 text-emerald-700',
+    no: 'bg-ink-100 text-ink-500',
+    unset: 'bg-amber-100 text-amber-700',
+  }
+  const labels = {
+    yes: 'attached',
+    no: 'not attached',
+    unset: 'not set',
+  }
+  return (
+    <span className={cn('inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium', styles[state])}>
+      {count} {labels[state]}
+    </span>
+  )
+}
 function WorkflowStepper({ activeStep }) {
   const steps = [
     { n: 1, label: 'Select checks' },
@@ -416,6 +469,7 @@ export default function StaleWatchPanel({ onSubmitted }) {
     open: false,
     step: 'confirm',
     summary: null,
+     pendingRows: [], 
     reportNumber: '',
     selectedRows: [],
     xlsxBlob: null,
@@ -657,19 +711,11 @@ export default function StaleWatchPanel({ onSubmitted }) {
     return hidden
   }, [selectedIds, filteredRows, rowsById])
 
-  // The one-bank-per-branch rule, checked live against the current
-  // selection. The Staled Check Report groups strictly by branch, and
-  // each branch section returns to exactly one bank — so a selection
-  // spanning two banks within the same branch can never be turned into
-  // a valid report. Surfacing this as the selection changes (rather
-  // than only after "Generate" is clicked) lets a verifier fix it
-  // before they even open the confirm dialog.
-  const mixedBankBranchWarning = useMemo(() => {
+const invalidSelectionWarning = useMemo(() => {
     if (selectionSummary.count === 0) return null
     const selectedRows = [...selectedIds].map((id) => rowsById.get(id)).filter(Boolean)
-    return findMixedBankBranch(selectedRows)
+    return findInvalidBankOrLocationMix(selectedRows)
   }, [selectedIds, selectionSummary.count, rowsById])
-
   const reportLockValid = !!reportLock && selectionSummary.count > 0 && setsEqual(reportLock.checkIds, selectedIds)
 
   const activeStep = reportLockValid ? 3 : selectionSummary.count > 0 ? 2 : 1
@@ -755,28 +801,30 @@ export default function StaleWatchPanel({ onSubmitted }) {
   // verifier_record_staled_check_report burns a report number the
   // moment it's called, so we only call it once the verifier has
   // explicitly confirmed what they're locking in.
-  function handleRequestGenerate() {
-    if (selectionSummary.count === 0) {
-      push({ variant: 'error', title: 'Nothing selected', description: 'Select at least one check to include in the report.' })
-      return
-    }
-    const snapshot = [...selectedIds].map((id) => rowsById.get(id)).filter(Boolean)
-    const mixedBankError = findMixedBankBranch(snapshot)
-    if (mixedBankError) {
-      push({ variant: 'error', title: 'One bank per branch required', description: mixedBankError })
-      return
-    }
-    setReportModal((prev) => ({ ...prev, open: true, step: 'confirm', summary: computeReportSummary(snapshot) }))
+function handleRequestGenerate() {
+  if (selectionSummary.count === 0) {
+    push({ variant: 'error', title: 'Nothing selected', description: 'Select at least one check to include in the report.' })
+    return
   }
-
-  // Closes the modal while on the 'confirm' face — nothing has been
-  // generated or locked yet, so this fully discards the pending summary
-  // rather than leaving stale data around for next time.
-  function cancelConfirm() {
-    if (generating) return
-    setReportModal((prev) => ({ ...prev, open: false, step: 'confirm', summary: null }))
+  const snapshot = [...selectedIds].map((id) => rowsById.get(id)).filter(Boolean)
+  const invalidSelectionError = findInvalidBankOrLocationMix(snapshot)
+  if (invalidSelectionError) {
+    push({ variant: 'error', title: 'Single bank and location required', description: invalidSelectionError })
+    return
   }
+  setReportModal((prev) => ({
+    ...prev,
+    open: true,
+    step: 'confirm',
+    summary: computeReportSummary(snapshot),
+    pendingRows: snapshot,
+  }))
+}
 
+function cancelConfirm() {
+  if (generating) return
+  setReportModal((prev) => ({ ...prev, open: false, step: 'confirm', summary: null, pendingRows: [] }))
+}
   async function handleConfirmGenerate() {
     const trimmedAdminName = (adminName || '').trim()
     if (!trimmedAdminName) {
@@ -785,14 +833,14 @@ export default function StaleWatchPanel({ onSubmitted }) {
       return
     }
 
-    const idList = [...selectedIds]
+const idList = [...selectedIds]
     const precheckRows = idList.map((id) => rowsById.get(id)).filter(Boolean)
-    const mixedBankError = findMixedBankBranch(precheckRows)
-    if (mixedBankError) {
+    const invalidSelectionError = findInvalidBankOrLocationMix(precheckRows)
+    if (invalidSelectionError) {
       // Re-checked here (not just at modal-open time) since the
       // selection is live and could theoretically change while the
       // modal is open.
-      push({ variant: 'error', title: 'One bank per branch required', description: mixedBankError })
+      push({ variant: 'error', title: 'Single bank and location required', description: invalidSelectionError })
       setReportModal((prev) => ({ ...prev, open: false, step: 'confirm', summary: null }))
       return
     }
@@ -1202,14 +1250,14 @@ export default function StaleWatchPanel({ onSubmitted }) {
           )}
         </div>
 
-        <Button
+    <Button
           variant="outline"
           onClick={handleRequestGenerate}
-          disabled={generating || selectionSummary.count === 0 || !!mixedBankBranchWarning}
+          disabled={generating || selectionSummary.count === 0 || !!invalidSelectionWarning}
           title={
             selectionSummary.count === 0
               ? 'Select at least one check first'
-              : mixedBankBranchWarning || undefined
+              : invalidSelectionWarning || undefined
           }
         >
           {generating ? (
@@ -1221,10 +1269,10 @@ export default function StaleWatchPanel({ onSubmitted }) {
         </Button>
       </div>
 
-      {mixedBankBranchWarning && (
+  {invalidSelectionWarning && (
         <div className="mb-4 flex items-center gap-2 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
           <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-          {mixedBankBranchWarning}
+          {invalidSelectionWarning}
         </div>
       )}
       {reportLock && !reportLockValid && selectionSummary.count > 0 && (
@@ -1297,9 +1345,12 @@ export default function StaleWatchPanel({ onSubmitted }) {
             const branchIds = branchGroup.banks.flatMap((b) => b.rows.map((r) => r.id))
             const branchAllSelected = branchIds.every((id) => selectedIds.has(id))
             const branchSomeSelected = branchIds.some((id) => selectedIds.has(id))
-            const branchCollapsed = collapsedBranches.has(branchGroup.branch)
-            const branchHasMixedSelection =
-              findMixedBankBranch(branchIds.filter((id) => selectedIds.has(id)).map((id) => rowsById.get(id)).filter(Boolean)) !== null
+       const branchCollapsed = collapsedBranches.has(branchGroup.branch)
+            // Per-branch mixed-bank badge no longer drives eligibility —
+            // a report can't span more than one bank or location at all
+            // now, so invalidSelectionWarning above is the single source
+            // of truth. This just flags branches with more than one bank
+            // on file, informationally.
 
             return (
               <div key={branchGroup.branch} className="overflow-hidden rounded-lg border border-ink-100 bg-white">
@@ -1329,13 +1380,10 @@ export default function StaleWatchPanel({ onSubmitted }) {
                   <span className="text-xs text-ink-400">
                     {branchIds.length} check{branchIds.length === 1 ? '' : 's'}
                   </span>
-                  {branchGroup.banks.length > 1 && (
+        {branchGroup.banks.length > 1 && (
                     <span
-                      className={cn(
-                        'ml-1 inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[9px] font-medium',
-                        branchHasMixedSelection ? 'bg-red-100 text-red-700' : 'bg-ink-100 text-ink-500',
-                      )}
-                      title="This branch has checks from more than one bank — select from only one bank to include it in a report."
+                      className="ml-1 inline-flex items-center gap-1 rounded-full bg-ink-100 px-2 py-0.5 text-[9px] font-medium text-ink-500"
+                      title="This location has checks from more than one bank on file — a single transmittal report can only include checks from one bank."
                     >
                       {branchGroup.banks.length} banks here
                     </span>
@@ -1473,12 +1521,12 @@ export default function StaleWatchPanel({ onSubmitted }) {
             if (reportModal.step === 'preview' && !submitting) closePreview()
           }}
         >
-          <div
-            className={cn(
-              'flex max-h-[88vh] w-full flex-col overflow-hidden rounded-2xl bg-white shadow-2xl',
-              reportModal.step === 'confirm' ? 'max-w-md' : 'max-w-2xl',
-            )}
-          >
+        <div
+  className={cn(
+    'flex max-h-[75vh] w-full flex-col overflow-hidden rounded-2xl bg-white shadow-2xl',
+    reportModal.step === 'confirm' ? 'max-w-[33.6rem]' : 'max-w-[50.4rem]',
+  )}
+>
             {/* Header: shared across both faces, with a 2-step progress
                 indicator so it's visually obvious this is one continuous
                 flow rather than two unrelated dialogs. */}
@@ -1533,106 +1581,162 @@ export default function StaleWatchPanel({ onSubmitted }) {
             </div>
 
             {/* Face 1: confirm + summary */}
-            {reportModal.step === 'confirm' && reportModal.summary && (
-              <>
-                <div className="overflow-y-auto px-6 py-5">
-                  <p className="text-xs text-ink-400">
-                    This locks a report number to the exact checks below. Once generated, you'll review the rendered
-                    PDF/Excel and submit for approval from this same window — if the selection changes afterward,
-                    you'll need to generate a new transmittal report before submitting.
-                  </p>
+       {reportModal.step === 'confirm' && reportModal.summary && (
+  <>
+    <div className="space-y-4 overflow-y-auto px-6 py-5">
+      <p className="text-xs text-ink-400">
+        Review the checks below, then lock in a report number. Once generated, you'll preview the rendered
+        PDF/Excel and submit it for approval from the same window — if the selection changes after that,
+        you'll need to generate a new report before submitting.
+      </p>
 
-                  <div className="mt-4 space-y-1.5 rounded-lg border border-ink-100 bg-ink-50/60 p-3 text-xs text-ink-600">
-                    <p className="flex justify-between">
-                      <span>Total checks</span>
-                      <span className="font-semibold text-ink-800">{reportModal.summary.totalCount}</span>
-                    </p>
-                    <p className="flex justify-between">
-                      <span>Stale</span>
-                      <span className="font-semibold text-red-600">
-                        {reportModal.summary.staleCount} · {formatCurrency(reportModal.summary.staleAmount)}
-                      </span>
-                    </p>
-                    {reportModal.summary.warningCount > 0 && (
-                      <p className="flex justify-between">
-                        <span>Nearing stale</span>
-                        <span className="font-semibold text-amber-600">
-                          {reportModal.summary.warningCount} · {formatCurrency(reportModal.summary.warningAmount)}
-                        </span>
-                      </p>
-                    )}
-                    <p className="flex justify-between border-t border-ink-200 pt-1.5">
-                      <span className="font-medium text-ink-700">Total amount</span>
-                      <span className="font-semibold text-ink-900">{formatCurrency(reportModal.summary.totalAmount)}</span>
-                    </p>
-                    <p className="flex justify-between">
-                      <span>Branches</span>
-                      <span className="font-semibold text-ink-800">{reportModal.summary.byBranch.length}</span>
-                    </p>
-                    <p className="flex justify-between">
-                      <span>Banks</span>
-                      <span className="font-semibold text-ink-800">{reportModal.summary.byBank.length}</span>
-                    </p>
-                  </div>
-                </div>
+      {/* Who / where / which bank — the three facts a verifier double-checks first */}
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+        <ScopeField label="Verifier" value={(adminName || '').trim() || '—'} icon={ClipboardCheck} />
+        <ScopeField
+          label="Pickup location"
+          value={reportModal.summary.byBranch.map((b) => b.key).join(', ') || '—'}
+          icon={Building2}
+        />
+        <ScopeField
+          label="Bank"
+          value={reportModal.summary.byBank.map((b) => b.key).join(', ') || '—'}
+          icon={Landmark}
+        />
+      </div>
 
-                <div className="flex shrink-0 justify-end gap-2 border-t border-dashed border-ink-100 px-6 py-4">
-                  <button
-                    onClick={cancelConfirm}
-                    disabled={generating}
-                    className="rounded-md border border-ink-200 px-4 py-2 text-sm font-medium text-ink-600 hover:bg-ink-50 disabled:opacity-40"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    onClick={handleConfirmGenerate}
-                    disabled={generating}
-                    className="flex items-center gap-2 rounded-md bg-ledger-stamp px-4 py-2 text-sm font-semibold text-white shadow-sm hover:opacity-90 disabled:opacity-60"
-                  >
-                    {generating && <Loader2 className="h-4 w-4 animate-spin" />}
-                    {generating ? 'Generating…' : 'Generate & lock report'}
-                  </button>
-                </div>
-              </>
-            )}
+      {/* Totals */}
+      <div className="space-y-1.5 rounded-lg border border-ink-100 bg-ink-50/60 p-3 text-xs text-ink-600">
+        <p className="flex justify-between">
+          <span>Total checks</span>
+          <span className="font-semibold text-ink-800">{reportModal.summary.totalCount}</span>
+        </p>
+        <p className="flex justify-between">
+          <span>Stale checks</span>
+          <span className="font-semibold text-red-600">
+            {reportModal.summary.staleCount} · {formatCurrency(reportModal.summary.staleAmount)}
+          </span>
+        </p>
+        {reportModal.summary.warningCount > 0 && (
+          <p className="flex justify-between">
+            <span>Nearing-stale checks</span>
+            <span className="font-semibold text-amber-600">
+              {reportModal.summary.warningCount} · {formatCurrency(reportModal.summary.warningAmount)}
+            </span>
+          </p>
+        )}
+        <p className="flex justify-between border-t border-ink-200 pt-1.5">
+          <span className="font-medium text-ink-700">Total amount</span>
+          <span className="font-semibold text-ink-900">{formatCurrency(reportModal.summary.totalAmount)}</span>
+        </p>
+        {reportModal.summary.oldestCheckDate && (
+          <p className="flex justify-between">
+            <span>Check date range</span>
+            <span className="font-semibold text-ink-800">
+              {reportModal.summary.oldestCheckDate === reportModal.summary.newestCheckDate
+                ? formatDate(reportModal.summary.oldestCheckDate)
+                : `${formatDate(reportModal.summary.oldestCheckDate)} – ${formatDate(reportModal.summary.newestCheckDate)}`}
+            </span>
+          </p>
+        )}
+      </div>
+
+      {/* 2307 mix — worth surfacing before locking, since it's often the
+          detail a submitter gets asked about during approval */}
+      <div className="flex flex-wrap items-center gap-2 rounded-lg border border-ink-100 bg-white p-3 text-[11px]">
+        <span className="shrink-0 font-medium text-ink-500">Form 2307 status:</span>
+        <Attachment2307SummaryBadge state="yes" count={reportModal.summary.attached2307Count} />
+        <Attachment2307SummaryBadge state="no" count={reportModal.summary.notAttached2307Count} />
+        <Attachment2307SummaryBadge state="unset" count={reportModal.summary.unset2307Count} />
+      </div>
+
+      {/* Line-item checklist — the actual checks about to be locked in,
+          so a verifier can catch a mistaken selection before generating
+          rather than after. */}
+      <div>
+        <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-ink-400">
+          Checks included ({reportModal.pendingRows.length})
+        </p>
+        <div className="max-h-40 overflow-y-auto rounded-lg border border-ink-100">
+          <table className="w-full text-left text-[11px]">
+            <thead className="sticky top-0 bg-ink-50">
+              <tr className="text-[9px] uppercase tracking-wide text-ink-300">
+                <th className="py-1 pl-3 pr-2 font-medium">Payee</th>
+                <th className="py-1 pr-2 font-medium">Check date</th>
+                <th className="py-1 pr-3 text-right font-medium">Amount</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-ink-50">
+              {reportModal.pendingRows.map((row) => (
+                <tr key={row.id}>
+                  <td className="py-1 pl-3 pr-2 text-ink-700">{row.payee || '—'}</td>
+                  <td className="py-1 pr-2 text-ink-500">{row.check_date ? formatDate(row.check_date) : '—'}</td>
+                  <td className="py-1 pr-3 text-right font-mono text-ink-800">{formatCurrency(row.amount)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div className="flex shrink-0 justify-end gap-2 border-t border-dashed border-ink-100 px-6 py-4">
+      <button
+        onClick={cancelConfirm}
+        disabled={generating}
+        className="rounded-md border border-ink-200 px-4 py-2 text-sm font-medium text-ink-600 hover:bg-ink-50 disabled:opacity-40"
+      >
+        Cancel Report
+      </button>
+      <button
+        onClick={handleConfirmGenerate}
+        disabled={generating || reportModal.pendingRows.length === 0}
+        className="flex items-center gap-2 rounded-md bg-ledger-stamp px-4 py-2 text-sm font-semibold text-white shadow-sm hover:opacity-90 disabled:opacity-60"
+      >
+        {generating && <Loader2 className="h-4 w-4 animate-spin" />}
+        {generating ? 'Generating Report…' : 'Generate & Lock Report'}
+      </button>
+    </div>
+  </>
+)}
 
             {/* Face 2: rendered preview + the actual submission action */}
-            {reportModal.step === 'preview' && (
-              <>
-                <div className="flex items-center justify-end gap-2 border-b border-dashed border-ink-100 px-5 py-2.5">
-                  <Button size="sm" variant="outline" onClick={handleDownloadExcelFromPreview}>
-                    <FileSpreadsheet className="mr-1.5 h-3.5 w-3.5" /> Excel
-                  </Button>
-                  <Button size="sm" variant="outline" onClick={handleDownloadPdfFromPreview}>
-                    <Download className="mr-1.5 h-3.5 w-3.5" /> PDF
-                  </Button>
-                </div>
-                <iframe title="Transmittal report preview" src={reportModal.pdfUrl} className="min-h-[50vh] flex-1" />
-                <div className="flex shrink-0 flex-col gap-3 border-t border-dashed border-ink-100 bg-ink-50/40 px-6 py-4 sm:flex-row sm:items-center sm:justify-between">
-                  <p className="flex items-center gap-1.5 text-xs text-ink-400">
-                    <Info className="h-3.5 w-3.5 shrink-0" />
-                    Not ready yet? You can close this and submit later — the report stays locked to this selection.
-                  </p>
-                  <div className="flex shrink-0 items-center gap-2">
-                    <button
-                      onClick={closePreview}
-                      disabled={submitting}
-                      className="rounded-md border border-ink-200 px-4 py-2 text-sm font-medium text-ink-600 hover:bg-ink-50 disabled:opacity-40"
-                    >
-                      Close — submit later
-                    </button>
-                    <button
-                      onClick={handleSubmit}
-                      disabled={!reportLockValid || submitting}
-                      className="flex items-center gap-2 rounded-md bg-ledger-stamp px-5 py-2 text-sm font-semibold text-white shadow-sm hover:opacity-90 disabled:opacity-60"
-                    >
-                      {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-                      {submitting ? 'Submitting…' : 'Submit for approval'}
-                    </button>
-                  </div>
-                </div>
-              </>
-            )}
+           {reportModal.step === 'preview' && (
+  <>
+    <div className="flex items-center justify-end gap-2 border-b border-dashed border-ink-100 px-5 py-2.5">
+      <Button size="sm" variant="outline" onClick={handleDownloadExcelFromPreview}>
+        <FileSpreadsheet className="mr-1.5 h-3.5 w-3.5" /> Download Excel
+      </Button>
+      <Button size="sm" variant="outline" onClick={handleDownloadPdfFromPreview}>
+        <Download className="mr-1.5 h-3.5 w-3.5" /> Download PDF
+      </Button>
+    </div>
+    <iframe title="Transmittal report preview" src={reportModal.pdfUrl} className="min-h-[50vh] flex-1" />
+    <div className="flex shrink-0 flex-col gap-3 border-t border-dashed border-ink-100 bg-ink-50/40 px-6 py-4 sm:flex-row sm:items-center sm:justify-between">
+      <p className="flex items-center gap-1.5 text-xs text-ink-400">
+        <Info className="h-3.5 w-3.5 shrink-0" />
+        Not ready yet? Save this and submit later — the report stays locked to this exact selection.
+      </p>
+      <div className="flex shrink-0 items-center gap-2">
+        <button
+          onClick={closePreview}
+          disabled={submitting}
+          className="rounded-md border border-ink-200 px-4 py-2 text-sm font-medium text-ink-600 hover:bg-ink-50 disabled:opacity-40"
+        >
+          Save for Later
+        </button>
+        <button
+          onClick={handleSubmit}
+          disabled={!reportLockValid || submitting}
+          className="flex items-center gap-2 rounded-md bg-ledger-stamp px-5 py-2 text-sm font-semibold text-white shadow-sm hover:opacity-90 disabled:opacity-60"
+        >
+          {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+          {submitting ? 'Submitting Report…' : 'Submit for Approval'}
+        </button>
+      </div>
+    </div>
+  </>
+)}
           </div>
         </div>
       )}

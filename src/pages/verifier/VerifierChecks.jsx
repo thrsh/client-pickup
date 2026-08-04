@@ -37,6 +37,7 @@ import {
   ReceiptText,
   ListChecks,
   CalendarClock,
+  CreditCard,
 } from 'lucide-react'
 import { useProfile } from '../../context/ProfileContext'
 import { supabase } from '../../lib/supabaseClient'
@@ -65,9 +66,21 @@ const SORTABLE_COLUMNS = ['payee', 'check_date', 'amount', 'uploaded_at', 'bank'
 const DEBOUNCE_MS = 300
 const RECEIPT_TYPES = ['PR', 'AR', 'OR']
 
+const COLLECTOR_ID_TYPES = [
+  { value: 'national_id', label: 'National ID' },
+  { value: 'postal_id', label: 'Postal ID' },
+  { value: 'passport', label: 'Passport' },
+  { value: 'drivers_license', label: "Driver's License" },
+  { value: 'other', label: 'Others' },
+]
+const COLLECTOR_ID_TYPE_LABELS = Object.fromEntries(COLLECTOR_ID_TYPES.map((t) => [t.value, t.label]))
+const COLLECTOR_ID_NUMBER_MAX_LENGTH = 24
+const COLLECTOR_ID_OTHER_LABEL_MAX_LENGTH = 40
+const RECEIPT_NUMBER_MAX_LENGTH = 40
+
 const STATUS_CONFIG = Object.freeze({
   available: { value: 'available', label: 'Available', icon: Wallet, secondary: 'Ready for pickup', accent: 'teal', summaryClass: 'text-ledger-stamp' },
-  reserved: { value: 'reserved', label: 'Reserved', icon: Clock, secondary: 'Held by a collector', accent: 'sky', summaryClass: 'text-sky-600' },
+  reserved: { value: 'reserved', label: 'Reserved', icon: Clock, secondary: 'Held by a collector', accent: 'teal', summaryClass: 'text-teal-600' },
   pending_approval: { value: 'pending_approval', label: 'Pending approval', icon: Hourglass, secondary: 'Awaiting approver review', accent: 'orange', summaryClass: 'text-amber-600' },
   returned: { value: 'returned', label: 'Returned', icon: RotateCcw, secondary: 'Sent back for correction', accent: 'amber', summaryClass: 'text-orange-600' },
   picked_up: { value: 'picked_up', label: 'Picked up', icon: CircleCheckBig, secondary: 'Completed pickups', accent: 'teal', summaryClass: '' },
@@ -83,6 +96,25 @@ function composeReceiptNo(entry) {
   const no = entry?.receiptNo?.trim() || ''
   if (!type || !no) return ''
   return `${type}-${no}`
+}
+
+function isCollectorIdComplete(idInfo) {
+  if (!idInfo) return false
+  const type = idInfo.idType
+  if (!type) return false
+  if (type === 'other' && !idInfo.idTypeOther?.trim()) return false
+  const number = idInfo.idNumber?.trim() || ''
+  if (!number || number.length > COLLECTOR_ID_NUMBER_MAX_LENGTH) return false
+  return true
+}
+
+function formatCollectorId(row) {
+  if (!row?.collector_id_type) return null
+  const label =
+    row.collector_id_type === 'other'
+      ? row.collector_id_type_other || 'Other ID'
+      : COLLECTOR_ID_TYPE_LABELS[row.collector_id_type] || row.collector_id_type
+  return row.collector_id_number ? `${label} · ${row.collector_id_number}` : label
 }
 
 function formatDateTime(ts) {
@@ -292,7 +324,7 @@ export default function VerifierChecks() {
   useEffect(() => {
     loadStaleKpis()
   }, [loadStaleKpis])
-    const [pendingDecisionCount, setPendingDecisionCount] = useState(null)
+  const [pendingDecisionCount, setPendingDecisionCount] = useState(null)
 
   const loadPendingDecisionCount = useCallback(async () => {
     if (!hasUsableScope) {
@@ -393,7 +425,7 @@ export default function VerifierChecks() {
         let req = supabase
           .from('checks')
           .select(
-            `id, row_number, bank, pickup_branch, payee, payor, check_no, check_date, amount, status, picked_up_by, picked_up_at, or_no, ar_collected, attached_2307, remarks, collector_name, submitted_by_name, submitted_at, return_reason, returned_at, returned_by_name, ${uploadBatchesSelect}`,
+            `id, row_number, bank, pickup_branch, payee, payor, check_no, check_date, amount, status, picked_up_by, picked_up_at, or_no, remarks, collector_name, submitted_by_name, submitted_at, return_reason, returned_at, returned_by_name, ${uploadBatchesSelect}`,
             { count: 'exact' },
           )
           .range(pageIndex * pageSize, pageIndex * pageSize + pageSize - 1)
@@ -525,12 +557,17 @@ export default function VerifierChecks() {
     setSubmitError('')
   }
 
-  async function confirmSubmitForApproval(collectorName, entries) {
+  async function confirmSubmitForApproval(collectorName, entries, collectorId) {
     if (!submitTargets || submitSubmitting) return
 
     const trimmedName = normalizeCollectorName(collectorName)
     if (!trimmedName) {
       setSubmitError("Enter the collector's full name.")
+      return
+    }
+
+    if (!isCollectorIdComplete(collectorId)) {
+      setSubmitError("Select a valid ID type and enter the ID number before submitting.")
       return
     }
 
@@ -544,16 +581,8 @@ export default function VerifierChecks() {
     for (const r of included) {
       const entry = entries[r.id]
       const orNo = composeReceiptNo(entry)
-      if (
-        !orNo ||
-        entry.collected === null || entry.collected === undefined ||
-        entry.attached2307 === null || entry.attached2307 === undefined
-      ) {
-        setSubmitError('Select a receipt type, enter its number, and set AR-collected and 2307 Attached status for every check being submitted.')
-        return
-      }
-      if (entry.collected === false && !entry.remarks?.trim()) {
-        setSubmitError('Enter a reason for every check where AR was not collected.')
+      if (!orNo) {
+        setSubmitError('Enter a receipt type and number for every check being submitted.')
         return
       }
       const key = orNo.toLowerCase()
@@ -579,9 +608,6 @@ export default function VerifierChecks() {
         return {
           check_id: r.id,
           or_no: composeReceiptNo(entry),
-          ar_collected: entry.collected,
-          attached_2307: entry.attached2307,
-          remarks: entry.collected === false ? entry.remarks.trim() : null,
         }
       })
 
@@ -589,6 +615,9 @@ export default function VerifierChecks() {
         p_collector_name: trimmedName,
         p_admin_name: trimmedAdminName,
         p_check_outcomes,
+        p_collector_id_type: collectorId.idType,
+        p_collector_id_type_other: collectorId.idType === 'other' ? collectorId.idTypeOther.trim() : null,
+        p_collector_id_number: collectorId.idNumber.trim(),
       })
 
       if (!isMountedRef.current) return
@@ -630,8 +659,6 @@ export default function VerifierChecks() {
           .update({
             status: 'available',
             or_no: null,
-            ar_collected: null,
-            attached_2307: null,
             remarks: null,
             collector_name: null,
             submitted_by_name: null,
@@ -706,10 +733,10 @@ export default function VerifierChecks() {
 
   if (!hasUsableScope) {
     return (
-      <div className="flex flex-col items-center justify-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-6 py-16 text-center">
-        <AlertTriangle className="h-8 w-8 text-amber-500" />
-        <p className="text-sm font-semibold text-amber-800">No branch assigned to your account</p>
-        <p className="max-w-sm text-xs text-amber-700">
+      <div className="flex flex-col items-center justify-center gap-2 rounded-lg border border-orange-200 bg-orange-50 px-6 py-16 text-center">
+        <AlertTriangle className="h-8 w-8 text-orange-500" />
+        <p className="text-sm font-semibold text-orange-800">No branch assigned to your account</p>
+        <p className="max-w-sm text-xs text-orange-700">
           Ask an admin to set a branch on your profile before you can view the checks register.
         </p>
       </div>
@@ -761,7 +788,7 @@ export default function VerifierChecks() {
           <KpiCard icon={CalendarClock} label="Nearing stale (≤7d)" value={staleKpis.warning} secondary="Tap to review" accent="amber" />
         </button>
         <button onClick={() => setActiveTab('stale')} className="text-left">
-          <KpiCard icon={AlertTriangle} label="Already stale" value={staleKpis.stale} secondary="Tap to review" accent="red" />
+          <KpiCard icon={AlertTriangle} label="Already stale" value={staleKpis.stale} secondary="Tap to review" accent="orangeStrong" />
         </button>
       </div>
 
@@ -972,12 +999,12 @@ export default function VerifierChecks() {
           </div>
 
           {loadError && (
-            <div className="mb-4 flex items-center justify-between gap-3 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+            <div className="mb-4 flex items-center justify-between gap-3 rounded-md border border-orange-200 bg-orange-50 px-4 py-3 text-sm text-orange-700">
               <span className="flex items-center gap-2">
                 <AlertTriangle className="h-4 w-4 shrink-0" />
                 {loadError}
               </span>
-              <button onClick={() => load(page)} className="rounded-md border border-red-300 px-3 py-1 text-xs font-medium text-red-700 hover:bg-red-100">
+              <button onClick={() => load(page)} className="rounded-md border border-orange-300 px-3 py-1 text-xs font-medium text-orange-700 hover:bg-orange-100">
                 Retry
               </button>
             </div>
@@ -1086,7 +1113,7 @@ export default function VerifierChecks() {
 function BranchScopeBadge({ isAllBranches, branch }) {
   if (isAllBranches) {
     return (
-      <span className="inline-flex items-center gap-1 rounded-full bg-indigo-50 px-2.5 py-0.5 text-[10px] font-semibold text-indigo-700">
+      <span className="inline-flex items-center gap-1 rounded-full bg-teal-50 px-2.5 py-0.5 text-[10px] font-semibold text-teal-700">
         <Building2 className="h-3 w-3" /> All branches
       </span>
     )
@@ -1123,10 +1150,9 @@ const KpiCard = React.memo(function KpiCard({ icon: Icon, label, value, secondar
   const accents = {
     teal: { badge: 'bg-ledger-stamp/10 text-ledger-stampDark', ring: 'border-ledger-stamp/30' },
     lightTeal: { badge: 'bg-teal-50 text-teal-600', ring: 'border-teal-200' },
-    sky: { badge: 'bg-sky-50 text-sky-600', ring: 'border-sky-200' },
     orange: { badge: 'bg-ledger-amber/10 text-ledger-amber', ring: 'border-ledger-amber/30' },
     amber: { badge: 'bg-amber-100 text-amber-700', ring: 'border-amber-200' },
-    red: { badge: 'bg-red-100 text-red-700', ring: 'border-red-200' },
+    orangeStrong: { badge: 'bg-orange-100 text-orange-800', ring: 'border-orange-300' },
     ink: { badge: 'bg-ink-50 text-ink-700', ring: 'border-ink-100' },
   }
   const style = accents[accent] || accents.teal
@@ -1212,7 +1238,7 @@ function CopyableCheckNo({ value }) {
 function ReservedBadge({ row }) {
   return (
     <span className="inline-flex flex-col items-start gap-0.5" title={`Reserved by ${row.collector_name || 'an unknown collector'} — not yet submitted for approval`}>
-      <span className="inline-flex items-center gap-1 rounded-full bg-sky-50 px-2 py-0.5 text-[9px] font-medium text-sky-700">
+      <span className="inline-flex items-center gap-1 rounded-full bg-teal-50 px-2 py-0.5 text-[9px] font-medium text-teal-700">
         <Clock className="h-3 w-3" />
         Reserved
       </span>
@@ -1241,11 +1267,10 @@ function ReturnedBadge({ row }) {
 }
 
 function PendingApprovalBadge({ row }) {
-  const hasCollected = row.ar_collected !== null && row.ar_collected !== undefined
-  const hasAttached = row.attached_2307 !== null && row.attached_2307 !== undefined
-
+  const idLabel = formatCollectorId(row)
   const title = [
     row.collector_name ? `Collector: ${row.collector_name}` : null,
+    idLabel ? `ID: ${idLabel}` : null,
     row.submitted_by_name ? `Submitted by ${row.submitted_by_name}` : null,
     'Awaiting approver review',
   ].filter(Boolean).join(' — ')
@@ -1259,22 +1284,13 @@ function PendingApprovalBadge({ row }) {
       {row.collector_name && <span className="text-[9px] text-ink-400">for {row.collector_name}</span>}
       <span className="mt-0.5 flex flex-wrap items-center gap-1">
         {row.or_no && <span className="rounded bg-ink-100 px-1.5 py-0.5 font-mono text-[9px] text-ink-600">Receipt {row.or_no}</span>}
-        {hasCollected && (
-          <span className={cn('rounded px-1.5 py-0.5 text-[9px] font-medium', row.ar_collected ? 'bg-teal-100 text-teal-700' : 'bg-orange-100 text-orange-700')}>
-            AR {row.ar_collected ? 'collected' : 'not collected'}
-          </span>
-        )}
-        {hasAttached && (
-          <span className={cn('rounded px-1.5 py-0.5 text-[9px] font-medium', row.attached_2307 ? 'bg-teal-100 text-teal-700' : 'bg-orange-100 text-orange-700')}>
-            2307 {row.attached_2307 ? 'Attached' : 'Not attached'}
+        {idLabel && (
+          <span className="flex items-center gap-1 rounded bg-teal-50 px-1.5 py-0.5 text-[9px] font-medium text-teal-700" title={idLabel}>
+            <CreditCard className="h-2.5 w-2.5" />
+            {idLabel}
           </span>
         )}
       </span>
-      {row.ar_collected === false && row.remarks && (
-        <span className="max-w-[170px] truncate text-[9px] text-ink-400" title={row.remarks}>
-          {row.remarks}
-        </span>
-      )}
     </span>
   )
 }
@@ -1301,7 +1317,7 @@ const CheckRow = React.memo(function CheckRow({ row, cellPad, selected, onToggle
         <EntityBadge icon={Landmark} value={row.bank} colorClass="bg-teal-50 text-teal-700" emptyLabel="Unknown" />
       </td>
       <td className={cn(cellPad, 'max-w-[150px]')}>
-        <EntityBadge icon={Building2} value={row.pickup_branch} colorClass="bg-indigo-50 text-indigo-700" emptyLabel="No branch" />
+        <EntityBadge icon={Building2} value={row.pickup_branch} colorClass="bg-orange-50 text-orange-700" emptyLabel="No branch" />
       </td>
       <td className={cn(cellPad, 'max-w-[180px] truncate font-medium text-ink-800')} title={row.payee || undefined}>
         {row.payee || '—'}
@@ -1310,7 +1326,7 @@ const CheckRow = React.memo(function CheckRow({ row, cellPad, selected, onToggle
       <td className={cn(cellPad, 'font-mono text-ink-600')}>
         <CopyableCheckNo value={row.check_no} />
       </td>
-      <td className={cn(cellPad, 'text-ink-600', bucket === STALE_BUCKETS.STALE && 'bg-red-50 font-medium text-red-700', bucket === STALE_BUCKETS.WARNING && 'bg-amber-50 font-medium text-amber-700')}>
+      <td className={cn(cellPad, 'text-ink-600', bucket === STALE_BUCKETS.STALE && 'bg-orange-50 font-medium text-orange-700', bucket === STALE_BUCKETS.WARNING && 'bg-amber-50 font-medium text-amber-700')}>
         {row.check_date ? formatDate(row.check_date) : '—'}
       </td>
       <td className={cn(cellPad, 'font-mono text-ink-800')}>{formatCurrency(row.amount)}</td>
@@ -1353,7 +1369,7 @@ const CheckRow = React.memo(function CheckRow({ row, cellPad, selected, onToggle
 function buildInitialSubmitEntries(rowsList) {
   const initial = {}
   rowsList.forEach((r) => {
-    initial[r.id] = { include: true, receiptType: '', receiptNo: '', collected: null, attached2307: null, remarks: '' }
+    initial[r.id] = { include: true, receiptType: '', receiptNo: '' }
   })
   return initial
 }
@@ -1361,6 +1377,7 @@ function buildInitialSubmitEntries(rowsList) {
 function SubmitApprovalModal({ rows, collectorOptions, onCancel, onConfirm, submitting, error }) {
   const [collectorName, setCollectorName] = useState('')
   const [entries, setEntries] = useState(() => buildInitialSubmitEntries(rows))
+  const [collectorId, setCollectorId] = useState({ idType: '', idTypeOther: '', idNumber: '' })
   const dialogRef = useRef(null)
   const cancelButtonRef = useRef(null)
 
@@ -1407,9 +1424,6 @@ function SubmitApprovalModal({ rows, collectorOptions, onCancel, onConfirm, subm
         include: value,
         receiptType: value ? prev[id]?.receiptType || '' : '',
         receiptNo: value ? prev[id]?.receiptNo || '' : '',
-        collected: value ? prev[id]?.collected ?? null : null,
-        attached2307: value ? prev[id]?.attached2307 ?? null : null,
-        remarks: value ? prev[id]?.remarks || '' : '',
       },
     }))
   }, [])
@@ -1422,16 +1436,16 @@ function SubmitApprovalModal({ rows, collectorOptions, onCancel, onConfirm, subm
     setEntries((prev) => ({ ...prev, [id]: { ...prev[id], receiptNo: value } }))
   }, [])
 
-  const updateCollected = useCallback((id, value) => {
-    setEntries((prev) => ({ ...prev, [id]: { ...prev[id], collected: value, remarks: value === true ? '' : prev[id]?.remarks || '' } }))
+  const updateIdType = useCallback((value) => {
+    setCollectorId((prev) => ({ ...prev, idType: value, idTypeOther: value === 'other' ? prev.idTypeOther : '' }))
   }, [])
 
-  const updateAttached2307 = useCallback((id, value) => {
-    setEntries((prev) => ({ ...prev, [id]: { ...prev[id], attached2307: value } }))
+  const updateIdTypeOther = useCallback((value) => {
+    setCollectorId((prev) => ({ ...prev, idTypeOther: value.slice(0, COLLECTOR_ID_OTHER_LABEL_MAX_LENGTH) }))
   }, [])
 
-  const updateRemarks = useCallback((id, value) => {
-    setEntries((prev) => ({ ...prev, [id]: { ...prev[id], remarks: value } }))
+  const updateIdNumber = useCallback((value) => {
+    setCollectorId((prev) => ({ ...prev, idNumber: value.slice(0, COLLECTOR_ID_NUMBER_MAX_LENGTH) }))
   }, [])
 
   const trimmedName = collectorName.trim()
@@ -1446,10 +1460,7 @@ function SubmitApprovalModal({ rows, collectorOptions, onCancel, onConfirm, subm
       if (!entry?.include) return
       included += 1
       const receiptNo = composeReceiptNo(entry)
-      const reasonOk = entry.collected !== false || !!entry.remarks?.trim()
-      const hasCollected = entry.collected !== null && entry.collected !== undefined
-      const hasAttached = entry.attached2307 !== null && entry.attached2307 !== undefined
-      if (receiptNo && hasCollected && hasAttached && reasonOk) completed += 1
+      if (receiptNo) completed += 1
       if (receiptNo) {
         const key = receiptNo.toLowerCase()
         seenCounts[key] = (seenCounts[key] || 0) + 1
@@ -1460,8 +1471,9 @@ function SubmitApprovalModal({ rows, collectorOptions, onCancel, onConfirm, subm
   }, [entries, rows])
 
   const hasDuplicates = duplicateOrNos.size > 0
+  const collectorIdComplete = isCollectorIdComplete(collectorId)
   const allComplete = includeCount > 0 && completedCount === includeCount && !hasDuplicates
-  const canSubmit = nameEntered && allComplete && !submitting
+  const canSubmit = nameEntered && allComplete && collectorIdComplete && !submitting
   const totalAmount = useMemo(
     () => rows.reduce((sum, r) => (entries[r.id]?.include ? sum + (Number(r.amount) || 0) : sum), 0),
     [rows, entries],
@@ -1469,12 +1481,12 @@ function SubmitApprovalModal({ rows, collectorOptions, onCancel, onConfirm, subm
 
   function handleConfirm() {
     if (!canSubmit) return
-    onConfirm(collectorName, entries)
+    onConfirm(collectorName, entries, collectorId)
   }
 
   return (
     <div className="fixed inset-0 z-40 flex items-center justify-center bg-ink-900/50 p-4 sm:p-6" onMouseDown={(e) => { if (e.target === e.currentTarget && !submitting) onCancel() }}>
-      <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="submit-approval-title" className="relative flex max-h-[65vh] w-full max-w-6xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl">
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="submit-approval-title" className="relative flex max-h-[85vh] w-full max-w-6xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl">
         <div className="flex shrink-0 items-start justify-between gap-4 border-b border-ink-100 px-7 py-5">
           <div className="flex items-start gap-3">
             <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-ledger-stamp/10 text-ledger-stamp">
@@ -1508,6 +1520,62 @@ function SubmitApprovalModal({ rows, collectorOptions, onCancel, onConfirm, subm
             </div>
           </div>
 
+          <div className="mt-5 rounded-xl border border-ink-100 bg-white p-5 shadow-sm">
+            <div className="mb-3 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-ink-500">
+              <CreditCard className="h-3.5 w-3.5" />
+              Collector ID verification <span className="normal-case text-orange-500">(required)</span>
+            </div>
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+              <div>
+                <label className="mb-1.5 block text-[10px] font-semibold uppercase tracking-wide text-ink-400">Valid ID</label>
+                <select
+                  value={collectorId.idType}
+                  onChange={(e) => updateIdType(e.target.value)}
+                  aria-label="Collector valid ID type"
+                  className="w-full rounded-md border border-ink-200 px-2.5 py-2 text-xs text-ink-800 focus:outline-none focus:ring-2 focus:ring-ledger-stamp/40"
+                >
+                  <option value="">Select ID type</option>
+                  {COLLECTOR_ID_TYPES.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
+                </select>
+              </div>
+
+              {collectorId.idType === 'other' && (
+                <div>
+                  <label className="mb-1.5 block text-[10px] font-semibold uppercase tracking-wide text-ink-400">Specify ID type</label>
+                  <input
+                    type="text"
+                    value={collectorId.idTypeOther}
+                    onChange={(e) => updateIdTypeOther(e.target.value)}
+                    placeholder="e.g. Company ID"
+                    maxLength={COLLECTOR_ID_OTHER_LABEL_MAX_LENGTH}
+                    aria-label="Specify collector ID type"
+                    className="w-full rounded-md border border-ink-200 px-2.5 py-2 text-xs text-ink-800 focus:outline-none focus:ring-2 focus:ring-ledger-stamp/40"
+                  />
+                </div>
+              )}
+
+              <div>
+                <label className="mb-1.5 block text-[10px] font-semibold uppercase tracking-wide text-ink-400">ID Number</label>
+                <input
+                  type="text"
+                  value={collectorId.idNumber}
+                  onChange={(e) => updateIdNumber(e.target.value)}
+                  onBlur={(e) => updateIdNumber(e.target.value.trim())}
+                  placeholder="ID number"
+                  maxLength={COLLECTOR_ID_NUMBER_MAX_LENGTH}
+                  aria-label="Collector ID number"
+                  className="w-full rounded-md border border-ink-200 px-2.5 py-2 text-xs text-ink-800 focus:outline-none focus:ring-2 focus:ring-ledger-stamp/40"
+                />
+              </div>
+            </div>
+            {!collectorIdComplete && (
+              <p className="mt-2.5 flex items-center gap-1.5 text-[11px] text-orange-700">
+                <AlertTriangle className="h-3 w-3 shrink-0" />
+                Select the collector's valid ID type and enter the ID number before submitting.
+              </p>
+            )}
+          </div>
+
           {nameEntered && (
             <div className="mt-5">
               <div className="mb-3 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-ink-500">
@@ -1517,12 +1585,10 @@ function SubmitApprovalModal({ rows, collectorOptions, onCancel, onConfirm, subm
 
               <div className="flex flex-col gap-3">
                 {rows.map((r, idx) => {
-                  const entry = entries[r.id] || { include: true, receiptType: '', receiptNo: '', collected: null, attached2307: null, remarks: '' }
+                  const entry = entries[r.id] || { include: true, receiptType: '', receiptNo: '' }
                   const composedReceipt = composeReceiptNo(entry)
                   const isDuplicate = entry.include && composedReceipt && duplicateOrNos.has(composedReceipt.toLowerCase())
-                  const needsReason = entry.include && entry.collected === false
-                  const missingReason = needsReason && !entry.remarks?.trim()
-                  const rowIncomplete = entry.include && (!composedReceipt || entry.collected === null || entry.collected === undefined || entry.attached2307 === null || entry.attached2307 === undefined || missingReason)
+                  const rowIncomplete = entry.include && !composedReceipt
                   const rowComplete = entry.include && !rowIncomplete && !isDuplicate
 
                   return (
@@ -1531,7 +1597,7 @@ function SubmitApprovalModal({ rows, collectorOptions, onCancel, onConfirm, subm
                       className={cn(
                         'rounded-xl border bg-white shadow-sm transition-colors',
                         !entry.include && 'border-ink-100 opacity-60',
-                        entry.include && isDuplicate && 'border-red-300 ring-1 ring-red-100',
+                        entry.include && isDuplicate && 'border-orange-300 ring-1 ring-orange-100',
                         entry.include && !isDuplicate && rowIncomplete && 'border-amber-200',
                         rowComplete && 'border-ledger-stamp/40',
                       )}
@@ -1560,7 +1626,7 @@ function SubmitApprovalModal({ rows, collectorOptions, onCancel, onConfirm, subm
                         <div className="flex items-center gap-3">
                           <span className="font-mono text-sm font-semibold text-ink-800">{formatCurrency(r.amount)}</span>
                           {entry.include && (
-                            <span className={cn('inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium', isDuplicate ? 'bg-red-100 text-red-700' : rowComplete ? 'bg-ledger-stamp/10 text-ledger-stamp' : 'bg-amber-100 text-amber-700')}>
+                            <span className={cn('inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium', isDuplicate ? 'bg-orange-100 text-orange-700' : rowComplete ? 'bg-ledger-stamp/10 text-ledger-stamp' : 'bg-amber-100 text-amber-700')}>
                               {isDuplicate ? (<><AlertTriangle className="h-3 w-3" /> Duplicate receipt</>) : rowComplete ? (<><Check className="h-3 w-3" /> Complete</>) : (<><AlertTriangle className="h-3 w-3" /> Incomplete</>)}
                             </span>
                           )}
@@ -1568,72 +1634,35 @@ function SubmitApprovalModal({ rows, collectorOptions, onCancel, onConfirm, subm
                       </div>
 
                       {entry.include && (
-                        <div className="grid grid-cols-1 gap-4 px-4 py-4 sm:grid-cols-2 lg:grid-cols-4">
-                          <div>
-                            <label className="mb-1.5 flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-ink-400">
-                              <ReceiptText className="h-3 w-3" />
-                              Receipt
-                            </label>
-                            <div className="flex gap-1.5">
-                              <select
-                                value={entry.receiptType}
-                                onChange={(e) => updateReceiptType(r.id, e.target.value)}
-                                aria-label={`Receipt type for check ${r.check_no || idx + 1}`}
-                                className="w-20 rounded-md border border-ink-200 px-2 py-2 text-xs text-ink-800 focus:outline-none focus:ring-2 focus:ring-ledger-stamp/40"
-                              >
-                                <option value="">Type</option>
-                                {RECEIPT_TYPES.map((rt) => <option key={rt} value={rt}>{rt}</option>)}
-                              </select>
-                              <input
-                                type="text"
-                                inputMode="numeric"
-                                value={entry.receiptNo}
-                                onChange={(e) => updateReceiptNo(r.id, e.target.value)}
-                                onBlur={(e) => updateReceiptNo(r.id, e.target.value.trim())}
-                                placeholder="Number"
-                                maxLength={40}
-                                disabled={!entry.receiptType}
-                                aria-label={`Receipt number for check ${r.check_no || idx + 1}`}
-                                className={cn('min-w-0 flex-1 rounded-md border px-2 py-2 text-xs text-ink-800 focus:outline-none focus:ring-2 focus:ring-ledger-stamp/40 disabled:bg-ink-50 disabled:text-ink-300', isDuplicate ? 'border-red-400' : 'border-ink-200')}
-                              />
-                            </div>
-                            {isDuplicate && <p className="mt-1 text-[10px] font-medium text-red-600">Already used above</p>}
+                        <div className="px-4 py-4">
+                          <label className="mb-1.5 flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-ink-400">
+                            <ReceiptText className="h-3 w-3" />
+                            Receipt
+                          </label>
+                          <div className="flex max-w-xs gap-1.5">
+                            <select
+                              value={entry.receiptType}
+                              onChange={(e) => updateReceiptType(r.id, e.target.value)}
+                              aria-label={`Receipt type for check ${r.check_no || idx + 1}`}
+                              className="w-20 rounded-md border border-ink-200 px-2 py-2 text-xs text-ink-800 focus:outline-none focus:ring-2 focus:ring-ledger-stamp/40"
+                            >
+                              <option value="">Type</option>
+                              {RECEIPT_TYPES.map((rt) => <option key={rt} value={rt}>{rt}</option>)}
+                            </select>
+                            <input
+                              type="text"
+                              inputMode="numeric"
+                              value={entry.receiptNo}
+                              onChange={(e) => updateReceiptNo(r.id, e.target.value)}
+                              onBlur={(e) => updateReceiptNo(r.id, e.target.value.trim())}
+                              placeholder="Number"
+                              maxLength={RECEIPT_NUMBER_MAX_LENGTH}
+                              disabled={!entry.receiptType}
+                              aria-label={`Receipt number for check ${r.check_no || idx + 1}`}
+                              className={cn('min-w-0 flex-1 rounded-md border px-2 py-2 text-xs text-ink-800 focus:outline-none focus:ring-2 focus:ring-ledger-stamp/40 disabled:bg-ink-50 disabled:text-ink-300', isDuplicate ? 'border-orange-400' : 'border-ink-200')}
+                            />
                           </div>
-
-                          <div>
-                            <label className="mb-1.5 block text-[10px] font-semibold uppercase tracking-wide text-ink-400">AR collected</label>
-                            <div className="flex gap-1.5" role="group" aria-label={`AR collected for check ${r.check_no || idx + 1}`}>
-                              <YesNoButton active={entry.collected === true} onClick={() => updateCollected(r.id, true)} label="Yes" tone="positive" />
-                              <YesNoButton active={entry.collected === false} onClick={() => updateCollected(r.id, false)} label="No" tone="neutral" />
-                            </div>
-                          </div>
-
-                          <div>
-                            <label className="mb-1.5 block text-[10px] font-semibold uppercase tracking-wide text-ink-400">2307 Attached</label>
-                            <div className="flex gap-1.5" role="group" aria-label={`2307 Attached for check ${r.check_no || idx + 1}`}>
-                              <YesNoButton active={entry.attached2307 === true} onClick={() => updateAttached2307(r.id, true)} label="Yes" tone="positive" />
-                              <YesNoButton active={entry.attached2307 === false} onClick={() => updateAttached2307(r.id, false)} label="No" tone="neutral" />
-                            </div>
-                          </div>
-
-                          <div>
-                            <label className="mb-1.5 block text-[10px] font-semibold uppercase tracking-wide text-ink-400">
-                              Remarks {needsReason && <span className="text-orange-500">(required)</span>}
-                            </label>
-                            {needsReason ? (
-                              <input
-                                type="text"
-                                value={entry.remarks}
-                                onChange={(e) => updateRemarks(r.id, e.target.value)}
-                                placeholder="Why wasn't AR collected?"
-                                maxLength={200}
-                                aria-label={`Remarks for check ${r.check_no || idx + 1}`}
-                                className={cn('w-full rounded-md border px-2 py-2 text-xs text-ink-800 focus:outline-none focus:ring-2 focus:ring-ledger-stamp/40', missingReason ? 'border-orange-400' : 'border-ink-200')}
-                              />
-                            ) : (
-                              <p className="flex h-[34px] items-center text-xs text-ink-300">Not needed</p>
-                            )}
-                          </div>
+                          {isDuplicate && <p className="mt-1 text-[10px] font-medium text-orange-600">Already used above</p>}
                         </div>
                       )}
                     </div>
@@ -1648,7 +1677,7 @@ function SubmitApprovalModal({ rows, collectorOptions, onCancel, onConfirm, subm
                     ? 'Include at least one check to submit.'
                     : hasDuplicates
                     ? 'Each check needs its own unique receipt type + number.'
-                    : "Every included check needs a receipt type & number, AR-collected status, and 2307 Attached status (plus a reason if AR wasn't collected)."}
+                    : 'Every included check needs a receipt type & number.'}
                 </p>
               )}
             </div>
@@ -1662,7 +1691,7 @@ function SubmitApprovalModal({ rows, collectorOptions, onCancel, onConfirm, subm
           )}
 
           {error && (
-            <p className="mt-4 flex items-center gap-1.5 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">
+            <p className="mt-4 flex items-center gap-1.5 rounded-lg bg-orange-50 px-3 py-2 text-sm text-orange-700">
               <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
               {error}
             </p>
@@ -1700,15 +1729,6 @@ function SummaryPill({ label, value, tone = 'neutral', mono = false }) {
       <p className={cn('text-sm font-semibold leading-tight', mono && 'font-mono')}>{value}</p>
       <p className="text-[9px] uppercase tracking-wide opacity-70">{label}</p>
     </div>
-  )
-}
-
-function YesNoButton({ active, onClick, label, tone }) {
-  const activeClass = tone === 'positive' ? 'border-ledger-stamp bg-ledger-stamp text-white' : 'border-ink-700 bg-ink-700 text-white'
-  return (
-    <button type="button" onClick={onClick} aria-pressed={active} className={cn('flex-1 rounded-md border px-2 py-2 text-xs font-medium transition', active ? activeClass : 'border-ink-200 text-ink-500 hover:bg-ink-50')}>
-      {label}
-    </button>
   )
 }
 

@@ -84,29 +84,84 @@ function normalizeCompanyName(raw) {
 
 // ---------------------------------------------------------------------------
 // Collector-name validation — used both live in the confirmation modal and
-// as the final guard right before the reservation RPC fires.
+// as the final guard right before the reservation RPC fires. This is the
+// value that gets written to the reservation record and read back by staff
+// at pickup, so it's treated as untrusted input end-to-end: sanitized
+// first, then validated against an explicit allow-list pattern. The server
+// (create_reservation RPC) must re-validate independently — client-side
+// checks are a UX convenience, never the actual security boundary.
 // ---------------------------------------------------------------------------
-const COLLECTOR_NAME_RE = /^[A-Za-zÀ-ÖØ-öø-ÿ.'\-\s]+$/
+// Letters (incl. accented Latin used in PH names), spaces, hyphens, and
+// apostrophes only. No digits, no punctuation runs, nothing else — this is
+// an allow-list, not a denylist, so it can't be bypassed by a character we
+// forgot to blacklist.
+const COLLECTOR_NAME_CHAR_RE = /^[A-Za-zÀ-ÖØ-öø-ÿ.'\-\s]+$/
+// Catches "John----Doe", "John''Doe", "John..Doe" etc. — a single punctuation
+// mark between name parts is legitimate (O'Brien, Dela-Cruz), a run of them
+// is not.
+const REPEATED_PUNCTUATION_RE = /[.'\-]{2,}/
+// A name shouldn't start or end on punctuation/whitespace once trimmed.
+const EDGE_PUNCTUATION_RE = /^[.'\-]|[.'\-]$/
+const COLLECTOR_NAME_MIN = 2
 const COLLECTOR_NAME_MAX = 60
+const COLLECTOR_NAME_MAX_WORDS = 6
 
 // IDs accepted for pickup verification — shown to the collector before they
 // confirm, and again as a reminder once the reservation is made.
 const ACCEPTED_IDS = ['Passport', 'PhilSys National ID', 'Postal ID', "Driver's License"]
 
+// Sanitizes free-text name input before it's ever validated, stored, or
+// sent to the server:
+//  - Unicode-normalizes (NFKC) so visually-identical characters (e.g. full-width
+//    letters, combining marks used to spoof filters) collapse to a canonical form.
+//  - Strips control characters, zero-width characters, and other invisible
+//    unicode (bidi override characters can be used to visually disguise a
+//    name — stripping them prevents that class of spoofing).
+//  - Collapses runs of whitespace and trims the ends.
+// This never throws on unexpected input — worst case it returns an empty
+// string, which validateCollectorName then rejects normally.
+function sanitizeCollectorName(raw) {
+  if (typeof raw !== 'string') return ''
+  let s = raw.normalize('NFKC')
+  // Control chars, zero-width space/joiner/non-joiner/BOM, and bidi control
+  // characters (LRM/RLM/LRE/RLE/PDF/LRO/RLO/LRI/RLI/FSI/PDI).
+  // eslint-disable-next-line no-control-regex
+  s = s.replace(/[\u0000-\u001F\u007F\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, '')
+  s = s.replace(/\s+/g, ' ').trim()
+  return s
+}
+
 function validateCollectorName(raw) {
-  const trimmed = (raw || '').trim()
-  if (!trimmed) return { valid: false, message: 'Enter the collector\u2019s full name.' }
-  if (trimmed.length < 2) return { valid: false, message: 'That name looks too short.' }
-  if (trimmed.length > COLLECTOR_NAME_MAX) {
-    return { valid: false, message: `Keep it under ${COLLECTOR_NAME_MAX} characters.` }
+  const sanitized = sanitizeCollectorName(raw)
+
+  if (!sanitized) return { valid: false, message: 'Enter the collector\u2019s full name.', sanitized }
+  if (sanitized.length < COLLECTOR_NAME_MIN) {
+    return { valid: false, message: 'That name looks too short.', sanitized }
   }
-  if (!COLLECTOR_NAME_RE.test(trimmed)) {
-    return { valid: false, message: 'Use letters, spaces, hyphens, or apostrophes only.' }
+  if (sanitized.length > COLLECTOR_NAME_MAX) {
+    return { valid: false, message: `Keep it under ${COLLECTOR_NAME_MAX} characters.`, sanitized }
   }
-  if (trimmed.split(/\s+/).filter(Boolean).length < 2) {
-    return { valid: false, message: 'Include both a first and last name.' }
+  if (!COLLECTOR_NAME_CHAR_RE.test(sanitized)) {
+    return { valid: false, message: 'Use letters, spaces, hyphens, or apostrophes only.', sanitized }
   }
-  return { valid: true, message: '' }
+  if (EDGE_PUNCTUATION_RE.test(sanitized)) {
+    return { valid: false, message: 'Name can\u2019t start or end with punctuation.', sanitized }
+  }
+  if (REPEATED_PUNCTUATION_RE.test(sanitized)) {
+    return { valid: false, message: 'Remove the repeated punctuation.', sanitized }
+  }
+  const words = sanitized.split(/\s+/).filter(Boolean)
+  if (words.length < 2) {
+    return { valid: false, message: 'Include both a first and last name.', sanitized }
+  }
+  if (words.length > COLLECTOR_NAME_MAX_WORDS) {
+    return { valid: false, message: 'That\u2019s a lot of names — check for extra spaces.', sanitized }
+  }
+  if (words.some((w) => w.replace(/[.'\-]/g, '').length === 0)) {
+    return { valid: false, message: 'Each name part needs at least one letter.', sanitized }
+  }
+
+  return { valid: true, message: '', sanitized }
 }
 
 // ---------------------------------------------------------------------------
@@ -148,6 +203,20 @@ const OFFICES = {
     lat: 14.5547443,
     lng: 121.0444729,
   },
+}
+
+// Light haptic feedback on supporting mobile browsers (Android Chrome;
+// iOS Safari does not expose the Vibration API, so this silently no-ops
+// there). Wrapped in a try/catch since some browsers throw when called
+// outside a user gesture rather than just returning false.
+function haptic(pattern) {
+  try {
+    if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
+      navigator.vibrate(pattern)
+    }
+  } catch {
+    // best-effort only
+  }
 }
 
 function getDirectionsUrl(office) {
@@ -514,6 +583,9 @@ setQueueInfo({ number: row.out_queue_number, date: row.out_queue_date, branch: b
   }
 }
   async function confirmPickup() {
+    // Belt-and-suspenders against a double-tap firing two reservations
+    // before the disabled state on the confirm button has re-rendered.
+    if (reserving) return
     const validation = validateCollectorName(collectorName)
     if (!validation.valid) {
       setReserveError(validation.message)
@@ -532,52 +604,93 @@ setQueueInfo({ number: row.out_queue_number, date: row.out_queue_date, branch: b
       return
     }
 
-    const cleanName = collectorName.trim().replace(/\s+/g, ' ')
+    // Use the exact sanitized string that was validated above — never the
+    // raw field value — so what's persisted server-side is guaranteed to be
+    // the value the allow-list regex actually approved.
+    const cleanName = validation.sanitized
+    const idempotencyKey =
+      typeof crypto !== 'undefined' && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+
     setReserving(true)
     setReserveError('')
 
     const { data, error } = await supabase.rpc('create_reservation', {
       p_check_ids: idsForSelectedBranch,
       p_collector_name: cleanName,
+      p_idempotency_key: idempotencyKey,
     })
 
     setReserving(false)
 
     if (error) {
-      setReserveError(error.message || 'Something went wrong. Please try again.')
+      // 'checks_unavailable' (or similar) is the code the RPC should raise
+      // when every requested row lost the race — see the SQL notes above
+      // create_reservation. Give that case its own copy; anything else
+      // falls back to the raw server message.
+      if (error.code === 'P0001' || /unavailable|already reserved/i.test(error.message || '')) {
+        setReserveError('Someone else just reserved these checks. Refreshing the list…')
+        fetchMatchCount(bank, payeeQuery, payorQuery)
+      } else {
+        setReserveError(error.message || 'Something went wrong. Please try again.')
+      }
       return
     }
 
+    const result = Array.isArray(data) ? data[0] : data
+    const reservationId = result?.reservation_id
+    // The RPC is the single source of truth for what actually got locked in
+    // — it must run the check-selection and status flip inside one atomic,
+    // row-locked transaction (see SQL notes above create_reservation) and
+    // hand back exactly which check ids it reserved. We never assume the
+    // client's pre-fetched idsForSelectedBranch all made it through: if two
+    // collectors race for the same batch, only one wins each row.
+    const reservedIds = Array.isArray(result?.reserved_check_ids)
+      ? result.reserved_check_ids
+      : idsForSelectedBranch // back-compat fallback if the RPC hasn't been updated yet
+    const reservedIdSet = new Set(reservedIds)
+    const rowsActuallyReserved = rowsForSelectedBranch.filter((row) => reservedIdSet.has(row.id))
+    const lostToRaceCount = idsForSelectedBranch.length - rowsActuallyReserved.length
+
+    if (rowsActuallyReserved.length === 0) {
+      haptic([20, 40, 20])
+      setReserveError('These checks were just reserved by someone else. Refreshing the list…')
+      fetchMatchCount(bank, payeeQuery, payorQuery)
+      return
+    }
+
+    haptic(15)
+
     const banksForSelectedBranch = {}
-    for (const row of rowsForSelectedBranch) {
+    for (const row of rowsActuallyReserved) {
       const name = row.bank || UNKNOWN_BANK_LABEL
       banksForSelectedBranch[name] = (banksForSelectedBranch[name] || 0) + 1
     }
 
-const result = Array.isArray(data) ? data[0] : data
-const reservationId = result?.reservation_id
+    setSuccessInfo({
+      reservationId,
+      branch: selectedBranch,
+      count: rowsActuallyReserved.length,
+      requestedCount: idsForSelectedBranch.length,
+      lostToRaceCount,
+      expiresAt: result?.expires_at,
+      collectorName: cleanName,
+      bank,
+      payee: payeeQuery,
+      payor: payorQuery,
+      branchBreakdown: {
+        [selectedBranch]: { total: rowsActuallyReserved.length, banks: banksForSelectedBranch },
+      },
+    })
+    setShowConfirm(false)
+    setCollectorName('')
+    setQueueInfo(null)
+    setQueueError('')
+    queueAssignedForRef.current = null
+    fetchMatchCount(bank, payeeQuery, payorQuery)
 
-setSuccessInfo({
-  reservationId,
-  branch: selectedBranch,
-  count: idsForSelectedBranch.length,
-  expiresAt: result?.expires_at,
-  collectorName: cleanName,
-  bank,
-  payee: payeeQuery,
-  payor: payorQuery,
-  branchBreakdown: {
-    [selectedBranch]: { total: idsForSelectedBranch.length, banks: banksForSelectedBranch },
-  },
-})
-setShowConfirm(false)
-setCollectorName('')
-setQueueInfo(null)
-setQueueError('')
-queueAssignedForRef.current = null
-fetchMatchCount(bank, payeeQuery, payorQuery)
-
-assignQueueNumber(reservationId, selectedBranch)
+    assignQueueNumber(reservationId, selectedBranch)
   }
 
   // Bank is optional, so query "readiness" is driven by payee + payor only.
@@ -842,7 +955,7 @@ assignQueueNumber(reservationId, selectedBranch)
             even if — with no bank filter applied — that point holds checks
             from several different banks. */}
         {hasSearched && !loading && matchedCount > 0 && !successInfo && (
-          <div className="slide-up fixed inset-x-0 bottom-0 z-40 bg-gradient-to-r from-[var(--brand-dark)] via-[var(--brand)] to-[var(--brand-dark)] px-4 pb-6 pt-5 shadow-[0_-16px_40px_rgba(13,148,136,0.35)] sm:pb-5">
+          <div className="slide-up safe-bottom fixed inset-x-0 bottom-0 z-40 bg-gradient-to-r from-[var(--brand-dark)] via-[var(--brand)] to-[var(--brand-dark)] px-4 pb-6 pt-5 shadow-[0_-16px_40px_rgba(13,148,136,0.35)] sm:pb-5">
             <div className="absolute inset-x-0 top-0 h-[3px] bg-[var(--brand-light)]"></div>
             <div className="mx-auto flex max-w-4xl flex-col items-center justify-between gap-4 sm:flex-row">
               <div className="flex w-full items-center gap-4 sm:w-auto">
@@ -884,7 +997,7 @@ assignQueueNumber(reservationId, selectedBranch)
                 type="button"
                 onClick={openConfirm}
                 disabled={needsBranchSelection}
-                className="flex w-full items-center justify-center gap-2 rounded-xl bg-[var(--accent)] px-10 py-4 text-base font-semibold text-white shadow-xl shadow-black/25 transition-all hover:-translate-y-0.5 hover:bg-[var(--accent-dark)] active:scale-95 disabled:pointer-events-none disabled:opacity-40 disabled:hover:translate-y-0 sm:w-auto"
+                className="touch-target flex w-full min-h-[52px] items-center justify-center gap-2 rounded-xl bg-[var(--accent)] px-10 py-4 text-base font-semibold text-white shadow-xl shadow-black/25 transition-all hover:-translate-y-0.5 hover:bg-[var(--accent-dark)] active:scale-95 disabled:pointer-events-none disabled:opacity-40 disabled:hover:translate-y-0 sm:w-auto"
               >
                 <Truck className="h-5 w-5" />
                 Reserve now
@@ -1174,7 +1287,7 @@ function BankDropdown({ value, options, onChange, placeholder = 'All banks' }) {
             <div className="overflow-y-auto overscroll-contain">
               {filteredOptions.length === 0 ? (
                 <p className="px-2.5 py-6 text-center text-sm font-medium text-slate-400">
-                  No banks match “{query}”
+                  No banks match "{query}"
                 </p>
               ) : (
                 filteredOptions.map((opt, i) => {
@@ -1323,6 +1436,20 @@ function PageStyles() {
         background-color: var(--paper);
         color: var(--ink);
         -webkit-font-smoothing: antialiased;
+        /* Kill the gray flash Android/iOS show on tap so buttons feel like
+           native controls instead of a webpage. */
+        -webkit-tap-highlight-color: transparent;
+      }
+
+      .touch-target {
+        touch-action: manipulation; /* removes the ~300ms tap delay */
+      }
+
+      /* Sticky elements pinned to the bottom must clear the home-indicator /
+         gesture-bar area on notched phones — env() falls back to 0 on
+         devices without a safe-area inset, so this is a no-op elsewhere. */
+      .safe-bottom {
+        padding-bottom: calc(env(safe-area-inset-bottom, 0px));
       }
 
       .rider-app .font-display {
@@ -2037,10 +2164,20 @@ function ConfirmModal({
                   <Input
                     id="collector-name"
                     value={collectorName}
-                    onChange={(e) => onCollectorNameChange(e.target.value)}
+                    onChange={(e) => {
+                      // Strip invisible/control characters immediately — this
+                      // never removes a visible letter the collector typed,
+                      // it only closes off zero-width/bidi-override spoofing
+                      // at the source instead of waiting for blur.
+                      // eslint-disable-next-line no-control-regex
+                      const next = e.target.value
+                        .normalize('NFKC')
+                        .replace(/[\u0000-\u001F\u007F\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, '')
+                      onCollectorNameChange(next)
+                    }}
                     onBlur={() => {
                       setNameTouched(true)
-                      onCollectorNameChange(collectorName.replace(/\s+/g, ' ').trim())
+                      onCollectorNameChange(sanitizeCollectorName(collectorName))
                     }}
                     onKeyDown={(e) => {
                       if (e.key === 'Enter') handleConfirmClick()
@@ -2048,6 +2185,9 @@ function ConfirmModal({
                     placeholder="e.g. Juan Dela Cruz"
                     maxLength={COLLECTOR_NAME_MAX}
                     autoComplete="name"
+                    autoCapitalize="words"
+                    autoCorrect="off"
+                    spellCheck={false}
                     aria-invalid={showNameError}
                     aria-describedby="collector-name-hint"
                     className={`h-14 rounded-xl bg-white pr-11 text-base font-semibold shadow-sm transition-all focus-visible:ring-2 ${
@@ -2133,7 +2273,7 @@ function ConfirmModal({
             type="button"
             onClick={onCancel}
             disabled={reserving}
-            className="rounded-xl px-5 py-3 text-sm font-semibold text-slate-500 transition-colors hover:bg-slate-100 hover:text-[var(--ink-dark)] disabled:opacity-50 sm:py-2.5"
+            className="touch-target min-h-[48px] rounded-xl px-5 py-3 text-sm font-semibold text-slate-500 transition-colors hover:bg-slate-100 hover:text-[var(--ink-dark)] disabled:opacity-50 sm:py-2.5"
           >
             Cancel
           </button>
@@ -2141,7 +2281,7 @@ function ConfirmModal({
             type="button"
             onClick={handleConfirmClick}
             disabled={reserving || (nameTouched && !nameValidation.valid) || (idTouched && !idAcknowledged)}
-            className="inline-flex items-center justify-center gap-2 rounded-xl bg-[var(--accent)] px-6 py-3 text-sm font-semibold text-white shadow-lg shadow-[var(--accent)]/30 transition-all hover:-translate-y-0.5 hover:bg-[var(--accent-dark)] disabled:transform-none disabled:opacity-60 sm:py-2.5"
+            className="touch-target inline-flex min-h-[48px] items-center justify-center gap-2 rounded-xl bg-[var(--accent)] px-6 py-3 text-sm font-semibold text-white shadow-lg shadow-[var(--accent)]/30 transition-all hover:-translate-y-0.5 hover:bg-[var(--accent-dark)] disabled:transform-none disabled:opacity-60 sm:py-2.5"
           >
             {reserving ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
             Confirm pickup
@@ -2263,6 +2403,15 @@ function SuccessManifest({ info, onDismiss, queueInfo, queueError, assigningQueu
             )}
             .
           </p>
+
+          {info.lostToRaceCount > 0 && (
+            <div className="mt-3 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs font-semibold text-amber-700">
+              <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              {info.lostToRaceCount} of the {info.requestedCount} checks requested{' '}
+              {info.lostToRaceCount === 1 ? 'was' : 'were'} reserved by another collector moments earlier — only the{' '}
+              {info.count} still available {info.count === 1 ? 'was' : 'were'} included in this reservation.
+            </div>
+          )}
 
           {matchedBranches.length > 0 && (
             <div className="mt-3 flex flex-wrap gap-2">

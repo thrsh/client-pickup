@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  ClipboardList,
   Loader2,
   RefreshCw,
   AlertTriangle,
@@ -20,6 +19,10 @@ import {
   Landmark,
   FileDown,
   CalendarRange,
+  CheckCircle2,
+  RotateCcw,
+  Clock3,
+  Hash,
 } from 'lucide-react'
 import { useProfile } from '../../context/ProfileContext'
 import { supabase } from '../../lib/supabaseClient'
@@ -39,8 +42,20 @@ const STATUS_OPTIONS = [
   { value: 'generated', label: 'Generated (pending)' },
 ]
 
+// Decision is a separate axis from the submission status above: a report
+// can be "submitted" (workflow status) while still "awaiting" a decision,
+// or "submitted" and "approved"/"returned"/"mixed" once an approver acts.
+const DECISION_OPTIONS = [
+  { value: 'all', label: 'All decisions' },
+  { value: 'awaiting', label: 'Awaiting decision' },
+  { value: 'approved', label: 'Approved' },
+  { value: 'returned', label: 'Returned' },
+  { value: 'mixed', label: 'Mixed outcome' },
+]
+
 const DEFAULT_FILTERS = {
   status: 'all',
+  decision: 'all',
   dateFrom: '',
   dateTo: '',
   branch: 'all',
@@ -51,6 +66,7 @@ const SORTABLE_COLUMNS = {
   report_number: (r) => r.report_number || '',
   generated_at: (r) => (r.generated_at ? new Date(r.generated_at).getTime() : 0),
   submitted_at: (r) => (r.submitted_at ? new Date(r.submitted_at).getTime() : 0),
+  decided_at: (r) => (r.decided_at ? new Date(r.decided_at).getTime() : 0),
   status: (r) => r.status || '',
   check_count: (r) => Number(r.check_count) || 0,
   total_amount: (r) => Number(r.total_amount) || 0,
@@ -62,9 +78,16 @@ const SORTABLE_COLUMNS = {
 // hydration is needed for scoping or the branch filter.
 const getReportBranches = (r) => (Array.isArray(r?.branches) ? r.branches.filter(Boolean) : [])
 
-// staled_check_reports has no equivalent bank column, so bank names have
-// to come from checks.bank via the per-report detail RPC.
+// staled_check_reports has no equivalent bank column, so bank names (and
+// full check detail, for the expandable row) have to come from
+// checks.bank via the per-report detail RPC.
 const BANK_FIELD_CANDIDATES = ['bank', 'bank_name', 'bankName']
+const CHECK_NO_FIELD_CANDIDATES = ['check_no', 'checkNo', 'check_number']
+const PAYEE_FIELD_CANDIDATES = ['payee']
+const BRANCH_FIELD_CANDIDATES = ['pickup_branch', 'branch', 'pickupBranch']
+const CHECK_STATUS_FIELD_CANDIDATES = ['status', 'check_status']
+const RETURN_REASON_FIELD_CANDIDATES = ['return_reason', 'reason', 'returnReason']
+const AMOUNT_FIELD_CANDIDATES = ['amount', 'check_amount']
 
 const DETAIL_FETCH_BATCH_SIZE = 4
 
@@ -90,6 +113,15 @@ function firstDefined(row, keys) {
   return null
 }
 
+/** First finite numeric value found among a list of candidate field names, defaulting to 0. */
+function firstDefinedNumber(row, keys) {
+  for (const key of keys) {
+    const value = Number(row?.[key])
+    if (Number.isFinite(value)) return value
+  }
+  return 0
+}
+
 function uniqueSorted(values) {
   return Array.from(new Set(values)).sort((a, b) => a.localeCompare(b))
 }
@@ -99,6 +131,11 @@ function formatDateTime(value) {
   const d = new Date(value)
   if (Number.isNaN(d.getTime())) return null
   return d.toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' })
+}
+
+function safeCurrency(amount) {
+  const n = Number(amount)
+  return Number.isFinite(n) ? formatCurrency(n) : '—'
 }
 
 function escapeCsvField(value) {
@@ -121,6 +158,18 @@ function toErrorMessage(err, fallback) {
   if (typeof err === 'string') return err
   if (err.message) return err.message
   return fallback
+}
+
+// A report's decision outcome, derived from decided_at / approved_count /
+// returned_count. Treated as optional/nullable throughout — a report with
+// no decided_at (or missing counts) simply reads as "awaiting".
+function getDecisionState(r) {
+  if (!r?.decided_at) return 'awaiting'
+  const approved = Number(r.approved_count) || 0
+  const returned = Number(r.returned_count) || 0
+  if (returned > 0 && approved === 0) return 'returned'
+  if (returned > 0) return 'mixed'
+  return 'approved'
 }
 
 // ---------------------------------------------------------------------------
@@ -236,12 +285,142 @@ function StatusBadge({ status }) {
   )
 }
 
-function TableSkeleton({ rows = 6 }) {
+// The approver's decision on a report — independent of the submission
+// StatusBadge above. "Mixed" covers a report where some checks were
+// confirmed stale and others were returned to the pool.
+function DecisionBadge({ report }) {
+  const state = getDecisionState(report)
+  if (state === 'returned')
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full bg-orange-100 px-2 py-0.5 text-[10px] font-medium text-orange-700">
+        <RotateCcw className="h-2.5 w-2.5" /> Returned
+      </span>
+    )
+  if (state === 'mixed')
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-medium text-amber-700">
+        <CheckCircle2 className="h-2.5 w-2.5" /> Mixed outcome
+      </span>
+    )
+  if (state === 'approved')
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
+        <CheckCircle2 className="h-2.5 w-2.5" /> Approved
+      </span>
+    )
+  return (
+    <span className="inline-flex items-center gap-1 rounded-full bg-ink-100 px-2 py-0.5 text-[10px] font-medium text-ink-500">
+      <Clock3 className="h-2.5 w-2.5" /> Awaiting decision
+    </span>
+  )
+}
+
+// Per-check outcome inside the expanded detail table. Falls back to a
+// plain capitalized label for any status value it doesn't recognize,
+// so an unexpected value never renders as a blank cell.
+function CheckOutcomeBadge({ status }) {
+  const normalized = String(status || '').toLowerCase()
+  if (normalized === 'returned')
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full bg-orange-100 px-2 py-0.5 text-[10px] font-medium text-orange-700">
+        <RotateCcw className="h-2.5 w-2.5" /> Returned
+      </span>
+    )
+  if (normalized === 'approved' || normalized === 'picked_up')
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
+        <CheckCircle2 className="h-2.5 w-2.5" /> {normalized === 'picked_up' ? 'Picked up' : 'Approved'}
+      </span>
+    )
+  if (normalized === 'pending_approval')
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-medium text-amber-700">
+        <Clock3 className="h-2.5 w-2.5" /> Awaiting decision
+      </span>
+    )
+  if (normalized)
+    return (
+      <span className="inline-flex items-center rounded-full bg-ink-100 px-2 py-0.5 text-[10px] font-medium capitalize text-ink-500">
+        {normalized}
+      </span>
+    )
+  return <span className="text-ink-300">—</span>
+}
+
+// Nested, read-only detail table shown when a report row is expanded.
+// Sourced from the same detail cache used to hydrate the Banks column, so
+// expanding a row never triggers an extra network call once that row has
+// already been fetched for the page.
+function CheckDetailTable({ rows }) {
+  if (!rows || rows.length === 0) {
+    return (
+      <div className="flex items-center gap-2 px-4 py-4 text-xs text-ink-400">
+        <Inbox className="h-3.5 w-3.5 shrink-0" />
+        No check details are available for this report.
+      </div>
+    )
+  }
+
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full min-w-[720px] text-xs">
+        <thead>
+          <tr className="border-b border-dashed border-ink-100 text-left text-[10px] uppercase tracking-wide text-ink-400">
+            <th className="px-4 py-2 font-medium">Check no.</th>
+            <th className="px-2 py-2 font-medium">Bank</th>
+            <th className="px-2 py-2 font-medium">Branch</th>
+            <th className="px-2 py-2 font-medium">Payee</th>
+            <th className="px-2 py-2 text-right font-medium">Amount</th>
+            <th className="px-2 py-2 font-medium">Outcome</th>
+            <th className="px-2 py-2 font-medium">Reason</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-dashed divide-ink-50">
+          {rows.map((row, idx) => {
+            const checkNo = firstDefined(row, CHECK_NO_FIELD_CANDIDATES)
+            const payee = firstDefined(row, PAYEE_FIELD_CANDIDATES)
+            const branch = firstDefined(row, BRANCH_FIELD_CANDIDATES)
+            const bank = firstDefined(row, BANK_FIELD_CANDIDATES)
+            const status = firstDefined(row, CHECK_STATUS_FIELD_CANDIDATES)
+            const reason = firstDefined(row, RETURN_REASON_FIELD_CANDIDATES)
+            const amount = firstDefinedNumber(row, AMOUNT_FIELD_CANDIDATES)
+            return (
+              <tr key={row.id ?? checkNo ?? idx} className="hover:bg-ink-50/40">
+                <td className="px-4 py-2 font-mono text-ink-700">
+                  <span className="flex items-center gap-1">
+                    <Hash className="h-3 w-3 shrink-0 text-ink-300" />
+                    {checkNo || '—'}
+                  </span>
+                </td>
+                <td className="px-2 py-2 text-ink-600">{bank || '—'}</td>
+                <td className="max-w-[120px] truncate px-2 py-2 text-ink-600" title={branch || undefined}>
+                  {branch || '—'}
+                </td>
+                <td className="max-w-[160px] truncate px-2 py-2 font-medium text-ink-800" title={payee || undefined}>
+                  {payee || '—'}
+                </td>
+                <td className="px-2 py-2 text-right font-mono font-medium text-ink-700">{safeCurrency(amount)}</td>
+                <td className="px-2 py-2">
+                  <CheckOutcomeBadge status={status} />
+                </td>
+                <td className="max-w-[180px] truncate px-2 py-2 text-ink-500" title={reason || undefined}>
+                  {reason || '—'}
+                </td>
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function TableSkeleton({ rows = 6, columns = 11 }) {
   return (
     <tbody className="divide-y divide-ink-50">
       {Array.from({ length: rows }).map((_, i) => (
         <tr key={i}>
-          {Array.from({ length: 9 }).map((__, j) => (
+          {Array.from({ length: columns }).map((__, j) => (
             <td key={j} className="px-4 py-3">
               <div className="h-3 w-full max-w-[6rem] animate-pulse rounded bg-ink-100" />
             </td>
@@ -279,13 +458,17 @@ export default function StaleReportHistory() {
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(25)
 
-  // Per-report cache of hydrated bank names, keyed by report_number:
-  // { status: 'loading' | 'loaded' | 'error', banks: string[] | null }
-  const [bankCache, setBankCache] = useState({})
-  const bankCacheRef = useRef(bankCache)
+  const [expandedRows, setExpandedRows] = useState(() => new Set())
+
+  // Per-report cache of hydrated check detail, keyed by report_number:
+  // { status: 'loading' | 'loaded' | 'error', rows: object[] | null, banks: string[] | null }
+  // Serves both the Banks column and the expandable check-detail table so
+  // expanding a row never triggers a duplicate fetch.
+  const [detailCache, setDetailCache] = useState({})
+  const detailCacheRef = useRef(detailCache)
   useEffect(() => {
-    bankCacheRef.current = bankCache
-  }, [bankCache])
+    detailCacheRef.current = detailCache
+  }, [detailCache])
 
   const [preview, setPreview] = useState({
     open: false,
@@ -389,14 +572,27 @@ export default function StaleReportHistory() {
     })
   }, [reports, currentUserId, pickupBranch, isAllBranches])
 
-  // -- Bank name hydration ---------------------------------------------------
-  //
-  // staled_check_reports has no bank column, so showing bank names requires
-  // the per-report detail RPC. Lazily fetched for whatever's on the visible
-  // page, batched, and cached per report_number so paging back doesn't refetch.
+  // Drop any expanded row that no longer exists after a refresh (e.g. it
+  // fell out of scope), so we don't leave a dangling expanded entry around.
+  useEffect(() => {
+    setExpandedRows((prev) => {
+      if (prev.size === 0) return prev
+      const validIds = new Set(scopedReports.map((r) => r.report_number))
+      const next = new Set([...prev].filter((id) => validIds.has(id)))
+      return next.size === prev.size ? prev : next
+    })
+  }, [scopedReports])
 
-  const fetchBankDetail = useCallback(async (reportNumber) => {
-    setBankCache((prev) => ({ ...prev, [reportNumber]: { status: 'loading', banks: null } }))
+  // -- Check detail hydration ---------------------------------------------
+  //
+  // staled_check_reports has no bank column and no per-check breakdown, so
+  // both the Banks column and the expandable check table require the
+  // per-report detail RPC. Lazily fetched for whatever's on the visible
+  // page, batched, and cached per report_number so paging back — or
+  // expanding a row already on-screen — never refetches.
+
+  const fetchReportDetail = useCallback(async (reportNumber) => {
+    setDetailCache((prev) => ({ ...prev, [reportNumber]: { status: 'loading', rows: null, banks: null } }))
     try {
       const { data: rows, error } = await supabase.rpc('verifier_get_staled_check_report_detail', {
         p_report_number: reportNumber,
@@ -407,23 +603,31 @@ export default function StaleReportHistory() {
       const banks = uniqueSorted(rows.map((row) => firstDefined(row, BANK_FIELD_CANDIDATES)).filter(Boolean))
 
       if (!isMountedRef.current) return
-      setBankCache((prev) => ({
+      setDetailCache((prev) => ({
         ...prev,
-        [reportNumber]: { status: 'loaded', banks },
+        [reportNumber]: { status: 'loaded', rows, banks },
       }))
     } catch (err) {
-      console.error(`[StaleReportHistory] Failed to hydrate banks for report ${reportNumber}:`, err)
+      console.error(`[StaleReportHistory] Failed to hydrate detail for report ${reportNumber}:`, err)
       if (!isMountedRef.current) return
-      setBankCache((prev) => ({ ...prev, [reportNumber]: { status: 'error', banks: null } }))
+      setDetailCache((prev) => ({ ...prev, [reportNumber]: { status: 'error', rows: null, banks: null } }))
     }
   }, [])
 
-  function retryBankDetail(reportNumber) {
-    fetchBankDetail(reportNumber)
+  function retryReportDetail(reportNumber) {
+    fetchReportDetail(reportNumber)
   }
 
   function resolvedBankNames(r) {
-    return bankCache[r.report_number]?.banks || null
+    return detailCache[r.report_number]?.banks || null
+  }
+
+  function toggleExpandRow(reportNumber) {
+    setExpandedRows((prev) => {
+      const next = new Set(prev)
+      next.has(reportNumber) ? next.delete(reportNumber) : next.add(reportNumber)
+      return next
+    })
   }
 
   const branchOptions = useMemo(() => {
@@ -437,7 +641,7 @@ export default function StaleReportHistory() {
     scopedReports.forEach((r) => names.push(...(resolvedBankNames(r) || [])))
     return uniqueSorted(names)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scopedReports, bankCache])
+  }, [scopedReports, detailCache])
 
   // -- Filtering / sorting / pagination -------------------------------------
 
@@ -448,10 +652,11 @@ export default function StaleReportHistory() {
 
     return scopedReports.filter((r) => {
       if (term) {
-        const haystack = `${r.report_number || ''} ${r.generated_by_name || ''} ${r.submitted_by_name || ''}`.toLowerCase()
+        const haystack = `${r.report_number || ''} ${r.generated_by_name || ''} ${r.submitted_by_name || ''} ${r.decided_by_name || ''}`.toLowerCase()
         if (!haystack.includes(term)) return false
       }
       if (filters.status !== 'all' && r.status !== filters.status) return false
+      if (filters.decision !== 'all' && getDecisionState(r) !== filters.decision) return false
       if (from || to) {
         const generatedAt = r.generated_at ? new Date(r.generated_at) : null
         if (!generatedAt || Number.isNaN(generatedAt.getTime())) return false
@@ -463,7 +668,7 @@ export default function StaleReportHistory() {
       return true
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scopedReports, debouncedSearch, filters, bankCache])
+  }, [scopedReports, debouncedSearch, filters, detailCache])
 
   const sortedReports = useMemo(() => {
     const getValue = SORTABLE_COLUMNS[sort.key]
@@ -491,12 +696,12 @@ export default function StaleReportHistory() {
     return sortedReports.slice(start, start + pageSize)
   }, [sortedReports, clampedPage, pageSize])
 
-  // Hydrate bank names for whatever's on the visible page, in small
+  // Hydrate check detail for whatever's on the visible page, in small
   // concurrent batches, skipping anything already cached or in flight.
   useEffect(() => {
     const pending = paginatedReports
       .map((r) => r.report_number)
-      .filter((num) => !bankCacheRef.current[num])
+      .filter((num) => !detailCacheRef.current[num])
 
     if (pending.length === 0) return
     let cancelled = false
@@ -505,14 +710,14 @@ export default function StaleReportHistory() {
       for (let i = 0; i < pending.length; i += DETAIL_FETCH_BATCH_SIZE) {
         if (cancelled) return
         const batch = pending.slice(i, i + DETAIL_FETCH_BATCH_SIZE)
-        await Promise.all(batch.map(fetchBankDetail))
+        await Promise.all(batch.map(fetchReportDetail))
       }
     })()
 
     return () => {
       cancelled = true
     }
-  }, [paginatedReports, fetchBankDetail])
+  }, [paginatedReports, fetchReportDetail])
 
   function toggleSort(key) {
     setSort((prev) =>
@@ -530,6 +735,7 @@ export default function StaleReportHistory() {
   const hasActiveFilters =
     searchInput.trim() !== '' ||
     filters.status !== 'all' ||
+    filters.decision !== 'all' ||
     filters.dateFrom !== '' ||
     filters.dateTo !== '' ||
     filters.branch !== 'all' ||
@@ -537,12 +743,17 @@ export default function StaleReportHistory() {
 
   const stats = useMemo(() => {
     return filteredReports.reduce(
-      (acc, r) => ({
-        checks: acc.checks + (Number(r.check_count) || 0),
-        amount: acc.amount + Number(r.total_amount || 0),
-        submitted: acc.submitted + (r.status === 'submitted' ? 1 : 0),
-      }),
-      { checks: 0, amount: 0, submitted: 0 },
+      (acc, r) => {
+        const state = getDecisionState(r)
+        return {
+          checks: acc.checks + (Number(r.check_count) || 0),
+          amount: acc.amount + Number(r.total_amount || 0),
+          awaiting: acc.awaiting + (state === 'awaiting' ? 1 : 0),
+          approved: acc.approved + (state === 'approved' ? 1 : 0),
+          returned: acc.returned + (state === 'returned' || state === 'mixed' ? 1 : 0),
+        }
+      },
+      { checks: 0, amount: 0, awaiting: 0, approved: 0, returned: 0 },
     )
   }, [filteredReports])
 
@@ -574,6 +785,8 @@ export default function StaleReportHistory() {
         submittedAt: reportMeta.submitted_at,
         submittedByName: reportMeta.submitted_by_name,
         status: reportMeta.status,
+        decidedAt: reportMeta.decided_at,
+        decidedByName: reportMeta.decided_by_name,
         rows,
       }
 
@@ -649,6 +862,11 @@ export default function StaleReportHistory() {
         'Branches',
         'Submitted At',
         'Submitted By',
+        'Decision',
+        'Decided At',
+        'Decided By',
+        'Approved Count',
+        'Returned Count',
         'Checks',
         'Total Amount',
         'Banks',
@@ -663,6 +881,11 @@ export default function StaleReportHistory() {
           getReportBranches(r).join('; '),
           r.submitted_at ? new Date(r.submitted_at).toISOString() : '',
           r.submitted_by_name || '',
+          getDecisionState(r),
+          r.decided_at ? new Date(r.decided_at).toISOString() : '',
+          r.decided_by_name || '',
+          r.approved_count ?? '',
+          r.returned_count ?? '',
           r.check_count ?? 0,
           r.total_amount ?? 0,
           banks,
@@ -708,7 +931,6 @@ export default function StaleReportHistory() {
   return (
     <div>
       <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
-       
         <div className="flex items-center gap-2">
           <Button variant="outline" onClick={exportListCsv} disabled={isBusy || sortedReports.length === 0}>
             <FileDown className="mr-2 h-3.5 w-3.5" />
@@ -725,7 +947,15 @@ export default function StaleReportHistory() {
         </div>
       </div>
 
-    
+      {!isBusy && filteredReports.length > 0 && (
+        <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+          <StatCard label="Reports" value={sortedReports.length} />
+          <StatCard label="Checks" value={stats.checks.toLocaleString()} />
+          <StatCard label="Total amount" value={formatCurrency(stats.amount)} tone="accent" />
+          <StatCard label="Awaiting decision" value={stats.awaiting} />
+          <StatCard label="Approved / Returned" value={`${stats.approved} / ${stats.returned}`} />
+        </div>
+      )}
 
       {loadError && (
         <div className="mb-4 flex items-center justify-between gap-3 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
@@ -750,7 +980,7 @@ export default function StaleReportHistory() {
               type="text"
               value={searchInput}
               onChange={(e) => setSearchInput(e.target.value)}
-              placeholder="Search report no., generated by, submitted by…"
+              placeholder="Search report no., generated by, submitted by, decided by…"
               className="w-full rounded-md border border-ink-100 bg-ink-50/40 py-1.5 pl-8 pr-3 text-xs text-ink-700 placeholder:text-ink-300 focus:border-ledger-stamp focus:outline-none focus:ring-1 focus:ring-ledger-stamp"
             />
           </div>
@@ -761,6 +991,18 @@ export default function StaleReportHistory() {
             className="rounded-md border border-ink-100 bg-white px-2.5 py-1.5 text-xs text-ink-600 focus:border-ledger-stamp focus:outline-none focus:ring-1 focus:ring-ledger-stamp"
           >
             {STATUS_OPTIONS.map((opt) => (
+              <option key={opt.value} value={opt.value}>
+                {opt.label}
+              </option>
+            ))}
+          </select>
+
+          <select
+            value={filters.decision}
+            onChange={(e) => setFilters((f) => ({ ...f, decision: e.target.value }))}
+            className="rounded-md border border-ink-100 bg-white px-2.5 py-1.5 text-xs text-ink-600 focus:border-ledger-stamp focus:outline-none focus:ring-1 focus:ring-ledger-stamp"
+          >
+            {DECISION_OPTIONS.map((opt) => (
               <option key={opt.value} value={opt.value}>
                 {opt.label}
               </option>
@@ -882,10 +1124,12 @@ export default function StaleReportHistory() {
           <table className="w-full text-left text-xs">
             <thead className="sticky top-0 z-10 bg-ink-50/90 backdrop-blur">
               <tr className="border-b border-ink-100 text-[10px] uppercase tracking-wide text-ink-400">
+                <th className="w-8 px-2 py-2" />
                 <SortHeader label="Report No." sortKey="report_number" sort={sort} onSort={toggleSort} />
                 <SortHeader label="Generated" sortKey="generated_at" sort={sort} onSort={toggleSort} />
                 <SortHeader label="Submitted" sortKey="submitted_at" sort={sort} onSort={toggleSort} />
                 <SortHeader label="Status" sortKey="status" sort={sort} onSort={toggleSort} />
+                <SortHeader label="Decision" sortKey="decided_at" sort={sort} onSort={toggleSort} />
                 <SortHeader label="Checks" sortKey="check_count" sort={sort} onSort={toggleSort} align="right" />
                 <SortHeader label="Amount" sortKey="total_amount" sort={sort} onSort={toggleSort} align="right" />
                 <th className="px-4 py-2 font-medium">Branches</th>
@@ -901,52 +1145,118 @@ export default function StaleReportHistory() {
                 {paginatedReports.map((r) => {
                   const generatedAt = formatDateTime(r.generated_at)
                   const submittedAt = formatDateTime(r.submitted_at)
-                  const cacheEntry = bankCache[r.report_number]
+                  const decidedAt = formatDateTime(r.decided_at)
+                  const cacheEntry = detailCache[r.report_number]
                   const isHydrating = cacheEntry?.status === 'loading'
                   const hydrationErrored = cacheEntry?.status === 'error'
+                  const isExpanded = expandedRows.has(r.report_number)
 
                   return (
-                    <tr key={r.report_number} className="hover:bg-ink-50/40">
-                      <td className="px-4 py-2.5 font-mono font-medium text-ink-800">{r.report_number}</td>
-                      <td className="px-4 py-2.5 text-ink-600">
-                        <div>{generatedAt || '—'}</div>
-                        <div className="text-[10px] text-ink-400">{r.generated_by_name || '—'}</div>
-                      </td>
-                      <td className="px-4 py-2.5 text-ink-600">
-                        {submittedAt ? (
-                          <>
-                            <div>{submittedAt}</div>
-                            <div className="text-[10px] text-ink-400">{r.submitted_by_name || '—'}</div>
-                          </>
-                        ) : (
-                          <span className="text-ink-300">Not yet submitted</span>
-                        )}
-                      </td>
-                      <td className="px-4 py-2.5">
-                        <StatusBadge status={r.status} />
-                      </td>
-                      <td className="px-4 py-2.5 text-right text-ink-700">{r.check_count}</td>
-                      <td className="px-4 py-2.5 text-right font-medium text-ink-800">
-                        {formatCurrency(r.total_amount)}
-                      </td>
-                      <td className="px-4 py-2.5">
-                        <BranchList names={getReportBranches(r)} icon={Building2} />
-                      </td>
-                      <td className="px-4 py-2.5">
-                        <NameList
-                          names={resolvedBankNames(r)}
-                          icon={Landmark}
-                          loading={isHydrating}
-                          errored={hydrationErrored}
-                          onRetry={() => retryBankDetail(r.report_number)}
-                        />
-                      </td>
-                      <td className="px-4 py-2.5 text-right">
-                        <Button size="sm" variant="outline" onClick={() => openPreview(r)}>
-                          <Eye className="mr-1.5 h-3.5 w-3.5" /> Preview
-                        </Button>
-                      </td>
-                    </tr>
+                    <React.Fragment key={r.report_number}>
+                      <tr className="hover:bg-ink-50/40">
+                        <td className="px-2 py-2.5">
+                          <button
+                            type="button"
+                            onClick={() => toggleExpandRow(r.report_number)}
+                            className="flex h-6 w-6 items-center justify-center rounded-md text-ink-400 hover:bg-ink-100 hover:text-ink-600"
+                            aria-expanded={isExpanded}
+                            aria-label={isExpanded ? 'Collapse check details' : 'Expand check details'}
+                          >
+                            {isExpanded ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+                          </button>
+                        </td>
+                        <td className="px-4 py-2.5 font-mono font-medium text-ink-800">{r.report_number}</td>
+                        <td className="px-4 py-2.5 text-ink-600">
+                          <div>{generatedAt || '—'}</div>
+                          <div className="text-[10px] text-ink-400">{r.generated_by_name || '—'}</div>
+                        </td>
+                        <td className="px-4 py-2.5 text-ink-600">
+                          {submittedAt ? (
+                            <>
+                              <div>{submittedAt}</div>
+                              <div className="text-[10px] text-ink-400">{r.submitted_by_name || '—'}</div>
+                            </>
+                          ) : (
+                            <span className="text-ink-300">Not yet submitted</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-2.5">
+                          <StatusBadge status={r.status} />
+                        </td>
+                        <td className="px-4 py-2.5">
+                          <DecisionBadge report={r} />
+                          {decidedAt && (
+                            <div className="mt-0.5 text-[10px] text-ink-400">
+                              {decidedAt}
+                              {r.decided_by_name && ` · ${r.decided_by_name}`}
+                            </div>
+                          )}
+                        </td>
+                        <td className="px-4 py-2.5 text-right text-ink-700">{r.check_count}</td>
+                        <td className="px-4 py-2.5 text-right font-medium text-ink-800">
+                          {formatCurrency(r.total_amount)}
+                        </td>
+                        <td className="px-4 py-2.5">
+                          <BranchList names={getReportBranches(r)} icon={Building2} />
+                        </td>
+                        <td className="px-4 py-2.5">
+                          <NameList
+                            names={resolvedBankNames(r)}
+                            icon={Landmark}
+                            loading={isHydrating}
+                            errored={hydrationErrored}
+                            onRetry={() => retryReportDetail(r.report_number)}
+                          />
+                        </td>
+                        <td className="px-4 py-2.5 text-right">
+                          <Button size="sm" variant="outline" onClick={() => openPreview(r)}>
+                            <Eye className="mr-1.5 h-3.5 w-3.5" /> Preview
+                          </Button>
+                        </td>
+                      </tr>
+
+                      {isExpanded && (
+                        <tr>
+                          <td colSpan={11} className="border-t border-dashed border-ink-100 bg-ink-50/30 p-0">
+                            {isHydrating && (
+                              <div className="flex items-center gap-2 px-4 py-4 text-xs text-ink-400">
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                Loading check details…
+                              </div>
+                            )}
+                            {hydrationErrored && (
+                              <div className="flex items-center justify-between gap-3 px-4 py-4 text-xs text-red-600">
+                                <span className="flex items-center gap-2">
+                                  <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                                  Failed to load check details for this report.
+                                </span>
+                                <button
+                                  onClick={() => retryReportDetail(r.report_number)}
+                                  className="rounded-md border border-red-300 px-2 py-1 font-medium text-red-700 hover:bg-red-100"
+                                >
+                                  Retry
+                                </button>
+                              </div>
+                            )}
+                            {cacheEntry?.status === 'loaded' && (
+                              <>
+                                {r.decided_at && (
+                                  <div className="flex flex-wrap items-center gap-2 border-b border-dashed border-ink-100 px-4 py-2.5 text-xs text-ink-500">
+                                    <span className="font-medium text-ink-700">Approver decision:</span>
+                                    <DecisionBadge report={r} />
+                                    <span>
+                                      decided {formatDateTime(r.decided_at)}
+                                      {r.decided_by_name && ` by ${r.decided_by_name}`}
+                                    </span>
+                                  </div>
+                                )}
+                                <CheckDetailTable rows={cacheEntry.rows} />
+                              </>
+                            )}
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
                   )
                 })}
               </tbody>
@@ -1015,6 +1325,13 @@ export default function StaleReportHistory() {
                     {preview.meta.check_count} checks · {formatCurrency(preview.meta.total_amount)}
                     {preview.meta.generated_at && <> · generated {formatDateTime(preview.meta.generated_at)}</>}
                     {preview.meta.submitted_at && <> · submitted {formatDateTime(preview.meta.submitted_at)}</>}
+                    {preview.meta.decided_at && (
+                      <>
+                        {' '}
+                        · decided {formatDateTime(preview.meta.decided_at)}
+                        {preview.meta.decided_by_name && ` by ${preview.meta.decided_by_name}`}
+                      </>
+                    )}
                   </p>
                 )}
               </div>

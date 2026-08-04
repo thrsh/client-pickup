@@ -156,9 +156,7 @@ export default function AdminQR() {
     <>
       <div className="print:hidden">
         <div className="mb-6 flex items-start gap-3">
-          <span className="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-dashed border-ledger-stamp/40 bg-ledger-stamp/10 text-ledger-stampDark">
-            <QrCode className="h-4.5 w-4.5" />
-          </span>
+         
           <div>
             <p className="font-mono text-[11px] uppercase tracking-[0.2em] text-ledger-stampDark/80">
               Pickup counter signage

@@ -35,6 +35,8 @@ import { Select } from '../../components/ui/select'
 import { useToast } from '../../components/ui/toast'
 import { formatCurrency } from '../../lib/utils'
 import { logAuditEvent } from '../../lib/adminAuditApi'
+import { generateReportReferenceNumber } from '../../lib/reportReference'
+import { buildStaleCheckReportPdf, buildStaleCheckReportWorkbook } from '../../lib/staleCheckReportDocument'
 
 const BRAND = {
   teal: '#0d9488',
@@ -45,6 +47,7 @@ const BRAND_TEAL_RGB = [13, 148, 136]
 
 const MANUAL_FILL_COLOR = 'FFFFFBEA'
 const STALE_FILL_COLOR = 'FFFDE7CB'
+const FUTURE_FILL_COLOR = 'FFF3F4F6' // light gray — marks an in-progress period's not-yet-happened days
 const HEADER_FILL_COLOR = 'FF0D9488'
 const BORDER_COLOR = 'FFD1D5DB'
 
@@ -54,34 +57,12 @@ const STALE_FIXED_MONTHS = 6
 
 const LOGO_URL = '/logo.png'
 
-const BANK_LOGO_PATHS = {
-  BDO: '/bdo_logo.png',
-  BPI: '/bpi_logo.png',
-  CHINABANK: '/chinabank_logo.png',
-  LANDBANK: '/landbank_logo.png',
-  METROBANK: '/metrobank_logo.png',
-  PNB: '/pnb_logo.svg',
-  PSBANK: '/psbank_logo.svg',
-  RCBC: '/rcbc_logo.png',
-  SECURITYBANK: '/securitybank_logo.png',
-  UNIONBANK: '/unionbank_logo.png',
-}
-
-function normalizeBankKey(bank) {
-  if (!bank) return null
-  const key = String(bank).toUpperCase().replace(/[^A-Z]/g, '')
-  if (key.includes('BDO') || key.includes('BANCODEORO')) return 'BDO'
-  if (key.includes('BPI') || key.includes('BANKOFTHEPHILIPPINEISLANDS')) return 'BPI'
-  if (key.includes('CHINABANK') || key.includes('CHINABANKINGCORP')) return 'CHINABANK'
-  if (key.includes('LANDBANK')) return 'LANDBANK'
-  if (key.includes('METROBANK') || key.includes('METROPOLITANBANK')) return 'METROBANK'
-  if (key.includes('PNB') || key.includes('PHILIPPINENATIONALBANK')) return 'PNB'
-  if (key.includes('PSBANK') || key.includes('PHILIPPINESAVINGSBANK')) return 'PSBANK'
-  if (key.includes('RCBC') || key.includes('RIZALCOMMERCIALBANKING')) return 'RCBC'
-  if (key.includes('SECURITYBANK')) return 'SECURITYBANK'
-  if (key.includes('UNIONBANK') || key.includes('UNIONBANKOFTHEPHILIPPINES')) return 'UNIONBANK'
-  return null
-}
+// NOTE: bank logos have intentionally been removed from every generated
+// report and transmittal on this page — only the company logo (LOGO_URL,
+// above) is ever embedded now. This keeps every export visually
+// consistent regardless of which bank(s) a report covers, and matches
+// src/lib/staleCheckReportDocument.js, which never loaded per-bank logos
+// either.
 
 function getClientName(row) {
   return row.payor || ''
@@ -246,25 +227,6 @@ function loadLogoAssets() {
   return _logoAssetPromise
 }
 
-const _bankLogoAssetPromises = new Map()
-function loadBankLogoAsset(bankRaw) {
-  const key = normalizeBankKey(bankRaw)
-  if (!key || !BANK_LOGO_PATHS[key]) return Promise.resolve(null)
-  if (!_bankLogoAssetPromises.has(key)) {
-    _bankLogoAssetPromises.set(key, loadImageAsset(BANK_LOGO_PATHS[key]))
-  }
-  return _bankLogoAssetPromises.get(key)
-}
-
-function generateTransmittalNumber(bankLabel) {
-  const now = new Date()
-  const datePart = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`
-  const rawBankCode = bankLabel && bankLabel !== ALL_BANKS_LABEL ? bankLabel : 'MULTI'
-  const bankCode = (rawBankCode.replace(/[^A-Za-z0-9]+/g, '').slice(0, 6) || 'BANK').toUpperCase()
-  const randomSuffix = Math.random().toString(36).slice(2, 6).toUpperCase()
-  return `TRM-${bankCode}-${datePart}-${randomSuffix}`
-}
-
 // --- Excel column-width -> pixel helpers, used to place the letterhead logo
 // flush against the right edge of the sheet so it never sits on top of the
 // left-aligned company / report details. ---
@@ -315,7 +277,7 @@ const REPORT_CONFIG = {
       { header: 'Status', width: 14 },
       { header: 'Date Released', width: 14 },
       { header: 'Aging (Days)', width: 12 },
-      { header: 'OR No.', width: 14 },
+      { header: 'Receipt No.', width: 14 },
       { header: 'AR Collected (Y/N)', width: 16 },
       { header: '2307 Attached (Y/N)', width: 16 },
       { header: 'Remarks', width: 24 },
@@ -373,7 +335,7 @@ const REPORT_CONFIG = {
       { header: 'Date Approved', width: 14 },
       { header: 'Date Released', width: 14 },
       { header: 'Aging (Days)', width: 12 },
-      { header: 'OR No.', width: 14 },
+      { header: 'Receipt No.', width: 14 },
       { header: 'AR Collected (Y/N)', width: 16 },
       { header: '2307 Attached (Y/N)', width: 16 },
       { header: 'Remarks', width: 22 },
@@ -437,7 +399,7 @@ const REPORT_CONFIG = {
     showStaleness: true,
     cwtAttachedOnly: false,
     amountColIndex: 6,
-    legendText: `Rows tagged "Stale (${STALE_FIXED_MONTHS}mo+)" are ${STALE_FIXED_MONTHS}+ months old measured from check date (fixed, not editable). Use "Generate BPI Transmittal" below to produce a bank-ready transmittal for those checks.`,
+    legendText: `Rows tagged "Stale (${STALE_FIXED_MONTHS}mo+)" are ${STALE_FIXED_MONTHS}+ months old measured from check date (fixed, not editable). Use "Generate Transmittal" below to produce a bank-ready stale check transmittal for those checks.`,
     columns: [
       { header: 'No', width: 6 },
       { header: 'Bank', width: 20 },
@@ -948,16 +910,22 @@ export default function AdminReports() {
         })}
       </div>
 
-      {activeTab === 'checks' && <CheckReportsWizard />}
-      {activeTab === 'billing' && <BillingReport />}
-      {activeTab === 'summary' && <SummaryReports />}
+   <div className={activeTab === 'checks' ? '' : 'hidden'}>
+  <CheckReportsWizard />
+</div>
+<div className={activeTab === 'billing' ? '' : 'hidden'}>
+  <BillingReport />
+</div>
+<div className={activeTab === 'summary' ? '' : 'hidden'}>
+  <SummaryReports />
+</div>
     </div>
   )
 }
 
 const CHECK_SELECT_COLUMNS =
   'id, check_no, check_date, bank, payee, payor, amount, status, picked_up_by, picked_up_at, created_at, ' +
-  'or_no, ar_collected, attached_2307, collector_name, submitted_by_name, submitted_at, approved_by_name, ' +
+  'pickup_branch, or_no, ar_collected, attached_2307, collector_name, submitted_by_name, submitted_at, approved_by_name, ' +
   'approved_at, reservation_id, pickup_reservations(reserved_at, collector_name), upload_batches(uploaded_by)'
 
 function CheckReportsWizard() {
@@ -1002,12 +970,18 @@ function CheckReportsWizard() {
   })
 
   const { push } = useToast()
+  // Used only to derive the reference-number location code (pickupBranch)
+  // and the "Generated by" name on the stale check transmittal — Check
+  // Reports themselves are not branch-scoped.
+  const { pickupBranch, fullName, isAllBranches, loading: profileLoading, error: profileError } = useProfile()
+const generatedByDisplayName = fullName || null
 
   const activeFormConfig = REPORT_CONFIG[effectiveReportKey(reportType, includeAuditTrail)]
 
-  useEffect(() => {
-    loadDistinctNames()
-  }, [])
+ useEffect(() => {
+  loadDistinctNames()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, [profileLoading, isAllBranches, pickupBranch])
 
   useEffect(() => {
     return () => {
@@ -1023,60 +997,74 @@ function CheckReportsWizard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [transmittalState.url])
 
-  async function loadDistinctNames() {
-    try {
-      const data = await fetchAllRows(() => supabase.from('checks').select('payee, payor, bank'))
-      setPayeeOptions([...new Set((data || []).map((r) => r.payee).filter(Boolean))].sort())
-      setPayorOptions([...new Set((data || []).map((r) => r.payor).filter(Boolean))].sort())
-      setBankOptions([...new Set((data || []).map((r) => r.bank).filter(Boolean))].sort())
-    } catch {
-      // suggestions only
-    }
+async function loadDistinctNames() {
+  if (profileLoading) return
+  if (!isAllBranches && !pickupBranch) return
+  try {
+    const { data, error } = await supabase.rpc('distinct_check_fields', {
+      p_branch: isAllBranches ? null : pickupBranch,
+    })
+    if (error) throw error
+    const row = data?.[0]
+    setPayeeOptions(row?.payees || [])
+    setPayorOptions(row?.payors || [])
+    setBankOptions(row?.banks || [])
+  } catch {
+    // suggestions only
   }
+}
 
-  async function fetchAllChecks({
-    payees,
-    payeeAll,
-    payor,
-    banks,
-    bankAll,
-    statusFilter,
-    dateFrom,
-    dateTo,
-    extraDateColumn,
-    extraFrom,
-    extraTo,
-    staleFilter,
-    cwtAttachedOnly,
-  }) {
-    const PAGE = 1000
-    let from = 0
-    let all = []
-    while (true) {
-      let req = supabase
-        .from('checks')
-        .select(CHECK_SELECT_COLUMNS)
-        .eq('status', statusFilter)
-        .order('check_date', { ascending: true })
-        .range(from, from + PAGE - 1)
+async function fetchAllChecks({
+  payees,
+  payeeAll,
+  payor,
+  banks,
+  bankAll,
+  statusFilter,
+  dateFrom,
+  dateTo,
+  extraDateColumn,
+  extraFrom,
+  extraTo,
+  staleFilter,
+  cwtAttachedOnly,
+  branchScope, // NEW — pickupBranch to restrict to, or null for "all branches"
+}) {
+  const PAGE = 1000
+  let from = 0
+  let all = []
+  while (true) {
+    let req = supabase
+      .from('checks')
+      .select(CHECK_SELECT_COLUMNS)
+      .eq('status', statusFilter)
+      .order('check_date', { ascending: true })
+      .range(from, from + PAGE - 1)
 
-      if (!payeeAll && payees.length > 0) req = req.in('payee', payees)
-      if (payor && payor.trim()) req = req.ilike('payor', `%${payor.trim()}%`)
-      if (!bankAll && banks.length > 0) req = req.in('bank', banks)
-      if (dateFrom) req = req.gte('check_date', dateFrom)
-      if (dateTo) req = req.lte('check_date', dateTo)
-      if (extraDateColumn && extraFrom) req = req.gte(extraDateColumn, `${extraFrom}T00:00:00`)
-      if (extraDateColumn && extraTo) req = req.lte(extraDateColumn, `${extraTo}T23:59:59`)
-      if (staleFilter === 'stale') req = req.lte('check_date', monthsAgoDateInputValue(STALE_FIXED_MONTHS))
-      if (staleFilter === 'fresh') req = req.gt('check_date', monthsAgoDateInputValue(STALE_FIXED_MONTHS))
+    // The actual access-control-relevant filter: a branch-scoped verifier
+    // never sees another branch's checks in ANY report type generated from
+    // this wizard, including the stale-check transmittal. Applied here —
+    // not just in the UI — so it can't be bypassed by any combination of
+    // the other filters below.
+    if (branchScope) req = req.eq('pickup_branch', branchScope)
 
-      const { data, error } = await req
-      if (error) throw error
+    if (!payeeAll && payees.length > 0) req = req.in('payee', payees)
+    if (payor && payor.trim()) req = req.ilike('payor', `%${payor.trim()}%`)
+    if (!bankAll && banks.length > 0) req = req.in('bank', banks)
+    if (dateFrom) req = req.gte('check_date', dateFrom)
+    if (dateTo) req = req.lte('check_date', dateTo)
+    if (extraDateColumn && extraFrom) req = req.gte(extraDateColumn, `${extraFrom}T00:00:00`)
+    if (extraDateColumn && extraTo) req = req.lte(extraDateColumn, `${extraTo}T23:59:59`)
+    if (staleFilter === 'stale') req = req.lte('check_date', monthsAgoDateInputValue(STALE_FIXED_MONTHS))
+    if (staleFilter === 'fresh') req = req.gt('check_date', monthsAgoDateInputValue(STALE_FIXED_MONTHS))
 
-      all = all.concat(data || [])
-      if (!data || data.length < PAGE) break
-      from += PAGE
-    }
+    const { data, error } = await req
+    if (error) throw error
+
+    all = all.concat(data || [])
+    if (!data || data.length < PAGE) break
+    from += PAGE
+  }
 
     const uploaderIds = [...new Set(all.map((r) => r.upload_batches?.uploaded_by).filter(Boolean))]
     let uploaderNameById = new Map()
@@ -1090,36 +1078,50 @@ function CheckReportsWizard() {
       }
     }
 
-    const checkIds = all.map((r) => r.id)
-    const activityByCheckId = new Map()
-    const LOG_BATCH = 200
-    for (let i = 0; i < checkIds.length; i += LOG_BATCH) {
-      const batchIds = checkIds.slice(i, i + LOG_BATCH)
-      if (batchIds.length === 0) continue
-      const { data: logRows, error: logError } = await supabase
-        .from('check_activity_log')
-        .select('check_id, action, performed_at, submitted_by_name, approved_by_name, or_no, ar_collected, attached_2307')
-        .in('check_id', batchIds)
-        .in('action', ['submitted_for_approval', 'approved', 'released', 'picked_up'])
-        .order('performed_at', { ascending: true })
-      if (logError) continue
-      for (const log of logRows || []) {
-        const entry = activityByCheckId.get(log.check_id) || {}
-        if (log.action === 'submitted_for_approval') {
-          entry.submittedAt = log.performed_at
-          entry.submittedByName = log.submitted_by_name || entry.submittedByName
-        } else if (log.action === 'approved') {
-          entry.approvedAt = log.performed_at
-          entry.approvedByName = log.approved_by_name || entry.approvedByName
-        } else if (log.action === 'released' || log.action === 'picked_up') {
-          entry.releasedAt = log.performed_at
-          if (log.or_no) entry.orNo = log.or_no
-          if (log.ar_collected != null) entry.arCollected = log.ar_collected
-          if (log.attached_2307 != null) entry.attached2307 = log.attached_2307
-        }
-        activityByCheckId.set(log.check_id, entry)
-      }
+const checkIds = all.map((r) => r.id)
+const activityByCheckId = new Map()
+const LOG_BATCH = 200
+
+// Fire every batch concurrently instead of one-at-a-time — for a 5,000-row
+// report this cuts ~25 sequential round trips down to the time of the
+// single slowest one. Merge order is deterministic regardless of which
+// batch resolves first because we still walk batches in original order
+// when applying results.
+const batchIdGroups = []
+for (let i = 0; i < checkIds.length; i += LOG_BATCH) {
+  batchIdGroups.push(checkIds.slice(i, i + LOG_BATCH))
+}
+
+const batchResults = await Promise.all(
+  batchIdGroups.map((batchIds) =>
+    supabase
+      .from('check_activity_log')
+      .select('check_id, action, performed_at, submitted_by_name, approved_by_name, or_no, ar_collected, attached_2307')
+      .in('check_id', batchIds)
+      .in('action', ['submitted_for_approval', 'approved', 'released', 'picked_up'])
+      .order('performed_at', { ascending: true })
+  )
+)
+
+for (const { data: logRows, error: logError } of batchResults) {
+  if (logError) continue
+  for (const log of logRows || []) {
+    const entry = activityByCheckId.get(log.check_id) || {}
+    if (log.action === 'submitted_for_approval') {
+      entry.submittedAt = log.performed_at
+      entry.submittedByName = log.submitted_by_name || entry.submittedByName
+    } else if (log.action === 'approved') {
+      entry.approvedAt = log.performed_at
+      entry.approvedByName = log.approved_by_name || entry.approvedByName
+    } else if (log.action === 'released' || log.action === 'picked_up') {
+      entry.releasedAt = log.performed_at
+      if (log.or_no) entry.orNo = log.or_no
+      if (log.ar_collected != null) entry.arCollected = log.ar_collected
+      if (log.attached_2307 != null) entry.attached2307 = log.attached_2307
     }
+    activityByCheckId.set(log.check_id, entry)
+  }
+}
 
     const merged = all.map((r) => {
       const activity = activityByCheckId.get(r.id) || {}
@@ -1169,113 +1171,155 @@ function CheckReportsWizard() {
     }
     return ''
   }
+function handleReportTypeChange(e) {
+  const value = e.target.value
+  setReportType(value)
+  if (value !== 'released') setIncludeAuditTrail(false)
+  if (value !== 'unreleased') setStalenessFilter('all')
+  setExtraDateFrom('')
+  setExtraDateTo('')
+  setFormError('')
 
-  function handleReportTypeChange(e) {
-    const value = e.target.value
-    setReportType(value)
-    if (value !== 'released') setIncludeAuditTrail(false)
-    if (value !== 'unreleased') setStalenessFilter('all')
-    setExtraDateFrom('')
-    setExtraDateTo('')
-    setFormError('')
+  // A CWT report type only ever includes checks with a 2307 on file — a
+  // bank filter picked while on a non-CWT type can silently produce zero
+  // matches once the CWT-only exclusion kicks in. Clearing it here means
+  // the "no matching checks" message the user sees, if any, is actually
+  // about the new type's own constraints, not a leftover filter.
+  const newConfig = REPORT_CONFIG[effectiveReportKey(value, includeAuditTrail)]
+  if (newConfig.cwtAttachedOnly) {
+    setReportBankAll(true)
+    setReportBanks([])
   }
+}
 
-  async function handlePreview() {
-    const validationError = validateForm()
-    if (validationError) {
-      setFormError(validationError)
+async function handlePreview() {
+  if (profileLoading) {
+    setFormError('Still loading your profile — please wait a moment and try again.')
+    return
+  }
+  // Fail closed: never fall through to an unscoped query for a verifier
+  // whose branch didn't resolve — same rule Stale Watch enforces.
+  if (!isAllBranches && !pickupBranch) {
+    setFormError("Your account isn't assigned to a branch, so reports can't be scoped correctly. Ask an admin to set your branch in your profile.")
+    return
+  }
+  const validationError = validateForm()
+  if (validationError) {
+    setFormError(validationError)
+    return
+  }
+  setFormError('')
+  setFetchError('')
+  setFetching(true)
+  try {
+    const configKey = effectiveReportKey(reportType, includeAuditTrail)
+    const config = REPORT_CONFIG[configKey]
+    const branchScope = isAllBranches ? null : pickupBranch
+    const rows = await fetchAllChecks({
+      payees: reportPayees,
+      payeeAll: reportPayeeAll,
+      payor: reportPayor,
+      banks: reportBanks,
+      bankAll: reportBankAll,
+      statusFilter: config.statusFilter,
+      dateFrom: reportDateFrom,
+      dateTo: reportDateTo,
+      extraDateColumn: config.extraDateColumn,
+      extraFrom: config.extraDateColumn ? extraDateFrom : '',
+      extraTo: config.extraDateColumn ? extraDateTo : '',
+      staleFilter: config.showStaleness ? stalenessFilter : 'all',
+      cwtAttachedOnly: !!config.cwtAttachedOnly,
+      branchScope,
+    })
+
+    if (rows.length === 0) {
+      setFormError(
+        config.cwtAttachedOnly
+          ? 'No matching checks with a 2307 on file were found for that filter combination.'
+          : 'No matching checks found for that filter combination.'
+      )
       return
     }
-    setFormError('')
-    setFetchError('')
-    setFetching(true)
-    try {
-      const configKey = effectiveReportKey(reportType, includeAuditTrail)
-      const config = REPORT_CONFIG[configKey]
-      const rows = await fetchAllChecks({
-        payees: reportPayees,
-        payeeAll: reportPayeeAll,
-        payor: reportPayor,
-        banks: reportBanks,
-        bankAll: reportBankAll,
-        statusFilter: config.statusFilter,
-        dateFrom: reportDateFrom,
-        dateTo: reportDateTo,
-        extraDateColumn: config.extraDateColumn,
-        extraFrom: config.extraDateColumn ? extraDateFrom : '',
-        extraTo: config.extraDateColumn ? extraDateTo : '',
-        staleFilter: config.showStaleness ? stalenessFilter : 'all',
-        cwtAttachedOnly: !!config.cwtAttachedOnly,
-      })
 
-      if (rows.length === 0) {
-        setFormError(
-          config.cwtAttachedOnly
-            ? 'No matching checks with a 2307 on file were found for that filter combination.'
-            : 'No matching checks found for that filter combination.'
-        )
-        return
-      }
+    const referenceNumber = generateReportReferenceNumber({
+      location: pickupBranch,
+      reportType: configKey,
+      bank: reportBanks,
+      bankAll: reportBankAll,
+      date: new Date(),
+    })
 
-      setRawRows(rows)
-      setPreviewMeta({
-        reportType,
-        configKey,
-        includeAuditTrail: configKey === 'released_audit',
-        payees: reportPayeeAll ? [] : reportPayees,
-        payeeAll: reportPayeeAll,
-        banks: reportBankAll ? [] : reportBanks,
-        bankAll: reportBankAll,
-        payor: reportPayor.trim(),
-        releasedDate,
-        dateFrom: reportDateFrom,
-        dateTo: reportDateTo,
-        extraDateColumn: config.extraDateColumn,
-        extraDateLabel: config.extraDateLabel,
-        extraDateFrom: config.extraDateColumn ? extraDateFrom : '',
-        extraDateTo: config.extraDateColumn ? extraDateTo : '',
-        stalenessFilter: config.showStaleness ? stalenessFilter : 'all',
-      })
-      setSearchTerm('')
-      setPage(1)
-      setStep('preview')
-    } catch (err) {
-      setFormError(friendlyError(err))
-    } finally {
-      setFetching(false)
-    }
+    setRawRows(rows)
+    setPreviewMeta({
+      reportType,
+      configKey,
+      referenceNumber,
+      includeAuditTrail: configKey === 'released_audit',
+      payees: reportPayeeAll ? [] : reportPayees,
+      payeeAll: reportPayeeAll,
+      banks: reportBankAll ? [] : reportBanks,
+      bankAll: reportBankAll,
+      payor: reportPayor.trim(),
+      releasedDate,
+      dateFrom: reportDateFrom,
+      dateTo: reportDateTo,
+      extraDateColumn: config.extraDateColumn,
+      extraDateLabel: config.extraDateLabel,
+      extraDateFrom: config.extraDateColumn ? extraDateFrom : '',
+      extraDateTo: config.extraDateColumn ? extraDateTo : '',
+      stalenessFilter: config.showStaleness ? stalenessFilter : 'all',
+      branchScope, // NEW — carried into handleRefresh below
+      branchLabel: isAllBranches ? 'All Branches' : pickupBranch, // NEW — for the preview header
+    })
+    setSearchTerm('')
+    setPage(1)
+    setStep('preview')
+  } catch (err) {
+    setFormError(friendlyError(err))
+  } finally {
+    setFetching(false)
   }
+}
 
-  async function handleRefresh() {
-    if (!previewMeta) return
-    setFetchError('')
-    setFetching(true)
-    try {
-      const config = REPORT_CONFIG[previewMeta.configKey]
-      const rows = await fetchAllChecks({
-        payees: previewMeta.payees,
-        payeeAll: previewMeta.payeeAll,
-        payor: previewMeta.payor,
-        banks: previewMeta.banks,
-        bankAll: previewMeta.bankAll,
-        statusFilter: config.statusFilter,
-        dateFrom: previewMeta.dateFrom,
-        dateTo: previewMeta.dateTo,
-        extraDateColumn: previewMeta.extraDateColumn,
-        extraFrom: previewMeta.extraDateFrom,
-        extraTo: previewMeta.extraDateTo,
-        staleFilter: previewMeta.stalenessFilter,
-        cwtAttachedOnly: !!config.cwtAttachedOnly,
-      })
-      setRawRows(rows)
-      setPage(1)
-      push?.({ variant: 'success', title: 'Preview refreshed', description: `${rows.length} record${rows.length === 1 ? '' : 's'} loaded.` })
-    } catch (err) {
-      setFetchError(friendlyError(err))
-    } finally {
-      setFetching(false)
-    }
+async function handleRefresh() {
+  if (!previewMeta) return
+  setFetchError('')
+  setFetching(true)
+  try {
+    const config = REPORT_CONFIG[previewMeta.configKey]
+    const rows = await fetchAllChecks({
+      payees: previewMeta.payees,
+      payeeAll: previewMeta.payeeAll,
+      payor: previewMeta.payor,
+      banks: previewMeta.banks,
+      bankAll: previewMeta.bankAll,
+      statusFilter: config.statusFilter,
+      dateFrom: previewMeta.dateFrom,
+      dateTo: previewMeta.dateTo,
+      extraDateColumn: previewMeta.extraDateColumn,
+      extraFrom: previewMeta.extraDateFrom,
+      extraTo: previewMeta.extraDateTo,
+      staleFilter: previewMeta.stalenessFilter,
+      cwtAttachedOnly: !!config.cwtAttachedOnly,
+      branchScope: previewMeta.branchScope, // NEW — same scope as the original preview
+    })
+    const referenceNumber = generateReportReferenceNumber({
+      location: pickupBranch,
+      reportType: previewMeta.configKey,
+      bank: previewMeta.banks,
+      bankAll: previewMeta.bankAll,
+      date: new Date(),
+    })
+    setRawRows(rows)
+    setPreviewMeta((m) => ({ ...m, referenceNumber }))
+    setPage(1)
+    push?.({ variant: 'success', title: 'Preview refreshed', description: `${rows.length} record${rows.length === 1 ? '' : 's'} loaded.` })
+  } catch (err) {
+    setFetchError(friendlyError(err))
+  } finally {
+    setFetching(false)
   }
+}
 
   function handleBackToFilters() {
     setStep('form')
@@ -1291,9 +1335,13 @@ function CheckReportsWizard() {
     sheet.getRow(rowNum).height = style.height || 18
   }
 
-  function buildHeaderLines(configKey, { payeeDisplay, bankDisplay, payor, releasedDateValue, dateFrom, dateTo, extraDateLabel, extraDateFrom, extraDateTo }) {
+  function buildHeaderLines(
+    configKey,
+    { referenceNumber, payeeDisplay, bankDisplay, payor, releasedDateValue, dateFrom, dateTo, extraDateLabel, extraDateFrom, extraDateTo }
+  ) {
     const config = REPORT_CONFIG[configKey]
-    const lines = [{ text: `Client Name: ${payor || '—'}`, size: 11, bold: true }]
+    const lines = [{ text: `Reference No: ${referenceNumber || '—'}`, size: 10.5, bold: true, color: HEADER_FILL_COLOR }]
+    lines.push({ text: `Client Name: ${payor || '—'}`, size: 11, bold: true })
     lines.push({ text: `Payee: ${payeeDisplay || '—'}`, size: 10 })
     lines.push({ text: `Bank: ${bankDisplay || '—'}`, size: 10 })
     lines.push({ text: `Report Date: ${formatExcelDateLabel(new Date())}`, size: 10 })
@@ -1353,7 +1401,7 @@ function CheckReportsWizard() {
     r++
 
     for (const line of buildHeaderLines(configKey, headerArgs)) {
-      addHeaderRow(sheet, r, colCount, line.text, { bold: line.bold, size: line.size }, headerStartCol)
+      addHeaderRow(sheet, r, colCount, line.text, { bold: line.bold, size: line.size, color: line.color }, headerStartCol)
       r++
     }
 
@@ -1465,10 +1513,13 @@ function CheckReportsWizard() {
     doc.setTextColor(60, 60, 60)
     for (const line of buildHeaderLines(configKey, headerArgs)) {
       if (line.bold) doc.setFont('helvetica', 'bold')
+      if (line.color) doc.setTextColor(...BRAND_TEAL_RGB)
+      else doc.setTextColor(60, 60, 60)
       doc.text(line.text, margin, y)
       if (line.bold) doc.setFont('helvetica', 'normal')
       y += 14
     }
+    doc.setTextColor(60, 60, 60)
 
     if (configKey === 'unreleased' && bankBreakdown.length > 0) {
       y += 6
@@ -1535,175 +1586,9 @@ function CheckReportsWizard() {
     return doc
   }
 
-  async function buildTransmittalPdf(transmittalNumber, staleRows, { payorLabel }) {
-    const logo = await loadLogoAssets()
-    const doc = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'a4' })
-    const margin = 40
-    const pageWidth = doc.internal.pageSize.getWidth()
-    const pageHeight = doc.internal.pageSize.getHeight()
-
-    const byBank = new Map()
-    for (const r of staleRows) {
-      const bank = r.bank || 'Unspecified'
-      if (!byBank.has(bank)) byBank.set(bank, [])
-      byBank.get(bank).push(r)
-    }
-    const bankEntries = [...byBank.entries()].sort((a, b) => a[0].localeCompare(b[0]))
-    const grandTotalAmount = staleRows.reduce((sum, r) => sum + Number(r.amount || 0), 0)
-    const bankLogoByName = new Map(await Promise.all(bankEntries.map(async ([bank]) => [bank, await loadBankLogoAsset(bank)])))
-
-    const logoBox = logo ? fitToHeight(logo, 52, 130) : null
-    if (logo?.dataUrl && logoBox) {
-      try {
-        doc.addImage(logo.dataUrl, 'PNG', margin, 28, logoBox.width, logoBox.height)
-      } catch (err) {
-        console.warn('Could not embed logo into transmittal:', err)
-      }
-    }
-    const textX = margin + (logoBox ? logoBox.width + 16 : 0)
-
-    doc.setFont('helvetica', 'bold')
-    doc.setFontSize(14)
-    doc.setTextColor(20, 20, 20)
-    doc.text('CREDIT SOLUTIONS & BUSINESS ALLIANCES, INC.', textX, 46, { maxWidth: pageWidth - margin - textX })
-
-    doc.setFont('helvetica', 'normal')
-    doc.setFontSize(10)
-    doc.setTextColor(90, 90, 90)
-    doc.text('Check Transmittal — Stale / Unreleased Checks Return to Bank', textX, 62, { maxWidth: pageWidth - margin - textX })
-
-    let y = Math.max(28 + (logoBox?.height || 0) + 16, 90)
-    doc.setDrawColor(...BRAND_TEAL_RGB)
-    doc.setLineWidth(1)
-    doc.line(margin, y, pageWidth - margin, y)
-    y += 20
-
-    const banksLabel = bankEntries.map(([bank]) => bank).join(', ') || 'None'
-
-    doc.setFont('helvetica', 'bold')
-    doc.setFontSize(10)
-    doc.setTextColor(20, 20, 20)
-    doc.text(`Transmittal No: ${transmittalNumber}`, margin, y)
-    doc.text(
-      `Date Generated: ${formatExcelDateLabel(new Date())}, ${new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}`,
-      margin,
-      y + 16
-    )
-
-    doc.setFont('helvetica', 'normal')
-    doc.text(`Client / Payor: ${payorLabel || 'Multiple / All Clients'}`, margin, y + 32, { maxWidth: pageWidth - margin * 2 })
-    doc.text(`Banks Included: ${banksLabel}`, margin, y + 48, { maxWidth: pageWidth - margin * 2 })
-    doc.text(
-      `Total Checks: ${staleRows.length}  ·  Grand Total: PHP ${grandTotalAmount.toLocaleString('en-US', {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2,
-      })}  ·  Aging threshold: ${STALE_FIXED_MONTHS}+ months from check date (fixed)`,
-      margin,
-      y + 64,
-      { maxWidth: pageWidth - margin * 2 }
-    )
-
-    y += 88
-
-    let grandTotal = 0
-    for (const [bank, rowsForBank] of bankEntries) {
-      const bankLogo = bankLogoByName.get(bank)
-      const bankLogoBox = bankLogo ? fitToHeight(bankLogo, 24, 70) : null
-
-      if (y > pageHeight - 170) {
-        doc.addPage()
-        y = 40
-      }
-
-      let bankTextX = margin
-      if (bankLogo?.dataUrl && bankLogoBox) {
-        try {
-          doc.addImage(bankLogo.dataUrl, 'PNG', margin, y - bankLogoBox.height + 4, bankLogoBox.width, bankLogoBox.height)
-          bankTextX = margin + bankLogoBox.width + 8
-        } catch (err) {
-          console.warn(`Could not embed logo for bank "${bank}":`, err)
-        }
-      }
-
-      doc.setFont('helvetica', 'bold')
-      doc.setFontSize(11)
-      doc.setTextColor(...BRAND_TEAL_RGB)
-      doc.text(`RETURN TO: ${bank.toUpperCase()}`, bankTextX, y)
-      y += 18
-
-      const head = [['No', 'Check No.', 'Payee', 'Client Name', 'Check Date', 'Aging (Days)', 'Amount']]
-      let bankTotal = 0
-      const body = rowsForBank.map((r, i) => {
-        bankTotal += Number(r.amount || 0)
-        return [
-          String(i + 1),
-          r.check_no || '',
-          r.payee || '',
-          getClientName(r),
-          r.check_date ? new Date(r.check_date).toLocaleDateString('en-US') : '',
-          String(daysBetween(r.check_date, null) ?? ''),
-          Number(r.amount || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
-        ]
-      })
-      body.push(['', '', '', '', '', 'Subtotal', bankTotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })])
-      grandTotal += bankTotal
-      const subtotalRowIndex = body.length - 1
-
-      autoTable(doc, {
-        head,
-        body,
-        startY: y + 6,
-        margin: { left: margin, right: margin },
-        styles: { fontSize: 8, cellPadding: 4, textColor: [55, 65, 81], lineColor: [209, 213, 219], lineWidth: 0.5 },
-        headStyles: { fillColor: BRAND_TEAL_RGB, textColor: 255, fontStyle: 'bold', halign: 'center' },
-        columnStyles: { 6: { halign: 'right' } },
-        didParseCell: (data) => {
-          if (data.row.section === 'body' && data.row.index === subtotalRowIndex) data.cell.styles.fontStyle = 'bold'
-        },
-      })
-      y = doc.lastAutoTable.finalY + 24
-    }
-
-    if (y > pageHeight - 130) {
-      doc.addPage()
-      y = 60
-    }
-
-    doc.setFont('helvetica', 'bold')
-    doc.setFontSize(11)
-    doc.setTextColor(20, 20, 20)
-    doc.text(
-      `GRAND TOTAL: ${grandTotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
-      pageWidth - margin - 230,
-      y
-    )
-    y += 46
-
-    doc.setDrawColor(120, 120, 120)
-    doc.setLineWidth(0.75)
-    const sigY = Math.min(Math.max(y, pageHeight - 90), pageHeight - 60)
-    doc.line(margin, sigY, margin + 190, sigY)
-    doc.line(pageWidth - margin - 190, sigY, pageWidth - margin, sigY)
-
-    doc.setFont('helvetica', 'normal')
-    doc.setFontSize(9)
-    doc.setTextColor(60, 60, 60)
-    doc.text('Prepared by / Signature over printed name', margin, sigY + 13)
-    doc.text('Received by (Bank Representative)', pageWidth - margin - 190, sigY + 13)
-
-    const pageCount = doc.internal.getNumberOfPages()
-    for (let p = 1; p <= pageCount; p++) {
-      doc.setPage(p)
-      doc.setFontSize(8)
-      doc.setTextColor(150, 150, 150)
-      doc.text(`Transmittal ${transmittalNumber} · Page ${p} of ${pageCount}`, margin, pageHeight - 20)
-    }
-
-    return doc
-  }
-
   function reportMetaArgs() {
     return {
+      referenceNumber: previewMeta.referenceNumber,
       payeeDisplay: formatMultiSelectDisplay(previewMeta.payeeAll, previewMeta.payees, ALL_PAYEES_LABEL),
       bankDisplay: formatMultiSelectDisplay(previewMeta.bankAll, previewMeta.banks, ALL_BANKS_LABEL),
       payor: previewMeta.payor,
@@ -1717,11 +1602,10 @@ function CheckReportsWizard() {
   }
 
   function reportFilename(config) {
-    const stamp = new Date().toISOString().slice(0, 10)
     const safePayor = (previewMeta.payor || 'all-clients').replace(/[^a-z0-9]+/gi, '_')
     const payeeTag = multiSelectFileTag(previewMeta.payeeAll, previewMeta.payees, 'all-payees')
     const bankTag = multiSelectFileTag(previewMeta.bankAll, previewMeta.banks, 'all-banks')
-    return `${config.fileTag}-${safePayor}-${payeeTag}-${bankTag}-${stamp}`
+    return `${config.fileTag}-${safePayor}-${payeeTag}-${bankTag}-${previewMeta.referenceNumber}`
   }
 
   async function handleDownload() {
@@ -1753,6 +1637,7 @@ function CheckReportsWizard() {
       logAuditEvent('report_generated', {
         format: 'xlsx',
         report_type: previewMeta.configKey,
+        reference_no: previewMeta.referenceNumber,
         row_count: rawRows.length,
         payor: previewMeta.payor || null,
         bank_filter: previewMeta.bankAll ? 'all' : previewMeta.banks,
@@ -1807,6 +1692,7 @@ function CheckReportsWizard() {
       logAuditEvent('report_generated', {
         format: 'pdf',
         report_type: previewMeta.configKey,
+        reference_no: previewMeta.referenceNumber,
         row_count: rawRows.length,
         payor: previewMeta.payor || null,
         bank_filter: previewMeta.bankAll ? 'all' : previewMeta.banks,
@@ -1818,6 +1704,14 @@ function CheckReportsWizard() {
     }
   }
 
+  // Generates the stale-check transmittal for the "unreleased" report tab.
+  // This now calls the exact same buildStaleCheckReportPdf /
+  // buildStaleCheckReportWorkbook functions used on the Stale Watch page
+  // (src/lib/staleCheckReportDocument.js) instead of a bespoke, page-local
+  // builder, so the transmittal produced from Reports is pixel-identical
+  // to the one produced from Stale Watch — same two-copy layout, same
+  // watermark, same signature block, and (since that shared module never
+  // touches per-bank logos) no bank logo on either.
   async function handleGenerateTransmittal() {
     if (!previewMeta || previewMeta.reportType !== 'unreleased') return
     const staleRows = rawRows.filter((r) => isStale(r.check_date))
@@ -1831,16 +1725,28 @@ function CheckReportsWizard() {
     }
     setTransmittalState((s) => ({ ...s, generating: true }))
     try {
-      const bankLabel = formatMultiSelectDisplay(previewMeta.bankAll, previewMeta.banks, ALL_BANKS_LABEL)
-      const transmittalNumber = generateTransmittalNumber(bankLabel)
-      const doc = await buildTransmittalPdf(transmittalNumber, staleRows, { payorLabel: previewMeta.payor })
+      const referenceNumber = generateReportReferenceNumber({
+        location: pickupBranch,
+        reportType: 'stale',
+        bank: previewMeta.banks,
+        bankAll: previewMeta.bankAll,
+        date: new Date(),
+      })
+      const docArgs = {
+        reportNumber: referenceNumber,
+        generatedAt: new Date(),
+        generatedByName: generatedByDisplayName,
+        status: 'generated',
+        rows: staleRows,
+      }
+      const doc = await buildStaleCheckReportPdf(docArgs)
       const blobUrl = doc.output('bloburl')
       setTransmittalState((s) => {
         if (s.url) URL.revokeObjectURL(s.url)
-        return { open: true, url: blobUrl, generating: false, transmittalNumber, staleCount: staleRows.length }
+        return { open: true, url: blobUrl, generating: false, transmittalNumber: referenceNumber, staleCount: staleRows.length }
       })
       logAuditEvent('transmittal_generated', {
-        transmittal_no: transmittalNumber,
+        transmittal_no: referenceNumber,
         check_count: staleRows.length,
         total_amount: staleRows.reduce((sum, r) => sum + Number(r.amount || 0), 0),
         payor: previewMeta.payor || null,
@@ -1857,8 +1763,33 @@ function CheckReportsWizard() {
     if (!transmittalState.url || !transmittalState.transmittalNumber) return
     const a = document.createElement('a')
     a.href = transmittalState.url
-    a.download = `bpi-transmittal-${transmittalState.transmittalNumber}.pdf`
+    a.download = `stale-check-transmittal-${transmittalState.transmittalNumber}.pdf`
     a.click()
+  }
+
+  async function handleDownloadTransmittalExcel() {
+    if (!previewMeta || previewMeta.reportType !== 'unreleased' || !transmittalState.transmittalNumber) return
+    const staleRows = rawRows.filter((r) => isStale(r.check_date))
+    if (staleRows.length === 0) return
+    try {
+      const workbook = await buildStaleCheckReportWorkbook({
+        reportNumber: transmittalState.transmittalNumber,
+        generatedAt: new Date(),
+        generatedByName: generatedByDisplayName,
+        status: 'generated',
+        rows: staleRows,
+      })
+      const buffer = await workbook.xlsx.writeBuffer()
+      const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `stale-check-transmittal-${transmittalState.transmittalNumber}.xlsx`
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      push?.({ variant: 'error', title: 'Excel download failed', description: friendlyError(err) })
+    }
   }
 
   function closeTransmittalPreview() {
@@ -1984,8 +1915,8 @@ function CheckReportsWizard() {
                   <div className="inline-flex rounded-md border border-gray-200 bg-white p-0.5">
                     {[
                       { value: 'all', label: 'All checks' },
-                      { value: 'fresh', label: 'Not yet stale' },
-                      { value: 'stale', label: `Stale (${STALE_FIXED_MONTHS}mo+)` },
+                      { value: 'fresh', label: 'Expiring Checks' },
+                      { value: 'stale', label: `Expired Checks (Stale)` },
                     ].map((opt) => (
                       <button
                         key={opt.value}
@@ -2117,7 +2048,8 @@ function CheckReportsWizard() {
                   )}
                 </CardTitle>
                 <CardDescription>
-                  Client Name (Payor):{' '}
+                  Reference No: <span className="font-mono font-medium text-gray-700">{previewMeta.referenceNumber}</span>
+                  {' · '}Client Name (Payor):{' '}
                   <span className="font-medium text-gray-700">{previewMeta.payor || 'All clients'}</span>
                   {' · '}Bank(s):{' '}
                   <span className="font-medium text-gray-700">
@@ -2171,7 +2103,7 @@ function CheckReportsWizard() {
               <div className="rounded-lg border border-amber-100 bg-amber-50/40 p-3">
                 <div className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-amber-800">
                   <AlertTriangle className="h-3.5 w-3.5" />
-                  Stale checks by bank — use this to route BPI transmittals
+                  Stale checks by bank — use this to route bank transmittals
                 </div>
                 <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
                   {staleBankBreakdown.map((b) => (
@@ -2355,23 +2287,27 @@ function CheckReportsWizard() {
               <div>
                 <h3 className="flex items-center gap-2 text-sm font-semibold text-gray-900">
                   <Truck className="h-4 w-4 text-teal-600" />
-                  BPI Transmittal — {transmittalState.transmittalNumber}
+                  Stale Check Transmittal — {transmittalState.transmittalNumber}
                 </h3>
                 <p className="text-xs text-gray-500">
                   {transmittalState.staleCount} check{transmittalState.staleCount === 1 ? '' : 's'} included, grouped by bank with subtotals.
                 </p>
               </div>
               <div className="flex items-center gap-2">
+                <Button size="sm" variant="outline" onClick={handleDownloadTransmittalExcel}>
+                  <FileSpreadsheet className="mr-1.5 h-3.5 w-3.5" />
+                  Excel
+                </Button>
                 <Button size="sm" onClick={handleDownloadTransmittal} className="bg-teal-600 text-white hover:bg-teal-700">
                   <Download className="mr-1.5 h-3.5 w-3.5" />
-                  Download
+                  PDF
                 </Button>
                 <button onClick={closeTransmittalPreview} className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600" aria-label="Close transmittal preview">
                   <X className="h-4 w-4" />
                 </button>
               </div>
             </div>
-            <iframe title="BPI transmittal preview" src={transmittalState.url} className="flex-1 rounded-b-lg" />
+            <iframe title="Stale check transmittal preview" src={transmittalState.url} className="flex-1 rounded-b-lg" />
           </div>
         </div>
       )}
@@ -2444,17 +2380,39 @@ function todayManilaDateInputValue() {
   return `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`
 }
 
+// Dropdown is capped to the current calendar month plus the previous 2
+// months (3 months total, 6 half-month periods) — NOT the full 13-month
+// history this used to build. The still-in-progress half is included
+// (flagged via `isCurrent`) rather than hidden, so an admin can preview
+// it; `handleGenerate` further below is what blanks out any day within it
+// that hasn't happened yet.
+const PERIOD_DROPDOWN_MONTHS_BACK = 3
+
 function buildPeriodOptions() {
   const options = []
-  const { year: nowYear, month: nowMonth } = getManilaNowParts()
-  for (let i = 0; i < 13; i++) {
+  const { year: nowYear, month: nowMonth, day: nowDay } = getManilaNowParts()
+  for (let i = 0; i < PERIOD_DROPDOWN_MONTHS_BACK; i++) {
     const d = new Date(nowYear, nowMonth - i, 1)
     const year = d.getFullYear()
     const month = d.getMonth()
     const monthLabel = d.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
     const lastDay = new Date(year, month + 1, 0).getDate()
-    options.push({ value: `${year}-${String(month + 1).padStart(2, '0')}-1`, label: `${monthLabel} 1-15`, startDay: 1, endDay: 15, year, month })
-    options.push({ value: `${year}-${String(month + 1).padStart(2, '0')}-16`, label: `${monthLabel} 16-${lastDay}`, startDay: 16, endDay: lastDay, year, month })
+    const halves = [
+      { startDay: 1, endDay: 15, baseLabel: `${monthLabel} 1-15` },
+      { startDay: 16, endDay: lastDay, baseLabel: `${monthLabel} 16-${lastDay}` },
+    ]
+    halves.forEach((h) => {
+      const isCurrent = year === nowYear && month === nowMonth && nowDay >= h.startDay && nowDay <= h.endDay
+      options.push({
+        value: `${year}-${String(month + 1).padStart(2, '0')}-${h.startDay}`,
+        label: isCurrent ? `${h.baseLabel} (In Progress)` : h.baseLabel,
+        startDay: h.startDay,
+        endDay: h.endDay,
+        year,
+        month,
+        isCurrent,
+      })
+    })
   }
   return options
 }
@@ -2471,64 +2429,77 @@ function dateKey(d) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
 
-function periodEndDateInputValue(period) {
-  return `${period.year}-${String(period.month + 1).padStart(2, '0')}-${String(period.endDay).padStart(2, '0')}`
+function isFutureManilaDay(d) {
+  return dateKey(d) > todayManilaDateInputValue()
 }
-
+const ALL_BRANCHES_LABEL = 'All Branches'
+const ALL_BRANCHES_VALUE = '__all_branches__'
 function BillingReport() {
   const {
     pickupBranch,
     isAllBranches,
     loading: profileLoading,
     error: profileError,
+    fullName,
   } = useProfile()
 
-  const allPeriods = useMemo(() => buildPeriodOptions(), [])
-  // A period can only be billed once it has fully elapsed, judged against
-  // Manila time (see todayManilaDateInputValue above) — not the browser's
-  // local clock. Comparing with "<" (not "<=") means the period containing
-  // today is excluded until tomorrow, so the most recent selectable period
-  // is always the last one that has actually closed as of the current
-  // Manila date.
-  const completedPeriods = useMemo(
-    () => allPeriods.filter((p) => periodEndDateInputValue(p) < todayManilaDateInputValue()),
-    [allPeriods]
-  )
-  const [periodValue, setPeriodValue] = useState(completedPeriods[0]?.value || '')
+  const periodOptions = useMemo(() => buildPeriodOptions(), [])
+  const defaultPeriodValue = periodOptions.find((p) => p.isCurrent)?.value || periodOptions[0]?.value || ''
+  const [periodValue, setPeriodValue] = useState(defaultPeriodValue)
   const [bank, setBank] = useState('')
   const [bankOptions, setBankOptions] = useState([])
-  const [unitCost, setUnitCost] = useState('')
+
+  const [branch, setBranch] = useState(ALL_BRANCHES_VALUE)
+  const [branchOptions, setBranchOptions] = useState([])
+
+  const [unitCost, setUnitCost] = useState('') // rate per item UPLOADED
+  const [deliveredRate, setDeliveredRate] = useState('') // rate per item DELIVERED
   const [checkDateFrom, setCheckDateFrom] = useState('')
   const [checkDateTo, setCheckDateTo] = useState('')
   const [rows, setRows] = useState(null)
+  const [branchBreakdown, setBranchBreakdown] = useState([])
+
+  const [reportMeta, setReportMeta] = useState(null)
   const [fetching, setFetching] = useState(false)
   const [error, setError] = useState('')
   const [downloading, setDownloading] = useState(false)
   const [downloadingPdf, setDownloadingPdf] = useState(false)
   const { push } = useToast()
 
-  // Bank options — and every query below — are scoped to the signed-in
-  // verifier's own branch (unless they're an 'all_branches' profile or
-  // admin), the same defense-in-depth pattern used elsewhere: the RPC/RLS
-  // is the real security boundary, this just fails closed if they drift.
-  useEffect(() => {
+ useEffect(() => {
     if (profileLoading) return
     if (!isAllBranches && !pickupBranch) return
     ;(async () => {
       try {
         const data = await fetchAllRows(() => {
-          let query = supabase.from('checks').select('bank')
+          let query = supabase.from('checks').select('bank, pickup_branch')
           if (!isAllBranches) query = query.eq('pickup_branch', pickupBranch)
           return query
         })
         setBankOptions([...new Set((data || []).map((r) => r.bank).filter(Boolean))].sort())
+        // Branch-locked verifiers only ever see their own branch; "all
+        // branches" users see every distinct branch that has ever appeared
+        // on an uploaded check.
+        setBranchOptions(
+          isAllBranches
+            ? [...new Set((data || []).map((r) => r.pickup_branch).filter(Boolean))].sort()
+            : [pickupBranch].filter(Boolean)
+        )
       } catch {
         // suggestions only
       }
     })()
   }, [profileLoading, isAllBranches, pickupBranch])
 
-  const selectedPeriod = useMemo(() => completedPeriods.find((p) => p.value === periodValue), [completedPeriods, periodValue])
+  // Defense in depth: a branch-locked verifier can never end up scoping a
+  // report to a different branch (or to "All Branches"), even if `branch`
+  // was left at its default sentinel before the profile finished loading.
+  useEffect(() => {
+    if (profileLoading) return
+    if (!isAllBranches && pickupBranch) setBranch(pickupBranch)
+  }, [profileLoading, isAllBranches, pickupBranch])
+
+  const selectedPeriod = useMemo(() => periodOptions.find((p) => p.value === periodValue), [periodOptions, periodValue])
 
   async function handleGenerate() {
     if (profileLoading) {
@@ -2539,21 +2510,26 @@ function BillingReport() {
       setError("Your account isn't assigned to a branch, so a billing report can't be scoped correctly. Ask an admin to set your branch in your profile.")
       return
     }
-    if (completedPeriods.length === 0) {
-      setError('No half-month period has fully elapsed yet, so there is nothing to bill.')
-      return
-    }
-    if (!selectedPeriod) {
+  if (!selectedPeriod) {
       setError('Please select a period.')
       return
     }
-    if (!bank) {
+  if (!bank) {
       setError('Please select a bank.')
       return
     }
-    const costNum = Number(unitCost)
-    if (!unitCost || Number.isNaN(costNum) || costNum <= 0) {
-      setError('Please enter a unit cost greater than zero.')
+    if (isAllBranches && !branch) {
+      setError(`Please select a branch, or "${ALL_BRANCHES_LABEL}".`)
+      return
+    }
+    const uploadedRateNum = Number(unitCost)
+    if (!unitCost || Number.isNaN(uploadedRateNum) || uploadedRateNum <= 0) {
+      setError('Please enter an uploaded rate greater than zero.')
+      return
+    }
+    const deliveredRateNum = Number(deliveredRate)
+    if (!deliveredRate || Number.isNaN(deliveredRateNum) || deliveredRateNum <= 0) {
+      setError('Please enter a delivered rate greater than zero.')
       return
     }
     if (checkDateFrom && checkDateTo && checkDateFrom > checkDateTo) {
@@ -2564,24 +2540,12 @@ function BillingReport() {
     setFetching(true)
     try {
       const { days } = periodDateRange(selectedPeriod)
-
-      // Manila-local day boundaries for the whole period, used for the
-      // Supabase query range so records right at the edges of the period
-      // aren't missed because of a browser-timezone mismatch.
       const { startIso } = manilaDayBoundsToUtcIso(selectedPeriod.year, selectedPeriod.month, selectedPeriod.startDay)
       const { endIso } = manilaDayBoundsToUtcIso(selectedPeriod.year, selectedPeriod.month, selectedPeriod.endDay)
 
-      // Uploaded volume: every row in `checks` corresponds to exactly one
-      // row uploaded via the Upload page for this branch and bank, so
-      // counting `checks.created_at` in range is the authoritative source
-      // for "Uploaded Dispatch Soft File Volume" — scoped to this
-      // verifier's own branch so billing never mixes in another branch's
-      // uploads.
-      //
-      // Delivered (released) volume is an independent measure, fetched as
-      // a separate explicit query rather than one combined OR query — this
-      // keeps each count accurate even when a check's created_at and
-      // picked_up_at fall in different periods.
+      const effectiveBranch = isAllBranches ? branch : pickupBranch
+      const aggregateAllBranches = isAllBranches && effectiveBranch === ALL_BRANCHES_VALUE
+
       const uploadedRows = await fetchAllRows(() => {
         let query = supabase
           .from('checks')
@@ -2589,7 +2553,7 @@ function BillingReport() {
           .eq('bank', bank)
           .gte('created_at', startIso)
           .lte('created_at', endIso)
-        if (!isAllBranches) query = query.eq('pickup_branch', pickupBranch)
+        if (!aggregateAllBranches) query = query.eq('pickup_branch', effectiveBranch)
         if (checkDateFrom) query = query.gte('check_date', checkDateFrom)
         if (checkDateTo) query = query.lte('check_date', checkDateTo)
         return query
@@ -2603,30 +2567,104 @@ function BillingReport() {
           .eq('status', 'picked_up')
           .gte('picked_up_at', startIso)
           .lte('picked_up_at', endIso)
-        if (!isAllBranches) query = query.eq('pickup_branch', pickupBranch)
+        if (!aggregateAllBranches) query = query.eq('pickup_branch', effectiveBranch)
         if (checkDateFrom) query = query.gte('check_date', checkDateFrom)
         if (checkDateTo) query = query.lte('check_date', checkDateTo)
         return query
       })
 
-      const byDay = new Map(days.map((d) => [dateKey(d), { uploaded: 0, released: 0 }]))
+    const byDay = new Map(days.map((d) => [dateKey(d), { uploaded: 0, released: 0 }]))
+      const byBranch = new Map()
+      function branchBucket(branchName) {
+        const key = branchName || '(unassigned)'
+        if (!byBranch.has(key)) {
+          byBranch.set(key, { branch: key, uploaded: 0, released: 0, uploadedAmount: 0, releasedAmount: 0 })
+        }
+        return byBranch.get(key)
+      }
 
       for (const r of uploadedRows || []) {
         const k = toManilaDateKey(r.created_at)
         if (k && byDay.has(k)) byDay.get(k).uploaded += 1
+        if (aggregateAllBranches) {
+          const b = branchBucket(r.pickup_branch)
+          b.uploaded += 1
+          b.uploadedAmount += uploadedRateNum
+        }
       }
       for (const r of releasedRows || []) {
         const k = toManilaDateKey(r.picked_up_at)
         if (k && byDay.has(k)) byDay.get(k).released += 1
+        if (aggregateAllBranches) {
+          const b = branchBucket(r.pickup_branch)
+          b.released += 1
+          b.releasedAmount += deliveredRateNum
+        }
       }
 
-      const builtRows = days.map((d) => {
+     const builtRows = days.map((d) => {
+        // Days that haven't happened yet in Manila time (only relevant
+        // when the selected period is still in progress) have no real
+        // data — `hasData: false` marks them so the preview table and
+        // both exports render "—" instead of a misleading "0", which
+        // would otherwise look identical to a genuine zero-volume day.
+        if (isFutureManilaDay(d)) {
+          return {
+            date: d,
+            hasData: false,
+            uploaded: null,
+            unitCost: uploadedRateNum,
+            subtotal: null,
+            released: null,
+            deliveredRate: deliveredRateNum,
+            deliveredSubtotal: null,
+            totalBilling: null,
+          }
+        }
         const bucket = byDay.get(dateKey(d))
-        const subtotal = bucket.uploaded * costNum
-        return { date: d, uploaded: bucket.uploaded, unitCost: costNum, subtotal, released: bucket.released, totalBilling: subtotal }
+        const uploadedSubtotal = bucket.uploaded * uploadedRateNum
+        const deliveredSubtotal = bucket.released * deliveredRateNum
+        return {
+          date: d,
+          hasData: true,
+          uploaded: bucket.uploaded,
+          unitCost: uploadedRateNum,
+          subtotal: uploadedSubtotal,
+          released: bucket.released,
+          deliveredRate: deliveredRateNum,
+          deliveredSubtotal,
+          totalBilling: uploadedSubtotal + deliveredSubtotal,
+        }
+      })
+
+      const builtBranchBreakdown = aggregateAllBranches
+        ? [...byBranch.values()]
+            .map((b) => ({ ...b, totalAmount: b.uploadedAmount + b.releasedAmount }))
+            .sort((a, b) => b.totalAmount - a.totalAmount)
+        : []
+
+      const branchLabel = !isAllBranches ? pickupBranch || '—' : aggregateAllBranches ? ALL_BRANCHES_LABEL : effectiveBranch
+      const referenceNumber = generateReportReferenceNumber({
+        location: !isAllBranches ? pickupBranch : aggregateAllBranches ? null : effectiveBranch,
+        reportType: 'billing',
+        bank,
+        bankAll: false,
+        date: new Date(),
       })
 
       setRows(builtRows)
+      setBranchBreakdown(builtBranchBreakdown)
+      setReportMeta({
+        referenceNumber,
+        bank,
+        branchLabel,
+        branchTag: !isAllBranches ? pickupBranch : aggregateAllBranches ? 'all_branches' : effectiveBranch,
+        uploadedRate: uploadedRateNum,
+        deliveredRate: deliveredRateNum,
+        periodLabel: selectedPeriod.label,
+        checkDateFrom,
+        checkDateTo,
+      })
       push?.({ variant: 'success', title: 'Billing report generated', description: `${builtRows.length} day(s) loaded.` })
     } catch (err) {
       setError(friendlyError(err))
@@ -2635,22 +2673,23 @@ function BillingReport() {
     }
   }
 
-  const totals = useMemo(() => {
+const totals = useMemo(() => {
     if (!rows) return null
-    const totalNetOfVat = rows.reduce((sum, r) => sum + r.totalBilling, 0)
+    const totalUploadedAmount = rows.reduce((sum, r) => sum + (r.hasData ? r.subtotal : 0), 0)
+    const totalDeliveredAmount = rows.reduce((sum, r) => sum + (r.hasData ? r.deliveredSubtotal : 0), 0)
+    const totalNetOfVat = totalUploadedAmount + totalDeliveredAmount
     const vat = totalNetOfVat * 0.12
-    return { totalNetOfVat, vat, grandTotal: totalNetOfVat + vat }
+    return { totalUploadedAmount, totalDeliveredAmount, totalNetOfVat, vat, grandTotal: totalNetOfVat + vat }
   }, [rows])
-
-  function filenameBase() {
-    const stamp = todayDateInputValue()
-    const safeBank = (bank || 'bank').replace(/[^a-z0-9]+/gi, '_')
-    const safePeriod = (selectedPeriod?.label || 'period').replace(/[^a-z0-9]+/gi, '_')
-    return `billing-report-${safeBank}-${safePeriod}-${stamp}`
+function filenameBase() {
+    const safeBank = (reportMeta?.bank || bank || 'bank').replace(/[^a-z0-9]+/gi, '_')
+    const safeBranch = (reportMeta?.branchTag || 'all_branches').replace(/[^a-z0-9]+/gi, '_')
+    const safePeriod = (reportMeta?.periodLabel || selectedPeriod?.label || 'period').replace(/[^a-z0-9]+/gi, '_')
+    const ref = reportMeta?.referenceNumber || ''
+    return `billing-report-${safeBank}-${safeBranch}-${safePeriod}${ref ? `-${ref}` : ''}`
   }
-
-  async function handleDownloadExcel() {
-    if (!rows || !totals) return
+async function handleDownloadExcel() {
+    if (!rows || !totals || !reportMeta) return
     setDownloading(true)
     try {
       const workbook = new ExcelJS.Workbook()
@@ -2660,29 +2699,76 @@ function BillingReport() {
         pageSetup: { orientation: 'landscape', fitToPage: true, fitToWidth: 1 },
         views: [{ showGridLines: false }],
       })
+      // RTS ("Volume of RTS") column removed — it was never tracked by
+      // this system and existed only as a manual-entry placeholder.
       const columns = [
         { header: 'Productivity Date', width: 16 },
         { header: 'Uploaded Dispatch Soft File Volume', width: 22 },
-        { header: 'Unit Cost of Items Processed', width: 18 },
-        { header: 'Subtotal Amount Processed', width: 20 },
+        { header: 'Uploaded Rate', width: 14 },
+        { header: 'Subtotal Amount Uploaded', width: 20 },
         { header: 'Volume of Processed Delivered', width: 20 },
-        { header: 'Volume of RTS', width: 14 },
+        { header: 'Delivered Rate', width: 14 },
+        { header: 'Subtotal Amount Delivered', width: 20 },
         { header: 'Total Amount of Billing', width: 18 },
       ]
       sheet.columns = columns.map((c) => ({ width: c.width }))
 
-      sheet.mergeCells(1, 1, 1, columns.length)
-      sheet.getCell(1, 1).value = 'BILLING REPORT'
-      sheet.getCell(1, 1).font = { bold: true, size: 14, color: { argb: HEADER_FILL_COLOR } }
+      // Letterhead logo, anchored top-right — mirrors the check reports'
+      // workbook so every export produced by this page carries the same
+      // branded header treatment.
+      const logo = await loadLogoAssets()
+      const logoBox = logo ? fitToHeight(logo, 44, 110) : null
+      if (logo?.arrayBuffer && logoBox) {
+        try {
+          const imageId = workbook.addImage({ buffer: logo.arrayBuffer, extension: 'png' })
+          const anchor = computeRightAlignedImageAnchor(columns, logoBox.width)
+          sheet.addImage(imageId, { tl: anchor, ext: { width: logoBox.width, height: logoBox.height } })
+        } catch (err) {
+          console.warn('Could not embed logo into billing workbook:', err)
+        }
+      }
 
-      sheet.mergeCells(2, 1, 2, columns.length)
-      const rangeLabel = checkDateFrom || checkDateTo ? ` · Check Dates: ${checkDateFrom || '—'} to ${checkDateTo || '—'}` : ''
-      const branchLabel = isAllBranches ? 'All Branches' : pickupBranch || '—'
-      sheet.getCell(2, 1).value = `Branch: ${branchLabel} · Bank: ${bank} · Period: ${selectedPeriod?.label || '—'}${rangeLabel}`
-      sheet.getCell(2, 1).font = { size: 10 }
+      const rangeLabel = reportMeta.checkDateFrom || reportMeta.checkDateTo
+        ? ` · Check Dates: ${reportMeta.checkDateFrom || '—'} to ${reportMeta.checkDateTo || '—'}`
+        : ''
 
-      let r = 4
-      const headerRow = sheet.getRow(r)
+      // Structured, multi-line letterhead (company name → report title →
+      // reference no. → scope details) instead of two dense merged rows,
+      // for a clearer reading order and stronger visual hierarchy.
+      let r = 1
+      sheet.mergeCells(r, 1, r, columns.length)
+      sheet.getCell(r, 1).value = 'CREDIT SOLUTIONS & BUSINESS ALLIANCES, INC.'
+      sheet.getCell(r, 1).font = { bold: true, size: 14 }
+      sheet.getRow(r).height = 20
+      r++
+
+      sheet.mergeCells(r, 1, r, columns.length)
+      sheet.getCell(r, 1).value = 'BILLING REPORT'
+      sheet.getCell(r, 1).font = { bold: true, size: 13, color: { argb: HEADER_FILL_COLOR } }
+      sheet.getRow(r).height = 18
+      r++
+
+      const detailLines = [
+        { text: `Reference No: ${reportMeta.referenceNumber || '—'}`, bold: true, color: HEADER_FILL_COLOR },
+        { text: `Branch: ${reportMeta.branchLabel} · Bank: ${reportMeta.bank} · Period: ${reportMeta.periodLabel}${rangeLabel}` },
+        { text: `Report Date: ${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}` },
+      ]
+      detailLines.forEach((line) => {
+        sheet.mergeCells(r, 1, r, columns.length)
+        const cell = sheet.getCell(r, 1)
+        cell.value = line.text
+        cell.font = { bold: !!line.bold, size: 10, color: line.color ? { argb: line.color } : undefined }
+        sheet.getRow(r).height = 16
+        r++
+      })
+      r++ // spacer row before the table
+
+      const rowsUsedSoFar = r - 1
+      const logoRowSpan = logoBox ? Math.ceil(logoBox.height / 16) + 1 : 0
+      r += Math.max(0, logoRowSpan - rowsUsedSoFar)
+
+      const headerRowIndex = r
+      const headerRow = sheet.getRow(headerRowIndex)
       columns.forEach((c, i) => {
         const cell = headerRow.getCell(i + 1)
         cell.value = c.header
@@ -2694,37 +2780,58 @@ function BillingReport() {
       headerRow.height = 28
       r++
 
+      // Named indices instead of re-counted by eye — a future column
+      // insertion can't silently misalign the numFmt/fill logic below.
+      const MONEY_COL_INDICES = [2, 3, 5, 6, 7] // both rates, both subtotals, total (0-based)
+
       for (const row of rows) {
         const excelRow = sheet.getRow(r)
-        const values = [
-          row.date.toLocaleDateString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric' }),
-          row.uploaded,
-          row.unitCost,
-          row.subtotal,
-          row.released,
-          '',
-          row.totalBilling,
-        ]
+        const values = row.hasData
+          ? [
+              row.date.toLocaleDateString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric' }),
+              row.uploaded,
+              row.unitCost,
+              row.subtotal,
+              row.released,
+              row.deliveredRate,
+              row.deliveredSubtotal,
+              row.totalBilling,
+            ]
+          : [
+              row.date.toLocaleDateString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric' }),
+              '', '', '', '', '', '', '',
+            ]
         values.forEach((v, i) => {
           const cell = excelRow.getCell(i + 1)
           cell.value = v
-          if (i === 2 || i === 3 || i === 6) cell.numFmt = '#,##0.00'
+          if (row.hasData && MONEY_COL_INDICES.includes(i)) cell.numFmt = '#,##0.00'
           cell.alignment = { vertical: 'middle', horizontal: i === 0 ? 'center' : i >= 2 ? 'right' : 'center' }
           cell.border = thinBorder()
-          if (i === 5) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: MANUAL_FILL_COLOR } }
+          if (!row.hasData) {
+            cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: FUTURE_FILL_COLOR } }
+          }
         })
         r++
       }
 
-      const totalsStartRow = r + 1
+      const summaryTitleRow = r + 1
+      sheet.mergeCells(summaryTitleRow, 1, summaryTitleRow, columns.length)
+      sheet.getCell(summaryTitleRow, 1).value = 'BILLING SUMMARY'
+      sheet.getCell(summaryTitleRow, 1).font = { bold: true, size: 11, color: { argb: HEADER_FILL_COLOR } }
+      sheet.getRow(summaryTitleRow).height = 18
+
+      const totalsStartRow = summaryTitleRow + 1
       const totalLines = [
+        ['Total Amount Uploaded', totals.totalUploadedAmount],
+        ['Total Amount Delivered', totals.totalDeliveredAmount],
         ['Total Net of VAT', totals.totalNetOfVat],
         ['12% VAT', totals.vat],
         ['Total Billing Amount', totals.grandTotal],
       ]
       totalLines.forEach(([label, value], i) => {
-        const row = sheet.getRow(totalsStartRow + i)
-        sheet.mergeCells(totalsStartRow + i, 1, totalsStartRow + i, columns.length - 1)
+        const rowNum = totalsStartRow + i
+        const row = sheet.getRow(rowNum)
+        sheet.mergeCells(rowNum, 1, rowNum, columns.length - 1)
         const labelCell = row.getCell(1)
         labelCell.value = label
         labelCell.font = { bold: true }
@@ -2734,9 +2841,56 @@ function BillingReport() {
         valueCell.numFmt = '#,##0.00'
         valueCell.font = { bold: true }
         valueCell.alignment = { horizontal: 'right' }
+
+        // Grand total gets its own visually distinct, bordered row so it
+        // reads as the answer to the report, not just another line item.
+        if (label === 'Total Billing Amount') {
+          for (let c = 1; c <= columns.length; c++) {
+            row.getCell(c).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF0FDFA' } }
+            row.getCell(c).border = thinBorder()
+          }
+          labelCell.font = { bold: true, size: 12, color: { argb: HEADER_FILL_COLOR } }
+          valueCell.font = { bold: true, size: 12, color: { argb: HEADER_FILL_COLOR } }
+          row.height = 22
+        }
       })
 
-      sheet.views = [{ state: 'frozen', ySplit: 4 }]
+      // Only present when the report aggregated every branch — a second
+      // table showing the same Uploaded/Delivered breakdown PER BRANCH.
+      if (branchBreakdown.length > 0) {
+        let br = totalsStartRow + totalLines.length + 2
+        sheet.mergeCells(br, 1, br, columns.length)
+        sheet.getCell(br, 1).value = `VOLUME BY BRANCH — BANK: ${reportMeta.bank}`
+        sheet.getCell(br, 1).font = { bold: true, size: 11, color: { argb: HEADER_FILL_COLOR } }
+        br++
+
+        const breakdownHeaders = ['Branch', 'Uploaded Vol.', 'Uploaded Amount', 'Delivered Vol.', 'Delivered Amount', 'Total Amount']
+        const breakdownHeaderRow = sheet.getRow(br)
+        breakdownHeaders.forEach((h, i) => {
+          const cell = breakdownHeaderRow.getCell(i + 1)
+          cell.value = h
+          cell.font = { bold: true, color: { argb: 'FFFFFFFF' } }
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: HEADER_FILL_COLOR } }
+          cell.alignment = { horizontal: 'center' }
+          cell.border = thinBorder()
+        })
+        br++
+
+        for (const b of branchBreakdown) {
+          const row = sheet.getRow(br)
+          const values = [b.branch, b.uploaded, b.uploadedAmount, b.released, b.releasedAmount, b.totalAmount]
+          values.forEach((v, i) => {
+            const cell = row.getCell(i + 1)
+            cell.value = v
+            if (i === 2 || i === 4 || i === 5) cell.numFmt = '#,##0.00'
+            cell.alignment = { horizontal: i === 0 ? 'left' : 'right' }
+            cell.border = thinBorder()
+          })
+          br++
+        }
+      }
+
+      sheet.views = [{ state: 'frozen', ySplit: headerRowIndex }]
 
       const buffer = await workbook.xlsx.writeBuffer()
       const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
@@ -2750,9 +2904,12 @@ function BillingReport() {
       logAuditEvent('report_generated', {
         format: 'xlsx',
         report_type: 'billing',
-        bank,
-        period: selectedPeriod?.label,
-        branch: isAllBranches ? 'all_branches' : pickupBranch,
+        reference_no: reportMeta.referenceNumber,
+        bank: reportMeta.bank,
+        branch: reportMeta.branchTag,
+        period: reportMeta.periodLabel,
+        uploaded_rate: reportMeta.uploadedRate,
+        delivered_rate: reportMeta.deliveredRate,
       }).catch(() => {})
     } catch (err) {
       push?.({ variant: 'error', title: 'Download failed', description: friendlyError(err) })
@@ -2762,63 +2919,149 @@ function BillingReport() {
   }
 
   async function handleDownloadPdf() {
-    if (!rows || !totals) return
+    if (!rows || !totals || !reportMeta) return
     setDownloadingPdf(true)
     try {
+      const logo = await loadLogoAssets()
       const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' })
       const margin = 32
+      const pageWidth = doc.internal.pageSize.getWidth()
+
       doc.setFont('helvetica', 'bold')
+      doc.setFontSize(14)
+      doc.setTextColor(20, 20, 20)
+      doc.text('CREDIT SOLUTIONS & BUSINESS ALLIANCES, INC.', margin, 32)
+
       doc.setFontSize(13)
       doc.setTextColor(...BRAND_TEAL_RGB)
-      doc.text('BILLING REPORT', margin, 40)
+      doc.text('BILLING REPORT', margin, 50)
+
+      if (logo?.dataUrl) {
+        try {
+          const { width: logoW, height: logoH } = fitToHeight(logo, 42, 100)
+          doc.addImage(logo.dataUrl, 'PNG', pageWidth - margin - logoW, 14, logoW, logoH)
+        } catch (err) {
+          console.warn('Could not embed logo into billing PDF:', err)
+        }
+      }
+
+      doc.setFont('helvetica', 'bold')
+      doc.setFontSize(10)
+      doc.setTextColor(...BRAND_TEAL_RGB)
+      doc.text(`Reference No: ${reportMeta.referenceNumber || '—'}`, margin, 66)
+
       doc.setFont('helvetica', 'normal')
       doc.setFontSize(10)
       doc.setTextColor(60, 60, 60)
-      const rangeLabel = checkDateFrom || checkDateTo ? ` · Check Dates: ${checkDateFrom || '—'} to ${checkDateTo || '—'}` : ''
-      const branchLabel = isAllBranches ? 'All Branches' : pickupBranch || '—'
-      doc.text(`Branch: ${branchLabel} · Bank: ${bank} · Period: ${selectedPeriod?.label || '—'}${rangeLabel}`, margin, 58)
+      const rangeLabel = reportMeta.checkDateFrom || reportMeta.checkDateTo
+        ? ` · Check Dates: ${reportMeta.checkDateFrom || '—'} to ${reportMeta.checkDateTo || '—'}`
+        : ''
+      doc.text(
+        `Branch: ${reportMeta.branchLabel} · Bank: ${reportMeta.bank} · Period: ${reportMeta.periodLabel}${rangeLabel}`,
+        margin,
+        80
+      )
 
-      const head = [['Productivity Date', 'Uploaded Volume', 'Unit Cost', 'Subtotal', 'Delivered', 'RTS', 'Total Billing']]
-      const body = rows.map((row) => [
-        row.date.toLocaleDateString('en-US'),
-        String(row.uploaded),
-        row.unitCost.toLocaleString('en-US', { minimumFractionDigits: 2 }),
-        row.subtotal.toLocaleString('en-US', { minimumFractionDigits: 2 }),
-        String(row.released),
-        '',
-        row.totalBilling.toLocaleString('en-US', { minimumFractionDigits: 2 }),
-      ])
+      // RTS column removed — see the Excel export note above.
+      const head = [[
+        'Productivity Date', 'Uploaded Vol.', 'Uploaded Rate', 'Subtotal Uploaded',
+        'Delivered Vol.', 'Delivered Rate', 'Subtotal Delivered', 'Total Billing',
+      ]]
+      const body = rows.map((row) =>
+        row.hasData
+          ? [
+              row.date.toLocaleDateString('en-US'),
+              String(row.uploaded),
+              row.unitCost.toLocaleString('en-US', { minimumFractionDigits: 2 }),
+              row.subtotal.toLocaleString('en-US', { minimumFractionDigits: 2 }),
+              String(row.released),
+              row.deliveredRate.toLocaleString('en-US', { minimumFractionDigits: 2 }),
+              row.deliveredSubtotal.toLocaleString('en-US', { minimumFractionDigits: 2 }),
+              row.totalBilling.toLocaleString('en-US', { minimumFractionDigits: 2 }),
+            ]
+          : [row.date.toLocaleDateString('en-US'), '—', '—', '—', '—', '—', '—', '—']
+      )
 
       autoTable(doc, {
         head,
         body,
-        startY: 74,
+        startY: 96,
         margin: { left: margin, right: margin },
         styles: { fontSize: 8, cellPadding: 4, lineColor: [209, 213, 219], lineWidth: 0.5, textColor: [55, 65, 81] },
         headStyles: { fillColor: BRAND_TEAL_RGB, textColor: 255, fontStyle: 'bold', halign: 'center' },
-        columnStyles: { 2: { halign: 'right' }, 3: { halign: 'right' }, 6: { halign: 'right' } },
+        columnStyles: { 2: { halign: 'right' }, 3: { halign: 'right' }, 5: { halign: 'right' }, 6: { halign: 'right' }, 7: { halign: 'right' } },
         didParseCell: (data) => {
-          if (data.row.section === 'body' && data.column.index === 5) data.cell.styles.fillColor = [255, 251, 234]
+          const isFutureRow = rows[data.row.index] && !rows[data.row.index].hasData
+          if (data.row.section === 'body' && isFutureRow) {
+            data.cell.styles.fillColor = [243, 244, 246]
+            data.cell.styles.textColor = [156, 163, 175]
+          }
         },
       })
 
-      let y = doc.lastAutoTable.finalY + 24
+      let y = doc.lastAutoTable.finalY + 26
+      doc.setDrawColor(...BRAND_TEAL_RGB)
+      doc.setLineWidth(0.75)
+      doc.line(margin, y, pageWidth - margin, y)
+      y += 18
+
       doc.setFont('helvetica', 'bold')
+      doc.setFontSize(11)
+      doc.setTextColor(...BRAND_TEAL_RGB)
+      doc.text('BILLING SUMMARY', margin, y)
+      y += 18
+
+      doc.setFont('helvetica', 'normal')
       doc.setFontSize(10)
-      doc.setTextColor(20, 20, 20)
+      doc.setTextColor(40, 40, 40)
+      doc.text(`Total Amount Uploaded: ${totals.totalUploadedAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, margin, y)
+      y += 16
+      doc.text(`Total Amount Delivered: ${totals.totalDeliveredAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, margin, y)
+      y += 16
       doc.text(`Total Net of VAT: ${totals.totalNetOfVat.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, margin, y)
       y += 16
       doc.text(`12% VAT: ${totals.vat.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, margin, y)
-      y += 16
+      y += 20
+
+      doc.setFont('helvetica', 'bold')
+      doc.setFontSize(13)
+      doc.setTextColor(...BRAND_TEAL_RGB)
       doc.text(`Total Billing Amount: ${totals.grandTotal.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, margin, y)
+      y += 26
+
+      if (branchBreakdown.length > 0) {
+        doc.setFont('helvetica', 'bold')
+        doc.setFontSize(10)
+        doc.setTextColor(...BRAND_TEAL_RGB)
+        doc.text(`VOLUME BY BRANCH — BANK: ${reportMeta.bank}`, margin, y)
+        autoTable(doc, {
+          head: [['Branch', 'Uploaded Vol.', 'Uploaded Amount', 'Delivered Vol.', 'Delivered Amount', 'Total Amount']],
+          body: branchBreakdown.map((b) => [
+            b.branch,
+            String(b.uploaded),
+            b.uploadedAmount.toLocaleString('en-US', { minimumFractionDigits: 2 }),
+            String(b.released),
+            b.releasedAmount.toLocaleString('en-US', { minimumFractionDigits: 2 }),
+            b.totalAmount.toLocaleString('en-US', { minimumFractionDigits: 2 }),
+          ]),
+          startY: y + 8,
+          margin: { left: margin, right: margin },
+          styles: { fontSize: 8, cellPadding: 4, lineColor: [209, 213, 219], lineWidth: 0.5, textColor: [55, 65, 81] },
+          headStyles: { fillColor: BRAND_TEAL_RGB, textColor: 255, fontStyle: 'bold', halign: 'center' },
+          columnStyles: { 2: { halign: 'right' }, 4: { halign: 'right' }, 5: { halign: 'right' } },
+        })
+      }
 
       doc.save(`${filenameBase()}.pdf`)
       logAuditEvent('report_generated', {
         format: 'pdf',
         report_type: 'billing',
-        bank,
-        period: selectedPeriod?.label,
-        branch: isAllBranches ? 'all_branches' : pickupBranch,
+        reference_no: reportMeta.referenceNumber,
+        bank: reportMeta.bank,
+        branch: reportMeta.branchTag,
+        period: reportMeta.periodLabel,
+        uploaded_rate: reportMeta.uploadedRate,
+        delivered_rate: reportMeta.deliveredRate,
       }).catch(() => {})
     } catch (err) {
       push?.({ variant: 'error', title: 'PDF download failed', description: friendlyError(err) })
@@ -2827,21 +3070,26 @@ function BillingReport() {
     }
   }
 
-  if (profileError) {
-    return (
-      <Card className="border-gray-100 shadow-sm">
-        <CardContent className="pt-6">
-          <p className="flex items-center gap-1.5 text-sm text-red-600">
-            <AlertTriangle className="h-4 w-4 shrink-0" />
-            Could not load your profile: {profileError}
-          </p>
-        </CardContent>
-      </Card>
-    )
-  }
-
+ if (profileError) {
   return (
-    <Card className="border-gray-100 shadow-sm">
+    <div className="flex items-center gap-2 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+      <AlertTriangle className="h-4 w-4 shrink-0" />
+      Could not load your profile: {profileError}
+    </div>
+  )
+}
+if (!profileLoading && !isAllBranches && !pickupBranch) {
+  return (
+    <div className="flex items-center gap-2 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+      <AlertTriangle className="h-4 w-4 shrink-0" />
+      Your account isn't assigned to a branch, so Reports can't determine which checks to show you.
+      Please ask an admin to set your branch in your profile.
+    </div>
+  )
+}
+
+return (
+  <Card className="border-gray-100 shadow-sm">
       <CardHeader>
         <CardTitle className="text-lg">Billing report</CardTitle>
         <CardDescription>
@@ -2850,27 +3098,22 @@ function BillingReport() {
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        {!profileLoading && !isAllBranches && !pickupBranch ? (
+     {!profileLoading && !isAllBranches && !pickupBranch ? (
           <p className="flex items-center gap-1.5 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
             <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
             Your account isn't assigned to a branch, so a billing report can't be scoped correctly. Ask an admin to set your branch in your profile.
           </p>
-        ) : completedPeriods.length === 0 ? (
-          <p className="flex items-center gap-1.5 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-            No half-month period has fully elapsed yet — check back once the current period ends.
-          </p>
         ) : (
           <>
-            <div className="grid gap-4 sm:grid-cols-3">
+           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
               <div>
                 <label className="mb-1 block text-xs font-medium text-gray-500">Period</label>
-                <Select value={periodValue} onChange={(e) => setPeriodValue(e.target.value)}>
-                  {completedPeriods.map((p) => (
+             <Select value={periodValue} onChange={(e) => setPeriodValue(e.target.value)}>
+                  {periodOptions.map((p) => (
                     <option key={p.value} value={p.value}>{p.label}</option>
                   ))}
                 </Select>
-                <p className="mt-1 text-xs text-gray-400">Only fully-elapsed half-month periods can be billed — the period in progress isn't listed yet.</p>
+                <p className="mt-1 text-xs text-gray-400">Shows the current half-month period plus the last 3 months.</p>
               </div>
               <div>
                 <label className="mb-1 block text-xs font-medium text-gray-500">Bank</label>
@@ -2880,8 +3123,37 @@ function BillingReport() {
                 </Select>
               </div>
               <div>
-                <label className="mb-1 block text-xs font-medium text-gray-500">Unit cost (₱ per item)</label>
+                <label className="mb-1 block text-xs font-medium text-gray-500">Branch</label>
+                {isAllBranches ? (
+                  <Select value={branch} onChange={(e) => setBranch(e.target.value)} disabled={profileLoading}>
+                    <option value={ALL_BRANCHES_VALUE}>{ALL_BRANCHES_LABEL}</option>
+                    {branchOptions.map((b) => (<option key={b} value={b}>{b}</option>))}
+                  </Select>
+                ) : (
+                  <Select value={pickupBranch || ''} disabled>
+                    <option value={pickupBranch || ''}>{pickupBranch || '—'}</option>
+                  </Select>
+                )}
+           </div>
+            </div>
+
+            {selectedPeriod?.isCurrent && (
+              <p className="flex items-center gap-1.5 rounded-md border border-teal-100 bg-teal-50/60 px-3 py-2 text-xs text-teal-800">
+                <Info className="h-3.5 w-3.5 shrink-0" />
+                This period is still in progress — the report will only include data up to today ({todayManilaDateInputValue()}). Later dates show as "—" until they happen.
+              </p>
+            )}
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div>
+                <label className="mb-1 block text-xs font-medium text-gray-500">Uploaded rate (₱ per item)</label>
                 <Input type="number" min="0" step="0.01" value={unitCost} onChange={(e) => setUnitCost(e.target.value)} placeholder="e.g. 5.00" />
+                <p className="mt-1 text-xs text-gray-400">Applied to the daily "Uploaded" volume.</p>
+              </div>
+              <div>
+                <label className="mb-1 block text-xs font-medium text-gray-500">Delivered rate (₱ per item)</label>
+                <Input type="number" min="0" step="0.01" value={deliveredRate} onChange={(e) => setDeliveredRate(e.target.value)} placeholder="e.g. 7.00" />
+                <p className="mt-1 text-xs text-gray-400">Applied to the daily "Delivered" volume — intentionally a different rate.</p>
               </div>
             </div>
 
@@ -2916,45 +3188,89 @@ function BillingReport() {
           </>
         )}
 
-        {rows && totals && (
+      {rows && totals && reportMeta && (
           <>
+            <p className="text-xs text-gray-500">
+              Reference No: <span className="font-mono font-medium text-gray-700">{reportMeta.referenceNumber}</span>
+            </p>
             <div className="overflow-auto rounded-lg border border-gray-200" style={{ maxHeight: 420 }}>
-              <table className="w-full border-collapse text-sm">
+             <table className="w-full border-collapse text-sm">
                 <thead className="sticky top-0 z-10">
                   <tr>
-                    {['Date', 'Uploaded Vol.', 'Unit Cost', 'Subtotal', 'Delivered', 'RTS', 'Total Billing'].map((h) => (
+                    {['Date', 'Uploaded Vol.', 'Uploaded Rate', 'Subtotal Uploaded', 'Delivered Vol.', 'Delivered Rate', 'Subtotal Delivered', 'Total Billing'].map((h) => (
                       <th key={h} className="whitespace-nowrap border-b border-gray-200 bg-teal-600 px-3 py-2 text-left text-xs font-semibold text-white">{h}</th>
                     ))}
                   </tr>
                 </thead>
                 <tbody>
-                  {rows.map((row) => (
-                    <tr key={dateKey(row.date)} className="border-b border-gray-100 last:border-0 even:bg-gray-50/50">
+                {rows.map((row) => (
+                    <tr
+                      key={dateKey(row.date)}
+                      className={
+                        'border-b border-gray-100 last:border-0 ' +
+                        (row.hasData ? 'even:bg-gray-50/50' : 'bg-gray-50/80 text-gray-300')
+                      }
+                    >
                       <td className="px-3 py-1.5 text-center">{row.date.toLocaleDateString('en-US')}</td>
-                      <td className="px-3 py-1.5 text-center">{row.uploaded}</td>
-                      <td className="px-3 py-1.5 text-right">{row.unitCost.toFixed(2)}</td>
-                      <td className="px-3 py-1.5 text-right">{row.subtotal.toFixed(2)}</td>
-                      <td className="px-3 py-1.5 text-center">{row.released}</td>
-                      <td className="px-3 py-1.5 text-center" style={{ backgroundColor: '#fffbea' }}>
-                        <span className="text-gray-300">—</span>
+                      <td className="px-3 py-1.5 text-center">{row.hasData ? row.uploaded : '—'}</td>
+                      <td className="px-3 py-1.5 text-right">{row.hasData ? row.unitCost.toFixed(2) : '—'}</td>
+                      <td className="px-3 py-1.5 text-right">{row.hasData ? row.subtotal.toFixed(2) : '—'}</td>
+                      <td className="px-3 py-1.5 text-center">{row.hasData ? row.released : '—'}</td>
+                      <td className="px-3 py-1.5 text-right">{row.hasData ? row.deliveredRate.toFixed(2) : '—'}</td>
+                      <td className="px-3 py-1.5 text-right">{row.hasData ? row.deliveredSubtotal.toFixed(2) : '—'}</td>
+                      <td className="px-3 py-1.5 text-right font-medium">
+                        {row.hasData ? row.totalBilling.toFixed(2) : '—'}
                       </td>
-                      <td className="px-3 py-1.5 text-right">{row.totalBilling.toFixed(2)}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
 
-            <p className="flex items-center gap-1.5 text-xs text-gray-500">
-              <span className="inline-block h-3 w-3 rounded-sm border border-amber-200" style={{ backgroundColor: '#fffbea' }} />
-              RTS isn't tracked in this system yet, so that column is left blank for manual entry.
+       <p className="flex items-center gap-1.5 text-xs text-gray-500">
+              <span className="inline-block h-3 w-3 rounded-sm border border-gray-300 bg-gray-100" />
+              Rows shown as "—" are dates that haven't happened yet in an in-progress period — there's no data to show for them yet.
             </p>
+            {branchBreakdown.length > 0 && (
+              <div className="rounded-lg border border-teal-100 bg-teal-50/40 p-3">
+                <div className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-teal-800">
+                  <Landmark className="h-3.5 w-3.5" />
+                  Volume by branch — Bank: {reportMeta.bank}
+                </div>
+                <div className="overflow-auto rounded-md border border-teal-100 bg-white">
+                  <table className="w-full border-collapse text-xs">
+                    <thead>
+                      <tr>
+                        {['Branch', 'Uploaded Vol.', 'Uploaded Amount', 'Delivered Vol.', 'Delivered Amount', 'Total Amount'].map((h) => (
+                          <th key={h} className="whitespace-nowrap border-b border-teal-100 px-3 py-1.5 text-left font-semibold text-teal-700">{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {branchBreakdown.map((b) => (
+                        <tr key={b.branch} className="border-b border-gray-100 last:border-0">
+                          <td className="px-3 py-1.5">{b.branch}</td>
+                          <td className="px-3 py-1.5 text-right">{b.uploaded}</td>
+                          <td className="px-3 py-1.5 text-right">{formatCurrency(b.uploadedAmount)}</td>
+                          <td className="px-3 py-1.5 text-right">{b.released}</td>
+                          <td className="px-3 py-1.5 text-right">{formatCurrency(b.releasedAmount)}</td>
+                          <td className="px-3 py-1.5 text-right font-medium">{formatCurrency(b.totalAmount)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
 
-            <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg bg-gray-50 p-3 text-sm">
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-teal-100 bg-teal-50/30 p-4 text-sm">
               <div className="space-y-0.5 text-gray-700">
+                <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-teal-700">Billing Summary</div>
+                <div>Total Amount Uploaded: <span className="font-semibold">{formatCurrency(totals.totalUploadedAmount)}</span></div>
+                <div>Total Amount Delivered: <span className="font-semibold">{formatCurrency(totals.totalDeliveredAmount)}</span></div>
                 <div>Total Net of VAT: <span className="font-semibold">{formatCurrency(totals.totalNetOfVat)}</span></div>
                 <div>12% VAT: <span className="font-semibold">{formatCurrency(totals.vat)}</span></div>
-                <div>Total Billing Amount: <span className="font-semibold text-teal-700">{formatCurrency(totals.grandTotal)}</span></div>
+                <div className="mt-1 text-base">Total Billing Amount: <span className="font-bold text-teal-700">{formatCurrency(totals.grandTotal)}</span></div>
               </div>
               <div className="flex items-center gap-2">
                 <Button variant="outline" onClick={handleDownloadPdf} disabled={downloadingPdf}>
@@ -2979,7 +3295,7 @@ const SUMMARY_GROUP_BY_OPTIONS = [
   { value: 'payor', label: 'Client (Payor)' },
 ]
 
-function StatusSummaryReport({ status, dateField, dateFieldLabel, title, description, fileTag, accentClass }) {
+function StatusSummaryReport({ status, dateField, dateFieldLabel, title, description, fileTag, reportTypeKey, accentClass }) {
   const [groupBy, setGroupBy] = useState('bank')
   const [bank, setBank] = useState('')
   const [payor, setPayor] = useState('')
@@ -2989,6 +3305,7 @@ function StatusSummaryReport({ status, dateField, dateFieldLabel, title, descrip
   const [checkDateTo, setCheckDateTo] = useState('')
   const [bankOptions, setBankOptions] = useState([])
   const [rows, setRows] = useState(null)
+  const [referenceNumber, setReferenceNumber] = useState('')
   const [fetching, setFetching] = useState(false)
   const [error, setError] = useState('')
   const [downloading, setDownloading] = useState(false)
@@ -2996,6 +3313,7 @@ function StatusSummaryReport({ status, dateField, dateFieldLabel, title, descrip
   const [pdfState, setPdfState] = useState({ open: false, url: '', generating: false })
   const requestIdRef = useRef(0)
   const { push } = useToast()
+  const { pickupBranch, isAllBranches, loading: profileLoading, error: profileError } = useProfile()
 
   useEffect(() => {
     return () => {
@@ -3005,18 +3323,32 @@ function StatusSummaryReport({ status, dateField, dateFieldLabel, title, descrip
   }, [pdfState.url])
 
   useEffect(() => {
+    if (profileLoading) return
+    if (!isAllBranches && !pickupBranch) return
     ;(async () => {
       try {
-        const data = await fetchAllRows(() => supabase.from('checks').select('bank').eq('status', status))
+        const data = await fetchAllRows(() => {
+          let query = supabase.from('checks').select('bank, pickup_branch').eq('status', status)
+          if (!isAllBranches) query = query.eq('pickup_branch', pickupBranch)
+          return query
+        })
         setBankOptions([...new Set((data || []).map((r) => r.bank).filter(Boolean))].sort())
       } catch {
         // suggestions only
       }
     })()
-  }, [status])
+  }, [status, profileLoading, isAllBranches, pickupBranch])
 
   async function handleGenerate() {
     setError('')
+    if (profileLoading) {
+      setError('Still loading your profile — please wait a moment and try again.')
+      return
+    }
+    if (!isAllBranches && !pickupBranch) {
+      setError("Your account isn't assigned to a branch, so this summary can't be scoped correctly. Ask an admin to set your branch in your profile.")
+      return
+    }
     if (dateFrom && dateTo && dateFrom > dateTo) {
       setError(`The ${dateFieldLabel.toLowerCase()} "from" must be before the "to".`)
       return
@@ -3030,6 +3362,7 @@ function StatusSummaryReport({ status, dateField, dateFieldLabel, title, descrip
     try {
       const data = await fetchAllRows(() => {
         let query = supabase.from('checks').select('bank, payor, amount, check_date').eq('status', status)
+        if (!isAllBranches) query = query.eq('pickup_branch', pickupBranch)
         if (bank) query = query.eq('bank', bank)
         if (payor.trim()) query = query.ilike('payor', `%${payor.trim()}%`)
         if (dateFrom) query = query.gte(dateField, `${dateFrom}T00:00:00`)
@@ -3049,8 +3382,16 @@ function StatusSummaryReport({ status, dateField, dateFieldLabel, title, descrip
       }
 
       const built = [...groups.values()].sort((a, b) => String(a.key).localeCompare(String(b.key)))
+      const ref = generateReportReferenceNumber({
+        location: pickupBranch,
+        reportType: reportTypeKey,
+        bank: bank ? [bank] : null,
+        bankAll: !bank,
+        date: new Date(),
+      })
       if (myRequestId !== requestIdRef.current) return
       setRows(built)
+      setReferenceNumber(ref)
       push?.({ variant: 'success', title: `${title} generated`, description: `${built.length} group(s) loaded.` })
     } catch (err) {
       if (myRequestId !== requestIdRef.current) return
@@ -3066,7 +3407,7 @@ function StatusSummaryReport({ status, dateField, dateFieldLabel, title, descrip
   }, [rows])
 
   function summaryFilenameBase() {
-    return `${fileTag}-${groupBy}-${todayDateInputValue()}`
+    return `${fileTag}-${groupBy}-${referenceNumber || todayDateInputValue()}`
   }
 
   const groupLabel = SUMMARY_GROUP_BY_OPTIONS.find((g) => g.value === groupBy)?.label || 'Group'
@@ -3083,11 +3424,32 @@ function StatusSummaryReport({ status, dateField, dateFieldLabel, title, descrip
         { header: 'Amount (₱)', width: 18 },
       ]
       sheet.columns = columns.map((c) => ({ width: c.width }))
+
+      const logo = await loadLogoAssets()
+      const logoBox = logo ? fitToHeight(logo, 38, 90) : null
+      if (logo?.arrayBuffer && logoBox) {
+        try {
+          const imageId = workbook.addImage({ buffer: logo.arrayBuffer, extension: 'png' })
+          const anchor = computeRightAlignedImageAnchor(columns, logoBox.width)
+          sheet.addImage(imageId, { tl: anchor, ext: { width: logoBox.width, height: logoBox.height } })
+        } catch (err) {
+          console.warn('Could not embed logo into summary workbook:', err)
+        }
+      }
+
       sheet.mergeCells(1, 1, 1, columns.length)
       sheet.getCell(1, 1).value = title.toUpperCase()
       sheet.getCell(1, 1).font = { bold: true, size: 13, color: { argb: HEADER_FILL_COLOR } }
 
-      let r = 3
+      sheet.mergeCells(2, 1, 2, columns.length)
+      sheet.getCell(2, 1).value = `Reference No: ${referenceNumber || '—'}`
+      sheet.getCell(2, 1).font = { bold: true, size: 10, color: { argb: HEADER_FILL_COLOR } }
+
+      let r = 4
+      const rowsUsedSoFar = 2
+      const logoRowSpan = logoBox ? Math.ceil(logoBox.height / 15) + 1 : 0
+      r += Math.max(0, logoRowSpan - rowsUsedSoFar)
+
       const headerRow = sheet.getRow(r)
       columns.forEach((c, i) => {
         const cell = headerRow.getCell(i + 1)
@@ -3131,7 +3493,7 @@ function StatusSummaryReport({ status, dateField, dateFieldLabel, title, descrip
       a.click()
       URL.revokeObjectURL(url)
 
-      logAuditEvent('report_generated', { format: 'xlsx', report_type: fileTag, group_by: groupBy }).catch(() => {})
+      logAuditEvent('report_generated', { format: 'xlsx', report_type: fileTag, reference_no: referenceNumber, group_by: groupBy }).catch(() => {})
     } catch (err) {
       push?.({ variant: 'error', title: 'Download failed', description: friendlyError(err) })
     } finally {
@@ -3140,18 +3502,34 @@ function StatusSummaryReport({ status, dateField, dateFieldLabel, title, descrip
   }
 
   async function buildSummaryPdfDocument() {
+    const logo = await loadLogoAssets()
     const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' })
     const margin = 32
+    const pageWidth = doc.internal.pageSize.getWidth()
 
     doc.setFont('helvetica', 'bold')
     doc.setFontSize(13)
     doc.setTextColor(...BRAND_TEAL_RGB)
     doc.text(title.toUpperCase(), margin, 40)
 
+    if (logo?.dataUrl) {
+      try {
+        const { width: logoW, height: logoH } = fitToHeight(logo, 40, 100)
+        doc.addImage(logo.dataUrl, 'PNG', pageWidth - margin - logoW, 14, logoW, logoH)
+      } catch (err) {
+        console.warn('Could not embed logo into summary PDF:', err)
+      }
+    }
+
+    doc.setFont('helvetica', 'bold')
+    doc.setFontSize(9.5)
+    doc.setTextColor(...BRAND_TEAL_RGB)
+    doc.text(`Reference No: ${referenceNumber || '—'}`, margin, 56)
+
     doc.setFont('helvetica', 'normal')
     doc.setFontSize(10)
     doc.setTextColor(60, 60, 60)
-    doc.text(`Grouped by: ${groupLabel} · Bank: ${bank || 'All'} · Payor: ${payor || 'All'}`, margin, 58)
+    doc.text(`Grouped by: ${groupLabel} · Bank: ${bank || 'All'} · Payor: ${payor || 'All'}`, margin, 70)
 
     const head = [[groupLabel, 'Count', 'Amount (₱)']]
     const body = rows.map((r) => [
@@ -3165,7 +3543,7 @@ function StatusSummaryReport({ status, dateField, dateFieldLabel, title, descrip
     autoTable(doc, {
       head,
       body,
-      startY: 74,
+      startY: 86,
       margin: { left: margin, right: margin },
       styles: { fontSize: 8, cellPadding: 4, lineColor: [209, 213, 219], lineWidth: 0.5, textColor: [55, 65, 81] },
       headStyles: { fillColor: BRAND_TEAL_RGB, textColor: 255, fontStyle: 'bold', halign: 'center' },
@@ -3207,7 +3585,7 @@ function StatusSummaryReport({ status, dateField, dateFieldLabel, title, descrip
     try {
       const doc = await buildSummaryPdfDocument()
       doc.save(`${summaryFilenameBase()}.pdf`)
-      logAuditEvent('report_generated', { format: 'pdf', report_type: fileTag, group_by: groupBy }).catch(() => {})
+      logAuditEvent('report_generated', { format: 'pdf', report_type: fileTag, reference_no: referenceNumber, group_by: groupBy }).catch(() => {})
     } catch (err) {
       push?.({ variant: 'error', title: 'PDF download failed', description: friendlyError(err) })
     } finally {
@@ -3288,6 +3666,9 @@ function StatusSummaryReport({ status, dateField, dateFieldLabel, title, descrip
 
         {rows && grandTotals && (
           <>
+            <p className="text-xs text-gray-500">
+              Reference No: <span className="font-mono font-medium text-gray-700">{referenceNumber}</span>
+            </p>
             <div className="overflow-auto rounded-lg border border-gray-200">
               <table className="w-full border-collapse text-sm">
                 <thead>
@@ -3391,6 +3772,7 @@ function SummaryReports() {
           title="Released Summary"
           description="Pivot totals of released checks by bank or client, narrowed by released date and check date."
           fileTag="released-summary-report"
+          reportTypeKey="summary_released"
           accentClass="border-l-4 border-l-teal-500"
         />
       ) : (
@@ -3402,6 +3784,7 @@ function SummaryReports() {
           title="Unreleased Summary"
           description="Pivot totals of unreleased checks by bank or client, narrowed by uploaded date and check date."
           fileTag="unreleased-summary-report"
+          reportTypeKey="summary_unreleased"
           accentClass="border-l-4 border-l-amber-400"
         />
       )}
