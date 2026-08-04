@@ -22,6 +22,7 @@ import {
   CheckCircle2,
   RotateCcw,
   Clock3,
+  MinusCircle,
   Hash,
 } from 'lucide-react'
 import { useProfile } from '../../context/ProfileContext'
@@ -35,6 +36,7 @@ import { buildStaleCheckReportPdf, buildStaleCheckReportWorkbook } from '../../l
 // ---------------------------------------------------------------------------
 
 const PAGE_SIZE_OPTIONS = [10, 25, 50, 100]
+const SUBMITTED_STATUS = 'submitted'
 
 const STATUS_OPTIONS = [
   { value: 'all', label: 'All statuses' },
@@ -42,14 +44,19 @@ const STATUS_OPTIONS = [
   { value: 'generated', label: 'Generated (pending)' },
 ]
 
-// Decision is a separate axis from the submission status above: a report
-// can be "submitted" (workflow status) while still "awaiting" a decision,
-// or "submitted" and "approved"/"returned"/"mixed" once an approver acts.
+// Decision is a separate axis from the submission status above. A report
+// can only be decided once it's actually submitted, so this is driven by
+// the submitted_at / decided_at timestamps (see getDecisionState), not by
+// the free-text status column:
+//   - no submitted_at                -> 'not_submitted'
+//   - submitted_at set, no decided_at -> 'awaiting'
+//   - submitted_at and decided_at set -> 'approved' | 'returned' | 'mixed'
 const DECISION_OPTIONS = [
   { value: 'all', label: 'All decisions' },
-  { value: 'awaiting', label: 'Awaiting decision' },
+  { value: 'not_submitted', label: 'Not submitted' },
+  { value: 'awaiting', label: 'Pending approval' },
   { value: 'approved', label: 'Approved' },
-  { value: 'returned', label: 'Returned' },
+  { value: 'returned', label: 'Return to Bank' },
   { value: 'mixed', label: 'Mixed outcome' },
 ]
 
@@ -67,20 +74,19 @@ const SORTABLE_COLUMNS = {
   generated_at: (r) => (r.generated_at ? new Date(r.generated_at).getTime() : 0),
   submitted_at: (r) => (r.submitted_at ? new Date(r.submitted_at).getTime() : 0),
   decided_at: (r) => (r.decided_at ? new Date(r.decided_at).getTime() : 0),
-  status: (r) => r.status || '',
+  status: (r) => (isSubmitted(r) ? 1 : 0),
   check_count: (r) => Number(r.check_count) || 0,
   total_amount: (r) => Number(r.total_amount) || 0,
 }
 
-// staled_check_reports.branches is a text[] column populated with the
-// distinct checks.pickup_branch values bundled into that report — it's
-// already on every row from `verifier_list_staled_check_reports`, so no
-// hydration is needed for scoping or the branch filter.
+// staled_check_reports.branches is a text[] column already present on every
+// row from verifier_list_staled_check_reports — no hydration needed for
+// scoping or the branch filter.
 const getReportBranches = (r) => (Array.isArray(r?.branches) ? r.branches.filter(Boolean) : [])
 
-// staled_check_reports has no equivalent bank column, so bank names (and
-// full check detail, for the expandable row) have to come from
-// checks.bank via the per-report detail RPC.
+// staled_check_reports has no bank column, so bank names (and full check
+// detail, for the expandable row) come from checks.bank via the per-report
+// detail RPC.
 const BANK_FIELD_CANDIDATES = ['bank', 'bank_name', 'bankName']
 const CHECK_NO_FIELD_CANDIDATES = ['check_no', 'checkNo', 'check_number']
 const PAYEE_FIELD_CANDIDATES = ['payee']
@@ -94,6 +100,13 @@ const DETAIL_FETCH_BATCH_SIZE = 4
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
+
+// submitted_at is the field actually stamped when a verifier submits a
+// report, so it's the source of truth for "was this submitted" — not the
+// free-text `status` column, which can drift out of sync with it.
+function isSubmitted(r) {
+  return Boolean(r?.submitted_at)
+}
 
 function useDebouncedValue(value, delay = 250) {
   const [debounced, setDebounced] = useState(value)
@@ -160,11 +173,15 @@ function toErrorMessage(err, fallback) {
   return fallback
 }
 
-// A report's decision outcome, derived from decided_at / approved_count /
-// returned_count. Treated as optional/nullable throughout — a report with
-// no decided_at (or missing counts) simply reads as "awaiting".
+// A report's decision outcome. Only a submitted report can have one — a
+// report with no submitted_at was never sent to an approver, so it reads
+// as 'not_submitted' regardless of how many newer reports have since
+// superseded it. This is what keeps abandoned drafts (a verifier
+// re-generating a report several times before submitting one of them)
+// from ever being mislabeled as "awaiting decision".
 function getDecisionState(r) {
-  if (!r?.decided_at) return 'awaiting'
+  if (!isSubmitted(r)) return 'not_submitted'
+  if (!r.decided_at) return 'awaiting'
   const approved = Number(r.approved_count) || 0
   const returned = Number(r.returned_count) || 0
   if (returned > 0 && approved === 0) return 'returned'
@@ -271,8 +288,7 @@ function NameList({ names, icon: Icon, loading, errored, onRetry }) {
   )
 }
 
-function StatusBadge({ status }) {
-  const submitted = status === 'submitted'
+function StatusBadge({ submitted }) {
   return (
     <span
       className={cn(
@@ -286,44 +302,55 @@ function StatusBadge({ status }) {
 }
 
 // The approver's decision on a report — independent of the submission
-// StatusBadge above. "Mixed" covers a report where some checks were
-// confirmed stale and others were returned to the pool.
+// StatusBadge above. "Not submitted" covers any report never sent for
+// approval, including drafts superseded by a later generation. "Mixed"
+// covers a submitted report where some checks were confirmed stale and
+// others were returned to the pool.
 function DecisionBadge({ report }) {
-  const state = getDecisionState(report)
-  if (state === 'returned')
-    return (
-      <span className="inline-flex items-center gap-1 rounded-full bg-orange-100 px-2 py-0.5 text-[10px] font-medium text-orange-700">
-        <RotateCcw className="h-2.5 w-2.5" /> Returned
-      </span>
-    )
-  if (state === 'mixed')
-    return (
-      <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-medium text-amber-700">
-        <CheckCircle2 className="h-2.5 w-2.5" /> Mixed outcome
-      </span>
-    )
-  if (state === 'approved')
-    return (
-      <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
-        <CheckCircle2 className="h-2.5 w-2.5" /> Approved
-      </span>
-    )
-  return (
-    <span className="inline-flex items-center gap-1 rounded-full bg-ink-100 px-2 py-0.5 text-[10px] font-medium text-ink-500">
-      <Clock3 className="h-2.5 w-2.5" /> Awaiting decision
-    </span>
-  )
+  switch (getDecisionState(report)) {
+    case 'not_submitted':
+      return (
+        <span className="inline-flex items-center gap-1 rounded-full bg-ink-50 px-2 py-0.5 text-[10px] font-medium text-ink-400">
+          <MinusCircle className="h-2.5 w-2.5" /> Not submitted
+        </span>
+      )
+    case 'returned':
+      return (
+        <span className="inline-flex items-center gap-1 rounded-full bg-orange-100 px-2 py-0.5 text-[10px] font-medium text-orange-700">
+          <RotateCcw className="h-2.5 w-2.5" /> Return to Bank
+        </span>
+      )
+    case 'mixed':
+      return (
+        <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-medium text-amber-700">
+          <CheckCircle2 className="h-2.5 w-2.5" /> Mixed outcome
+        </span>
+      )
+    case 'approved':
+      return (
+        <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
+          <CheckCircle2 className="h-2.5 w-2.5" /> Approved
+        </span>
+      )
+    case 'awaiting':
+    default:
+      return (
+        <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-medium text-amber-700">
+          <Clock3 className="h-2.5 w-2.5" /> Pending approval
+        </span>
+      )
+  }
 }
 
 // Per-check outcome inside the expanded detail table. Falls back to a
-// plain capitalized label for any status value it doesn't recognize,
-// so an unexpected value never renders as a blank cell.
+// plain capitalized label for any status value it doesn't recognize, so an
+// unexpected value never renders as a blank cell.
 function CheckOutcomeBadge({ status }) {
   const normalized = String(status || '').toLowerCase()
   if (normalized === 'returned')
     return (
       <span className="inline-flex items-center gap-1 rounded-full bg-orange-100 px-2 py-0.5 text-[10px] font-medium text-orange-700">
-        <RotateCcw className="h-2.5 w-2.5" /> Returned
+        <RotateCcw className="h-2.5 w-2.5" /> Return to Bank
       </span>
     )
   if (normalized === 'approved' || normalized === 'picked_up')
@@ -335,7 +362,7 @@ function CheckOutcomeBadge({ status }) {
   if (normalized === 'pending_approval')
     return (
       <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-medium text-amber-700">
-        <Clock3 className="h-2.5 w-2.5" /> Awaiting decision
+        <Clock3 className="h-2.5 w-2.5" /> Pending approval
       </span>
     )
   if (normalized)
@@ -553,9 +580,9 @@ export default function StaleReportHistory() {
   //
   // verifier_list_staled_check_reports() already scopes to this caller's own
   // reports (generated_by = auth.uid()) and, unless they're an 'all_branches'
-  // verifier, to their own branch — enforced by the RPC body and RLS.
-  // This mirrors that same rule client-side: not the security boundary
-  // (the DB is), but it fails closed if the RPC/RLS ever drift out of sync.
+  // verifier, to their own branch — enforced by the RPC body and RLS. This
+  // mirrors that same rule client-side: not the security boundary (the DB
+  // is), but it fails closed if the RPC/RLS ever drift out of sync.
   const scopedReports = useMemo(() => {
     if (!currentUserId) return []
     return reports.filter((r) => {
@@ -625,7 +652,11 @@ export default function StaleReportHistory() {
   function toggleExpandRow(reportNumber) {
     setExpandedRows((prev) => {
       const next = new Set(prev)
-      next.has(reportNumber) ? next.delete(reportNumber) : next.add(reportNumber)
+      if (next.has(reportNumber)) {
+        next.delete(reportNumber)
+      } else {
+        next.add(reportNumber)
+      }
       return next
     })
   }
@@ -655,7 +686,8 @@ export default function StaleReportHistory() {
         const haystack = `${r.report_number || ''} ${r.generated_by_name || ''} ${r.submitted_by_name || ''} ${r.decided_by_name || ''}`.toLowerCase()
         if (!haystack.includes(term)) return false
       }
-      if (filters.status !== 'all' && r.status !== filters.status) return false
+      if (filters.status === 'submitted' && !isSubmitted(r)) return false
+      if (filters.status === 'generated' && isSubmitted(r)) return false
       if (filters.decision !== 'all' && getDecisionState(r) !== filters.decision) return false
       if (from || to) {
         const generatedAt = r.generated_at ? new Date(r.generated_at) : null
@@ -748,12 +780,13 @@ export default function StaleReportHistory() {
         return {
           checks: acc.checks + (Number(r.check_count) || 0),
           amount: acc.amount + Number(r.total_amount || 0),
+          notSubmitted: acc.notSubmitted + (state === 'not_submitted' ? 1 : 0),
           awaiting: acc.awaiting + (state === 'awaiting' ? 1 : 0),
           approved: acc.approved + (state === 'approved' ? 1 : 0),
           returned: acc.returned + (state === 'returned' || state === 'mixed' ? 1 : 0),
         }
       },
-      { checks: 0, amount: 0, awaiting: 0, approved: 0, returned: 0 },
+      { checks: 0, amount: 0, notSubmitted: 0, awaiting: 0, approved: 0, returned: 0 },
     )
   }, [filteredReports])
 
@@ -875,7 +908,7 @@ export default function StaleReportHistory() {
         const banks = resolvedBankNames(r)?.join('; ') || ''
         return [
           r.report_number,
-          r.status,
+          isSubmitted(r) ? 'Submitted' : 'Generated',
           r.generated_at ? new Date(r.generated_at).toISOString() : '',
           r.generated_by_name || '',
           getReportBranches(r).join('; '),
@@ -948,10 +981,11 @@ export default function StaleReportHistory() {
       </div>
 
       {!isBusy && filteredReports.length > 0 && (
-        <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+        <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
           <StatCard label="Reports" value={sortedReports.length} />
           <StatCard label="Checks" value={stats.checks.toLocaleString()} />
           <StatCard label="Total amount" value={formatCurrency(stats.amount)} tone="accent" />
+          <StatCard label="Not submitted" value={stats.notSubmitted} />
           <StatCard label="Awaiting decision" value={stats.awaiting} />
           <StatCard label="Approved / Returned" value={`${stats.approved} / ${stats.returned}`} />
         </div>
@@ -1181,7 +1215,7 @@ export default function StaleReportHistory() {
                           )}
                         </td>
                         <td className="px-4 py-2.5">
-                          <StatusBadge status={r.status} />
+                          <StatusBadge submitted={isSubmitted(r)} />
                         </td>
                         <td className="px-4 py-2.5">
                           <DecisionBadge report={r} />

@@ -215,8 +215,8 @@ function getOtpCooldownRemaining(email) {
 // approver accounts. Which role signs in determines where they land after
 // auth (see the redirect logic below); it does not affect what's shown here.
 const PORTAL_LABEL = {
-  title: 'Portal Login',
-  description: 'Sign in to your account.',
+  title: 'Check Releasing Portal',
+  description: 'Sign in to manage your check releasing workflow.',
   placeholder: 'you@csba.ph',
 }
 
@@ -232,7 +232,7 @@ const TRUST_POINTS = [
   {
     icon: Fingerprint,
     title: 'Role-based access',
-    description: 'Admin, verifier, and approver accounts each see only what their role permits.',
+    description: 'Every check moves through verifier and approver sign-off before it is released.',
   },
   {
     icon: ShieldAlert,
@@ -529,44 +529,46 @@ function OtpBoxes({ value, onChange, disabled, inputRef, invalid }) {
 // Left-hand brand panel — desktop/tablet only (lg+). Carries the trust
 // signals that used to be squeezed into the form card's footer, and gives
 // the portal an actual identity instead of a bare white card floating on
-// gray. Solid teal fill throughout — no gradients, per design direction.
-function BrandPanel({ logoError, onLogoError }) {
+// gray.
+//
+// Background photography: drop a real image at public/brand/check-release-hero.jpg
+// (a check-processing floor, teller line, vault, or ledger close-up all read
+// well here). Using a local asset — rather than hotlinking a stock photo —
+// means it won't break if the source disappears and avoids licensing risk;
+// swap in whatever's cleared for production. The gradient overlay is tuned
+// to keep the copy legible over any image you drop in, and to keep the
+// panel on-brand even before an image is added.
+function BrandPanel() {
   return (
-    <div className="relative hidden w-[42%] shrink-0 flex-col justify-between overflow-hidden bg-teal-700 px-10 py-12 text-white lg:flex xl:w-[38%] xl:px-14">
+    <div className="relative hidden w-[42%] shrink-0 flex-col justify-between overflow-hidden bg-teal-100 px-10 py-12 text-white lg:flex xl:w-[38%] xl:px-14">
       <div
-        className="csba-float pointer-events-none absolute -bottom-24 -right-16 h-72 w-72 rounded-full bg-teal-600/60 blur-3xl"
+        className="absolute inset-0 bg-[url('/brand/check-release-hero.jpg')] bg-cover bg-center"
+        aria-hidden="true"
+      />
+      <div className="absolute inset-0 bg-teal-950/80" aria-hidden="true" />
+      <div
+        className="csba-float pointer-events-none absolute -bottom-24 -right-16 h-72 w-72 rounded-full bg-teal-600/30 blur-3xl"
         aria-hidden="true"
       />
       <div
-        className="pointer-events-none absolute -top-10 left-1/3 h-40 w-40 rounded-full bg-teal-800/50 blur-3xl"
+        className="pointer-events-none absolute -top-10 left-1/3 h-40 w-40 rounded-full bg-teal-800/40 blur-3xl"
         aria-hidden="true"
       />
 
-      <div className="relative z-10 flex items-center gap-3">
-        {!logoError ? (
-          <img
-            src="https://csba.ph/logo.png"
-            alt="CSBA logo"
-            className="h-11 w-11 object-contain"
-            onError={onLogoError}
-          />
-        ) : (
-          <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-white/10 text-sm font-bold tracking-wide">
-            CSBA
-          </div>
-        )}
+      <div className="relative z-10 flex items-center gap-2.5">
+        
         <span className="text-sm font-semibold tracking-wide text-teal-50">
-          CSBA Compliance Portal
+          Check Releasing Portal
         </span>
       </div>
 
       <div className="relative z-10 max-w-sm">
         <h2 className="text-3xl font-bold leading-tight tracking-tight text-white">
-          Built for accountability, not just access.
+          Every check, verified before it's released.
         </h2>
         <p className="mt-3 text-sm leading-relaxed text-teal-100">
-          Admin, verifier, and approver accounts all sign in here — every session is verified,
-          scoped to your role, and logged.
+          Admin, verifier, and approver accounts sign in here to manage your bank's check
+          releasing workflow — every session is verified, scoped to your role, and logged.
         </p>
 
         <ul className="mt-8 flex flex-col gap-5">
@@ -585,7 +587,7 @@ function BrandPanel({ logoError, onLogoError }) {
       </div>
 
       <p className="relative z-10 text-xs text-teal-200">
-        Authorized personnel only. Accounts are managed by CSBA.
+        Authorized personnel only. Access is managed by Credit Solutions & Business Alliances, Inc.
       </p>
     </div>
   )
@@ -606,7 +608,6 @@ export default function Login() {
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const [failedAttempts, setFailedAttempts] = useState(0)
-  const [logoError, setLogoError] = useState(false)
   const [checkingExistingSession, setCheckingExistingSession] = useState(true)
 
   // Consent — required every sign-in, independent of the credentials
@@ -1072,9 +1073,9 @@ export default function Login() {
     <div className="relative flex min-h-[100dvh] overflow-hidden bg-gray-50">
       <MotionStyles />
 
-      <BrandPanel logoError={logoError} onLogoError={() => setLogoError(true)} />
+      <BrandPanel />
 
-      <div className="relative flex flex-1 items-center justify-center px-4 py-10 sm:px-6 sm:py-12 lg:px-10">
+      <div className="relative flex flex-1 items-start justify-center px-4 pb-10 pt-14 sm:px-6 sm:pb-12 sm:pt-20 lg:px-10 lg:pt-24">
         {/* One quiet, slow-drifting solid shape instead of a cluster of
             blurred gradient blobs — a single deliberate accent, not
             decoration. Only shown here on mobile/tablet; the brand panel
@@ -1084,12 +1085,7 @@ export default function Login() {
           aria-hidden="true"
         />
 
-        <Card className="csba-rise relative w-full max-w-md overflow-hidden border border-gray-200 bg-white shadow-[0_1px_2px_rgba(0,0,0,0.04),0_12px_32px_rgba(15,23,42,0.08)]">
-          {/* Solid brand accent — grows in on load instead of a blended gradient bar */}
-          <div className="flex h-1 w-full overflow-hidden bg-gray-100">
-            <div className="csba-accent h-full w-full bg-teal-600" />
-          </div>
-
+        <Card className="csba-rise relative w-full max-w-lg overflow-hidden border-0 bg-white shadow-[0_1px_2px_rgba(0,0,0,0.04),0_12px_32px_rgba(15,23,42,0.08)]">
           {!isOnline && (
             <div className="flex items-center justify-center gap-2 bg-amber-50 px-4 py-2 text-xs font-medium text-amber-700">
               <WifiOff className="h-3.5 w-3.5 shrink-0" />
@@ -1097,22 +1093,7 @@ export default function Login() {
             </div>
           )}
 
-          <CardHeader className="items-center space-y-4 pt-8 text-center">
-            <div className="flex flex-col items-center justify-center gap-3 lg:hidden">
-              {!logoError ? (
-                <img
-                  src="https://csba.ph/logo.png"
-                  alt="CSBA logo"
-                  className="h-16 w-16 object-contain"
-                  onError={() => setLogoError(true)}
-                />
-              ) : (
-                <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-teal-600 text-base font-bold tracking-wide text-white transition-transform duration-200 hover:scale-105">
-                  CSBA
-                </div>
-              )}
-            </div>
-
+          <CardHeader className="items-center space-y-4 pt-10 text-center">
             <div className="space-y-1">
               <CardTitle className="text-2xl font-bold tracking-tight text-teal-800">
                 {mode === 'signin' && portal.title}
@@ -1137,7 +1118,7 @@ export default function Login() {
             </div>
           </CardHeader>
 
-          <CardContent className="px-6 pb-8 sm:px-8">
+          <CardContent className="px-8 pb-10 sm:px-10">
             {mode === 'signin' && (
               <form
                 onSubmit={handleSubmit}
@@ -1497,7 +1478,7 @@ export default function Login() {
             )}
 
             <p className="mt-8 text-center text-xs text-gray-400 lg:hidden">
-              Authorized personnel only. Accounts are managed by CSBA.
+              Authorized bank personnel only. Access is managed by CSBA.
             </p>
             <div className="mt-2 flex flex-wrap items-center justify-center gap-x-3 gap-y-1">
               {isSecureConnection && (

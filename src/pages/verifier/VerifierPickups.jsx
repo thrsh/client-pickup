@@ -109,37 +109,39 @@ function lineItems(reservation, tab) {
     const byCheck = new Map()
 
     activity
-      .slice()
-      .sort((a, b) => new Date(a.performed_at || 0) - new Date(b.performed_at || 0))
-      .forEach((a) => {
-        if (!a.check_id) return
-        const entry = byCheck.get(a.check_id) || { or_no: null }
-        entry.latest = a
-        if (a.checks) entry.checks = a.checks
-        if (a.or_no !== null && a.or_no !== undefined) entry.or_no = a.or_no
-        byCheck.set(a.check_id, entry)
-      })
-
-    return [...byCheck.values()]
-      .map(({ latest, checks: c, or_no }) => {
-        if (!c) return null
-        return {
-          id: latest.id,
-          checkId: c.id,
-          row_number: c.row_number,
-          bank: c.bank,
-          pickupBranch: c.pickup_branch,
-          payee: c.payee,
-          payor: c.payor,
-          check_no: c.check_no,
-          check_date: c.check_date,
-          amount: c.amount,
-          outcome: latest.action,
-          or_no,
-          remarks: latest.remarks,
-        }
-      })
-      .filter(Boolean)
+  .slice()
+  .sort((a, b) => new Date(a.performed_at || 0) - new Date(b.performed_at || 0))
+  .forEach((a) => {
+    if (!a.check_id) return
+    const entry = byCheck.get(a.check_id) || { or_no: null }
+    entry.latest = a
+    if (a.checks) entry.checks = a.checks
+    const activityOrNo = typeof a.or_no === 'string' ? a.or_no.trim() : a.or_no
+    if (activityOrNo) entry.or_no = activityOrNo
+    byCheck.set(a.check_id, entry)
+  })
+return [...byCheck.values()]
+  .map(({ latest, checks: c, or_no }) => {
+    if (!c) return null
+    return {
+      id: latest.id,
+      checkId: c.id,
+      row_number: c.row_number,
+      bank: c.bank,
+      pickupBranch: c.pickup_branch,
+      payee: c.payee,
+      payor: c.payor,
+      check_no: c.check_no,
+      check_date: c.check_date,
+      amount: c.amount,
+      outcome: latest.action,
+      or_no: or_no || c.or_no || null,
+      remarks: latest.remarks,
+      arCollected: c.ar_collected ?? null,
+      attached2307: c.form_2307_attached === 'Y',
+    }
+  })
+  .filter(Boolean)
   }
 
   const rawChecks = Array.isArray(reservation.checks) ? reservation.checks : []
@@ -163,8 +165,9 @@ function lineItems(reservation, tab) {
     check_date: c.check_date,
     amount: c.amount,
     outcome: null,
-    or_no: tab === 'pending_approval' ? c.or_no ?? null : null,
-    remarks: tab === 'pending_approval' ? c.remarks ?? null : null,
+    or_no: tab === 'active' || tab === 'pending_approval' ? c.or_no ?? null : null,
+    remarks: tab === 'active' || tab === 'pending_approval' ? c.remarks ?? null : null,
+    arCollected: tab === 'active' || tab === 'pending_approval' ? c.ar_collected ?? null : null,
     submittedAt: tab === 'pending_approval' ? c.submitted_at ?? null : null,
     submittedByName: tab === 'pending_approval' ? c.submitted_by_name ?? null : null,
     submittedBy: tab === 'pending_approval' ? c.submitted_by ?? null : null,
@@ -231,6 +234,15 @@ function composeReceiptNo(entry) {
   const no = entry?.receiptNo?.trim() || ''
   if (!type || !no) return ''
   return `${type}-${no}`
+}
+
+function parseReceiptNo(orNo) {
+  if (!orNo) return { receiptType: '', receiptNo: '' }
+  const separatorIndex = orNo.indexOf('-')
+  if (separatorIndex === -1) return { receiptType: '', receiptNo: '' }
+  const receiptType = orNo.slice(0, separatorIndex)
+  const receiptNo = orNo.slice(separatorIndex + 1)
+  return RECEIPT_TYPES.includes(receiptType) ? { receiptType, receiptNo } : { receiptType: '', receiptNo: '' }
 }
 
 function isCollectorIdComplete(idInfo) {
@@ -393,7 +405,7 @@ export default function AdminPickups() {
 
         const selectClause =
           tab === 'active'
-            ? `id, collector_name, status, reserved_at, expires_at, picked_up_at, queue_number, queue_date, ${checksJoin}(id, row_number, bank, pickup_branch, payee, payor, check_no, check_date, amount, status, return_reason, returned_at, returned_by_name, submitted_by, form_2307_attached)`
+            ? `id, collector_name, status, reserved_at, expires_at, picked_up_at, queue_number, queue_date, collector_id_type, collector_id_type_other, collector_id_number, ${checksJoin}(id, row_number, bank, pickup_branch, payee, payor, check_no, check_date, amount, status, return_reason, returned_at, returned_by_name, submitted_by, form_2307_attached, or_no, remarks, ar_collected)`
             : tab === 'pending_approval'
             ? `id, collector_name, status, reserved_at, expires_at, collector_id_type, collector_id_type_other, collector_id_number, queue_number, queue_date, ${checksJoin}(id, row_number, bank, pickup_branch, payee, payor, check_no, check_date, amount, or_no, remarks, submitted_at, submitted_by, submitted_by_name)`
             : 'id, collector_name, status, reserved_at, expires_at, picked_up_at, collector_id_type, collector_id_type_other, collector_id_number, queue_number, queue_date'
@@ -484,10 +496,10 @@ export default function AdminPickups() {
 
             let checksById = new Map()
             if (checkIds.length > 0) {
-              const { data: checksData, error: checksError } = await supabase
-                .from('checks')
-                .select('id, row_number, bank, pickup_branch, payee, payor, check_no, check_date, amount')
-                .in('id', checkIds)
+             const { data: checksData, error: checksError } = await supabase
+  .from('checks')
+  .select('id, row_number, bank, pickup_branch, payee, payor, check_no, check_date, amount, or_no, ar_collected, form_2307_attached')
+  .in('id', checkIds)
 
               if (!isMountedRef.current || requestId !== requestIdRef.current) return
 
@@ -508,10 +520,10 @@ export default function AdminPickups() {
             const idsMissingActivity = rows.map((r) => r.id).filter((id) => !(byReservation.get(id) || []).length)
 
             if (idsMissingActivity.length > 0) {
-              const { data: fallbackChecks, error: fallbackError } = await supabase
-                .from('checks')
-                .select('id, reservation_id, row_number, bank, pickup_branch, payee, payor, check_no, check_date, amount, status, submitted_by')
-                .in('reservation_id', idsMissingActivity)
+             const { data: fallbackChecks, error: fallbackError } = await supabase
+  .from('checks')
+  .select('id, reservation_id, row_number, bank, pickup_branch, payee, payor, check_no, check_date, amount, status, submitted_by, or_no, ar_collected, form_2307_attached')
+  .in('reservation_id', idsMissingActivity)
 
               if (!isMountedRef.current || requestId !== requestIdRef.current) return
 
@@ -524,15 +536,15 @@ export default function AdminPickups() {
                   .forEach((c) => {
                     const syntheticOutcome =
                       c.status === 'picked_up' ? 'picked_up' : c.status === 'available' ? 'released' : c.status || 'expired'
-                    const entry = {
-                      id: `fallback-${c.id}`,
-                      check_id: c.id,
-                      action: syntheticOutcome,
-                      or_no: null,
-                      remarks: null,
-                      performed_at: null,
-                      checks: c,
-                    }
+const entry = {
+  id: `fallback-${c.id}`,
+  check_id: c.id,
+  action: syntheticOutcome,
+  or_no: c.or_no || null,
+  remarks: null,
+  performed_at: null,
+  checks: c,
+}
                     if (!byReservation.has(c.reservation_id)) byReservation.set(c.reservation_id, [])
                     byReservation.get(c.reservation_id).push(entry)
                   })
@@ -1011,7 +1023,7 @@ export default function AdminPickups() {
     const isPending = tab === 'pending_approval'
     const isActive = tab === 'active'
     const headers = isHistory
-      ? ['Queue #', 'Collector', 'Collector ID type', 'Collector ID no.', 'Status', 'Reserved at', 'Resolved at', 'Bank', 'Pickup branch', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount', 'Outcome', 'Receipt no.', 'Remarks']
+    ? ['Queue #', 'Collector', 'Collector ID type', 'Collector ID no.', 'Status', 'Reserved at', 'Resolved at', 'Bank', 'Pickup branch', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount', 'Outcome', 'Receipt no.', 'AR collected', '2307 attached', 'Remarks']
       : isPending
       ? ['Queue #', 'Collector', 'Collector ID type', 'Collector ID no.', 'Status', 'Reserved at', 'Bank', 'Pickup branch', 'Check no.', 'Payee', 'Payor', 'Check date', 'Amount', 'Receipt no.', 'Remarks', 'Submitted by', 'Submitted at']
       : isActive
@@ -1026,8 +1038,8 @@ export default function AdminPickups() {
 
       if (items.length === 0) {
         rows.push(
-          isHistory
-            ? [queueCode, r.collector_name || '', formatCollectorId(r) ? (r.collector_id_type === 'other' ? (r.collector_id_type_other || 'Other ID') : (COLLECTOR_ID_TYPE_LABELS[r.collector_id_type] || '')) : '', r.collector_id_number || '', r.status || '', r.reserved_at || '', r.picked_up_at || '', '', '', '', '', '', '', '', '', '', '']
+         isHistory
+  ? [queueCode, r.collector_name || '', formatCollectorId(r) ? (r.collector_id_type === 'other' ? (r.collector_id_type_other || 'Other ID') : (COLLECTOR_ID_TYPE_LABELS[r.collector_id_type] || '')) : '', r.collector_id_number || '', r.status || '', r.reserved_at || '', r.picked_up_at || '', '', '', '', '', '', '', '', '', '', '', '', '']
             : isPending
             ? [queueCode, r.collector_name || '', formatCollectorId(r) ? (r.collector_id_type === 'other' ? (r.collector_id_type_other || 'Other ID') : (COLLECTOR_ID_TYPE_LABELS[r.collector_id_type] || '')) : '', r.collector_id_number || '', r.status || '', r.reserved_at || '', '', '', '', '', '', '', '', '', '', '']
             : isActive
@@ -1041,13 +1053,16 @@ export default function AdminPickups() {
         const branchLabel = PICKUP_BRANCH_LABELS[c.pickupBranch] || c.pickupBranch || ''
         rows.push(
           isHistory
-            ? [
-                queueCode, r.collector_name || '',
-                r.collector_id_type === 'other' ? (r.collector_id_type_other || 'Other ID') : (COLLECTOR_ID_TYPE_LABELS[r.collector_id_type] || ''),
-                r.collector_id_number || '', r.status || '', r.reserved_at || '', r.picked_up_at || '',
-                c.bank || '', branchLabel, c.check_no || '', c.payee || '', c.payor || '', c.check_date || '', c.amount ?? '',
-                c.outcome || '', c.or_no || '', c.remarks || '',
-              ]
+  ? [
+      queueCode, r.collector_name || '',
+      r.collector_id_type === 'other' ? (r.collector_id_type_other || 'Other ID') : (COLLECTOR_ID_TYPE_LABELS[r.collector_id_type] || ''),
+      r.collector_id_number || '', r.status || '', r.reserved_at || '', r.picked_up_at || '',
+      c.bank || '', branchLabel, c.check_no || '', c.payee || '', c.payor || '', c.check_date || '', c.amount ?? '',
+      c.outcome || '', c.or_no || '',
+      c.arCollected === true ? 'Yes' : c.arCollected === false ? 'No' : '',
+      c.attached2307 === true ? 'Yes' : c.attached2307 === false ? 'No' : '',
+      c.remarks || '',
+    ]
             : isPending
             ? [
                 queueCode, r.collector_name || '',
@@ -1475,7 +1490,19 @@ function ActiveCheckStatusBadge({ status }) {
     </span>
   )
 }
-
+function BooleanBadge({ value, trueLabel, falseLabel }) {
+  return (
+    <span
+      className={cn(
+        'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium',
+        value ? 'bg-teal-100 text-teal-700' : 'bg-ink-100 text-ink-500'
+      )}
+    >
+      {value ? <Check className="h-3 w-3" /> : <X className="h-3 w-3" />}
+      {value ? trueLabel : falseLabel}
+    </span>
+  )
+}
 function BankBadge({ bank }) {
   if (!bank) {
     return (
@@ -1695,9 +1722,11 @@ function ReservationRow({
                     {isActive && anyReturned && <th className="px-4 py-2 font-medium">Returned at</th>}
                     {isPending && <th className="px-2 py-2 font-medium">Receipt no.</th>}
                     {isPending && <th className="px-4 py-2 font-medium">Remarks</th>}
-                    {isHistory && <th className="px-2 py-2 font-medium">Outcome</th>}
-                    {isHistory && <th className="px-2 py-2 font-medium">Receipt no.</th>}
-                    {isHistory && <th className="px-4 py-2 font-medium">Remarks</th>}
+                  {isHistory && <th className="px-2 py-2 font-medium">Outcome</th>}
+{isHistory && <th className="px-2 py-2 font-medium">Receipt no.</th>}
+{isHistory && <th className="px-2 py-2 font-medium">AR collected</th>}
+{isHistory && <th className="px-2 py-2 font-medium">2307 attached</th>}
+{isHistory && <th className="px-4 py-2 font-medium">Remarks</th>}
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-ink-50">
@@ -1739,9 +1768,27 @@ function ReservationRow({
                       )}
                       {isPending && <td className="px-2 py-2.5 font-mono text-xs text-ink-600">{c.or_no || '—'}</td>}
                       {isPending && <td className="max-w-[220px] px-4 py-2.5 text-xs text-ink-500">{c.remarks || '—'}</td>}
-                      {isHistory && <td className="px-2 py-2.5"><OutcomeBadge outcome={c.outcome} /></td>}
-                      {isHistory && <td className="px-2 py-2.5 font-mono text-xs text-ink-600">{c.or_no || '—'}</td>}
-                      {isHistory && <td className="max-w-[220px] px-4 py-2.5 text-xs text-ink-500">{c.remarks || '—'}</td>}
+                   {isHistory && <td className="px-2 py-2.5"><OutcomeBadge outcome={c.outcome} /></td>}
+{isHistory && <td className="px-2 py-2.5 font-mono text-xs text-ink-600">{c.or_no || '—'}</td>}
+{isHistory && (
+  <td className="px-2 py-2.5">
+    {c.outcome === 'picked_up' || c.outcome === 'approved' ? (
+      <BooleanBadge value={c.arCollected} trueLabel="Y" falseLabel="N" />
+    ) : (
+      <span className="text-ink-300">—</span>
+    )}
+  </td>
+)}
+{isHistory && (
+  <td className="px-2 py-2.5">
+    {c.outcome === 'picked_up' || c.outcome === 'approved' ? (
+      <BooleanBadge value={c.attached2307} trueLabel="Y" falseLabel="N" />
+    ) : (
+      <span className="text-ink-300">—</span>
+    )}
+  </td>
+)}
+{isHistory && <td className="max-w-[220px] px-4 py-2.5 text-xs text-ink-500">{c.remarks || '—'}</td>}
                     </tr>
                   ))}
                 </tbody>
@@ -1749,7 +1796,7 @@ function ReservationRow({
                   <tr className="border-t border-ink-100 bg-ink-50/40">
                     <td colSpan={7} className="px-4 py-2 text-right text-xs font-medium text-ink-500">Order total</td>
                     <td className="px-4 py-2 text-right font-mono font-semibold text-ink-900">{formatCurrency(total)}</td>
-                    {isHistory && <td colSpan={3} />}
+                    {isHistory && <td colSpan={5} />}
                     {isPending && <td colSpan={2} />}
                     {isActive && <td colSpan={anyReturned ? 4 : 1} />}
                   </tr>
@@ -1797,7 +1844,14 @@ function ReservationRow({
 function buildInitialCheckEntries(checks) {
   const initial = {}
   checks.forEach((c) => {
-    initial[c.checkId] = { include: true, receiptType: '', receiptNo: '', remarks: '' }
+    const { receiptType, receiptNo } = parseReceiptNo(c.or_no)
+    const hadReceipt = Boolean(receiptType && receiptNo)
+    initial[c.checkId] = {
+      include: hadReceipt || !c.remarks,
+      receiptType,
+      receiptNo,
+      remarks: hadReceipt ? '' : c.remarks || '',
+    }
   })
   return initial
 }
@@ -1816,7 +1870,11 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
 
   const [orEntries, setOrEntries] = useState(() => buildInitialCheckEntries(checks))
   const [reason, setReason] = useState('')
-  const [collectorId, setCollectorId] = useState({ idType: '', idTypeOther: '', idNumber: '' })
+  const [collectorId, setCollectorId] = useState(() => ({
+    idType: reservation?.collector_id_type || '',
+    idTypeOther: reservation?.collector_id_type_other || '',
+    idNumber: reservation?.collector_id_number || '',
+  }))
 
   const updateInclude = useCallback((checkId, value) => {
     setOrEntries((prev) => ({
@@ -1888,6 +1946,7 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
     () => checks.reduce((sum, c) => (orEntries[c.checkId]?.include ? sum + (Number(c.amount) || 0) : sum), 0),
     [checks, orEntries],
   )
+  const hasReturnedChecks = useMemo(() => checks.some((c) => c.checkStatus === 'returned'), [checks])
 
   useEffect(() => {
     const previouslyFocused = document.activeElement
@@ -2061,6 +2120,13 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
                 Per-check outcome
               </div>
 
+              {hasReturnedChecks && (
+                <div className="mb-3 flex items-start gap-2 rounded-lg border border-sky-200 bg-sky-50 px-3 py-2.5 text-xs text-sky-700">
+                  <RotateCcw className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  What you entered before has been restored below — review the approver's note, fix what's needed, and resubmit.
+                </div>
+              )}
+
               <div className="flex flex-col gap-3">
                 {checks.map((c, idx) => {
                   const entry = orEntries[c.checkId] || { include: true, receiptType: '', receiptNo: '', remarks: '' }
@@ -2129,8 +2195,19 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
                             <ReceiptText className="h-3 w-3" />
                             Receipt
                           </label>
-                          <div className="flex max-w-sm gap-1.5">
-                            <select ref={idx === 0 ? firstReceiptFieldRef : undefined} value={entry.receiptType} onChange={(e) => updateReceiptType(c.checkId, e.target.value)} aria-label={`Receipt type for check ${c.check_no || idx + 1}`} className="w-24 rounded-md border border-ink-200 px-2 py-2 text-xs text-ink-800 focus:outline-none focus:ring-2 focus:ring-teal-500/40">
+                          <div
+                            className={cn(
+                              'flex max-w-sm items-stretch overflow-hidden rounded-md border bg-white transition focus-within:ring-2 focus-within:ring-teal-500/40',
+                              isDuplicate ? 'border-red-400' : 'border-ink-200'
+                            )}
+                          >
+                            <select
+                              ref={idx === 0 ? firstReceiptFieldRef : undefined}
+                              value={entry.receiptType}
+                              onChange={(e) => updateReceiptType(c.checkId, e.target.value)}
+                              aria-label={`Receipt type for check ${c.check_no || idx + 1}`}
+                              className="w-[4.5rem] shrink-0 border-r border-ink-200 bg-ink-50 px-2 py-2 text-xs font-semibold text-ink-700 focus:outline-none"
+                            >
                               <option value="">Type</option>
                               {RECEIPT_TYPES.map((rt) => <option key={rt} value={rt}>{rt}</option>)}
                             </select>
@@ -2139,14 +2216,18 @@ function ActionModal({ action, checks, total, onCancel, onConfirm, loading, erro
                               inputMode="numeric"
                               value={entry.receiptNo}
                               onChange={(e) => updateReceiptNo(c.checkId, e.target.value)}
-                              placeholder="Number"
+                              placeholder="Receipt number"
                               maxLength={RECEIPT_NUMBER_MAX_LENGTH}
                               disabled={!entry.receiptType}
                               aria-label={`Receipt number for check ${c.check_no || idx + 1}`}
-                              className={cn('min-w-0 flex-1 rounded-md border px-2 py-2 text-xs text-ink-800 focus:outline-none focus:ring-2 focus:ring-teal-500/40 disabled:bg-ink-50 disabled:text-ink-300', isDuplicate ? 'border-red-400' : 'border-ink-200')}
+                              className="min-w-0 flex-1 border-0 px-2.5 py-2 text-xs text-ink-800 focus:outline-none disabled:bg-ink-50 disabled:text-ink-300"
                             />
                           </div>
-                          {isDuplicate && <p className="mt-1 text-[10px] font-medium text-red-600">Already used above</p>}
+                          {isDuplicate ? (
+                            <p className="mt-1 text-[10px] font-medium text-red-600">Already used above</p>
+                          ) : composedReceipt ? (
+                            <p className="mt-1 font-mono text-[10px] text-ink-400">{composedReceipt}</p>
+                          ) : null}
                         </div>
                       ) : (
                         <div className="px-4 py-4">

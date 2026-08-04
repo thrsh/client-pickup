@@ -1,12 +1,14 @@
 // src/pages/verifier/VerifierStaleApprovals.jsx
 //
-// Shows only the reports THIS verifier submitted that are still awaiting
-// an approver's decision (staled_check_reports.decided_at IS NULL). The
-// moment an approver approves or returns a report, it must disappear from
-// this queue — decided reports (approved or returned) live in Report
-// History (StaleReportHistory.jsx), not here. Scoping is enforced both in
-// the query (`.is('decided_at', null)`) and again client-side as
-// defense-in-depth, mirroring the ownership/branch check pattern used in
+// Shows reports THIS verifier submitted that are still awaiting an
+// approver's decision: status = 'submitted' AND decided_at IS NULL.
+//
+// A report only reaches 'submitted' once a verifier explicitly submits it;
+// generating a report (possibly multiple times) leaves it at status =
+// 'generated' until that happens. Unsubmitted drafts must never surface
+// here as "awaiting decision" — they were never sent to an approver and
+// never will be decided. Scoping is enforced both in the query and again
+// client-side as defense-in-depth, mirroring the pattern used in
 // StaleReportHistory.
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
@@ -29,12 +31,12 @@ const MAX_ROWS_PER_REPORT = 300
 
 const UNSPECIFIED_BANK = 'Unspecified bank'
 const UNSPECIFIED_BRANCH = 'No branch on file'
+const AWAITING_DECISION_STATUS = 'submitted'
 
-// generated_by is the primary match key. check_date / form_2307_attached
-// feed the badges in the detail table. decided_at is selected purely as a
-// defense-in-depth guard (see the filter in `load()` below) — it should
-// always be null for every row returned here, since the query itself
-// already scopes to `decided_at IS NULL`.
+// generated_by is the primary match key; generated_by_name is a fallback
+// for rows where the id might not be populated. check_date and
+// form_2307_attached feed badges in the detail table. status and
+// decided_at both gate which reports belong on this page (see load()).
 const REPORT_COLUMNS =
   'report_number, generated_by, generated_by_name, generated_at, submitted_at, submitted_by_name, status, decided_at, branches, check_ids'
 const CHECK_COLUMNS =
@@ -80,9 +82,8 @@ function formatDateTime(ts) {
   return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
 }
 
-// Merge two report arrays into a single de-duplicated list, keyed by
-// report_number. Used to combine the id-based and name-based lookups
-// below without ever showing the same report twice.
+// Merges report arrays into a de-duplicated list keyed by report_number,
+// so the id-based and name-based lookups below never show a duplicate.
 function mergeReportsByNumber(...lists) {
   const map = new Map()
   for (const list of lists) {
@@ -150,10 +151,9 @@ function Attachment2307Badge({ value }) {
   )
 }
 
-// Per-check status within an otherwise-pending report. A report only ever
-// reaches this page while awaiting a decision, so in practice every check
-// on it should read "picked_up"/"pending_approval" — the "returned" branch
-// is kept purely as a defensive fallback in case of stale/inconsistent data.
+// Per-check status within an otherwise-pending report. Every check here
+// should read "picked_up" or "pending_approval" — "returned" is kept as a
+// defensive fallback in case of stale/inconsistent data.
 function CheckOutcomeBadge({ status }) {
   if (status === 'returned')
     return (
@@ -178,10 +178,8 @@ function CheckOutcomeBadge({ status }) {
   return null
 }
 
-// Every report on this page is, by construction, awaiting a decision —
-// decided reports are excluded at the query level and filtered again
-// defensively in `load()`. So this is a single fixed badge, not a
-// branching status indicator.
+// Every report on this page is, by construction, submitted and awaiting a
+// decision — that's a fixed badge, not a branching status indicator.
 function PendingStatusBadge() {
   return (
     <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-100 px-3 py-1 text-xs font-semibold text-amber-700 ring-1 ring-inset ring-amber-200">
@@ -323,11 +321,9 @@ function ReportChecksTable({ checks }) {
 }
 
 export default function VerifierStaleApprovals() {
-  // NOTE: `id` is the verifier's profiles.id (== auth.uid()). If your
-  // ProfileContext doesn't currently expose it, add it there — it's the
-  // same id already used as generated_by's FK target, so it should be
-  // trivially available from the same session/profile row that gives you
-  // `name`.
+  // `id` is the verifier's profiles.id (== auth.uid()), the same value
+  // used as generated_by's FK target — it should already be available
+  // wherever ProfileContext exposes `name`.
   const { id: myId, name, pickupBranch, isAllBranches, loading: profileLoading, error: profileError } = useProfile()
 
   const [reports, setReports] = useState([])
@@ -355,18 +351,22 @@ export default function VerifierStaleApprovals() {
         return
       }
 
-      mode === 'initial' ? setLoading(true) : setRefreshing(true)
+      if (mode === 'initial') {
+        setLoading(true)
+      } else {
+        setRefreshing(true)
+      }
       setLoadError('')
 
       try {
         // Scoped to reports THIS verifier generated, in THIS verifier's
-        // branch, that are still awaiting an approver's decision. Two
-        // independent identity keys (id + name) are merged; branch and
-        // `decided_at IS NULL` are enforced on top of both, mirroring the
-        // RLS policy server-side. This isn't the security boundary (RLS
-        // is) — it just keeps the client from requesting rows outside
-        // scope and keeps this page's "pending" framing accurate even if
-        // the RPC/RLS drift.
+        // branch, that are submitted and still awaiting an approver's
+        // decision. Two independent identity keys (id + name) are merged;
+        // branch, status, and decided_at are enforced on top of both,
+        // mirroring the RLS policy server-side. This isn't the security
+        // boundary (RLS is) — it keeps the client from requesting rows
+        // outside scope and keeps this page's "pending" framing accurate
+        // even if the RPC/RLS drift.
         const branchLabel = !isAllBranches ? pickupBranch : null
 
         const queries = []
@@ -376,6 +376,7 @@ export default function VerifierStaleApprovals() {
             .from('staled_check_reports')
             .select(REPORT_COLUMNS)
             .eq('generated_by', myId)
+            .eq('status', AWAITING_DECISION_STATUS)
             .is('decided_at', null)
             .order('generated_at', { ascending: false })
             .limit(PAGE_SIZE)
@@ -388,6 +389,7 @@ export default function VerifierStaleApprovals() {
             .from('staled_check_reports')
             .select(REPORT_COLUMNS)
             .ilike('generated_by_name', myName)
+            .eq('status', AWAITING_DECISION_STATUS)
             .is('decided_at', null)
             .order('generated_at', { ascending: false })
             .limit(PAGE_SIZE)
@@ -402,20 +404,21 @@ export default function VerifierStaleApprovals() {
 
         let data = mergeReportsByNumber(...results.map((r) => r.data))
 
-        // Defense-in-depth: even though the query already filters on
-        // `decided_at IS NULL`, never trust that alone to keep decided
-        // (approved/returned) reports off this page — drop any that
-        // slipped through and log it so a query/RLS regression is visible
-        // instead of silently showing stale-looking "pending" reports.
+        // Defense-in-depth: never trust the query filters alone to keep
+        // unsubmitted drafts (status = 'generated') or decided reports off
+        // this page. A verifier can generate a report multiple times
+        // before submitting one of them — every earlier, unsubmitted
+        // generation must never appear here as "awaiting decision", since
+        // it was never sent to an approver and never will be.
         data = data.filter((r) => {
-          if (r.decided_at) {
+          const isEligible = r.status === AWAITING_DECISION_STATUS && !r.decided_at
+          if (!isEligible) {
             console.warn(
-              `[VerifierStaleApprovals] Dropped report ${r.report_number}: already decided at ${r.decided_at} ` +
+              `[VerifierStaleApprovals] Dropped report ${r.report_number}: status="${r.status}", decided_at=${r.decided_at ?? 'null'} ` +
                 `but matched the pending-reports query.`,
             )
-            return false
           }
-          return true
+          return isEligible
         })
 
         data.sort((a, b) => new Date(b.generated_at) - new Date(a.generated_at))
@@ -431,12 +434,11 @@ export default function VerifierStaleApprovals() {
 
         setReports(
           data.map((r) => {
-            // check_ids on the report is the source of truth for which
-            // checks belong to it. If a check id has no matching row (e.g.
-            // it was hard-deleted), it's silently dropped from the
-            // cascade rather than crashing the row — checkCount below
-            // still reflects the original check_ids length so a mismatch
-            // is visible instead of hidden.
+            // check_ids is the source of truth for which checks belong to
+            // a report. A missing check row (e.g. hard-deleted) is
+            // silently dropped from the cascade rather than crashing the
+            // row — checkCount still reflects the original check_ids
+            // length so any mismatch stays visible instead of hidden.
             const checks = (r.check_ids || []).map((id) => checksById.get(id)).filter(Boolean)
             const banks = [...new Set(checks.map((c) => normalizeBank(c.bank)))]
             const branches = [...new Set(checks.map((c) => normalizeBranch(c.pickup_branch)))]
@@ -484,7 +486,11 @@ export default function VerifierStaleApprovals() {
   function toggleExpand(reportNumber) {
     setExpandedIds((prev) => {
       const next = new Set(prev)
-      next.has(reportNumber) ? next.delete(reportNumber) : next.add(reportNumber)
+      if (next.has(reportNumber)) {
+        next.delete(reportNumber)
+      } else {
+        next.add(reportNumber)
+      }
       return next
     })
   }

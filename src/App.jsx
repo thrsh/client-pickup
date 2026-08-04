@@ -25,6 +25,7 @@ import VerifierAccount from './pages/verifier/VerifierAccount'
 import ApproverDashboard from './pages/approver/ApproverDashboard'
 import ApproverHome from './pages/approver/ApproverHome'
 import ApproverHistory from './pages/approver/ApproverHistory'
+import ApproverBillingReport from './pages/approver/ApproverBillingReport'
 import ApproverAccount from './pages/approver/ApproverAccount'
 
 import AdminDashboard from './pages/admin/AdminDashboard'
@@ -120,6 +121,7 @@ export default function App() {
               <Route index element={<ApproverDashboard />} />
               <Route path="pending" element={<ApproverHome />} />
               <Route path="history" element={<ApproverHistory />} />
+              <Route path="billing-report" element={<ApproverBillingReport />} />
               <Route path="account" element={<ApproverAccount />} />
             </Route>
 
