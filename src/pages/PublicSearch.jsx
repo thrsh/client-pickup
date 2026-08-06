@@ -1222,7 +1222,8 @@ function Hero() {
       <div className="grid grid-cols-1 md:grid-cols-2 gap-8 items-center h-full">
         <div className="relative z-10 flex flex-col justify-center px-6 py-11 sm:px-12 sm:py-14 md:pr-0">
           <h1 className="font-display text-4xl font-extrabold leading-tight sm:text-5xl lg:text-6xl">
-            Check Releasing
+            {/* Added whitespace-nowrap here to prevent line breaks */}
+            <span className="whitespace-nowrap">Check Releasing</span>
             <br />
             <span className="text-[var(--accent)]">System</span>
           </h1>
