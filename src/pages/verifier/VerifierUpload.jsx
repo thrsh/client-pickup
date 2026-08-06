@@ -87,7 +87,20 @@ const COMPANY_NAME_MAX_LENGTH = 150
 // an otherwise-valid row outright instead of failing gracefully here.
 const PAYEE_MAX_LENGTH = 200
 
-const PREVIEW_COLSPAN = CORE_FIELDS.length + EXTRA_FIELDS.length + 4
+// +5 (not +4) accounts for the Include, Row, Bank, Type, and Payee
+// (Resolved) columns that precede the mapped fields in the preview table.
+const PREVIEW_COLSPAN = CORE_FIELDS.length + EXTRA_FIELDS.length + 5
+
+// The only two valid check types. Selected once per upload — just like
+// bank — and applies to every row in the file: a single spreadsheet can't
+// mix Manager Checks and Corporate Checks, since they're distinct
+// instruments with their own downstream handling.
+const CHECK_TYPES = [
+  { value: 'MC', label: 'Manager Check (MC)' },
+  { value: 'CC', label: 'Corporate Check (CC)' },
+]
+const CHECK_TYPE_LABELS = Object.fromEntries(CHECK_TYPES.map((t) => [t.value, t.label]))
+const VALID_CHECK_TYPE_VALUES = new Set(CHECK_TYPES.map((t) => t.value))
 
 const BANKS = [
   'BDO Unibank',
@@ -184,7 +197,7 @@ const FLAG_LABELS = {
   negativeAmount: 'Negative amount',
   missingDate: 'Missing or unreadable date',
   futureDate: 'Check dated in the future',
-  duplicateCheckNo: 'Exact duplicate row (same bank, payee, payor, check no. & check date)',
+  duplicateCheckNo: 'Exact duplicate row (same bank, check type, payee, payor, check no. & check date)',
   existsInSystem: 'This exact row is already imported',
   missingClientRefNo: 'Missing client ref. no.',
   invalidClientRefNo: 'Client ref. no. must be digits only (max 12 characters)',
@@ -196,8 +209,8 @@ const FLAG_LABELS = {
   invalidForm2307Attached: '2307 Attached must be a single character: Y or N',
 }
 
-function fullRowKey(bank, checkNo, payee, payor, checkDate) {
-  return [bank, checkNo, payee, payor, checkDate]
+function fullRowKey(bank, checkType, checkNo, payee, payor, checkDate) {
+  return [bank, checkType, checkNo, payee, payor, checkDate]
     .map((v) => String(v ?? '').trim().toLowerCase())
     .join('::')
 }
@@ -414,7 +427,7 @@ function downloadFlaggedRows(rows, fileNameBase) {
   if (rows.length === 0) return
   const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`
   const header =
-    'Row,Bank,Payee (Resolved),Payee Company,Payee First Name,Payee Middle Name,Payee Last Name,Payor,Check No,Check Date,Amount,Client Ref No,Pickup Branch,Account Number,2307 Attached,Issues'
+    'Row,Bank,Check Type,Payee (Resolved),Payee Company,Payee First Name,Payee Middle Name,Payee Last Name,Payor,Check No,Check Date,Amount,Client Ref No,Pickup Branch,Account Number,2307 Attached,Issues'
   const lines = rows.map((r) => {
     const issues = Object.entries(FLAG_LABELS)
       .filter(([key]) => r.flags[key])
@@ -423,6 +436,7 @@ function downloadFlaggedRows(rows, fileNameBase) {
     return [
       r.rowNumber,
       esc(r.bank),
+      esc(r.check_type),
       esc(r.payee),
       esc(r.payee_company),
       esc(r.payee_first_name),
@@ -453,12 +467,12 @@ function downloadFlaggedRows(rows, fileNameBase) {
 
 // ---- Duplicate lookup + race-safe insert -----------------------------------
 
-// Looks up which (bank, check_no) pairs in `checkNos` already exist for
-// `bank`, then narrows the result to the exact-match key used everywhere
-// else in this file (bank + check no. + payee + payor + check date).
-// Shared by the debounced preview check and the final pre-commit re-check
-// in handleImport, so both read the exact same "is this really a
-// duplicate" definition.
+// Looks up which (bank, check_type, check_no) triples in `checkNos` already
+// exist for `bank` + `checkType`, then narrows the result to the exact-match
+// key used everywhere else in this file (bank + check type + check no. +
+// payee + payor + check date). Shared by the debounced preview check and
+// the final pre-commit re-check in handleImport, so both read the exact
+// same "is this really a duplicate" definition.
 //
 // This is still a best-effort, point-in-time snapshot — it narrows the
 // race window between two concurrent uploads but can't fully close it on
@@ -466,17 +480,26 @@ function downloadFlaggedRows(rows, fileNameBase) {
 // (see checks_dedupe_migration.sql), enforced by upsertChunkWithFallback
 // below. This function exists for a good user experience; it isn't the
 // safety net itself.
-async function fetchExistingRowKeys(bank, checkNos) {
+//
+// NOTE: this assumes a `check_type` column already exists on `checks`. If
+// the `dedupe_key` generated column/unique index was defined before check
+// type existed, it should be updated to also include check_type — otherwise
+// the database-level guarantee in upsertChunkWithFallback won't distinguish
+// an MC and a CC check that otherwise share the same bank/check no./payee/
+// payor/check date, and the second one would be silently skipped as a
+// "duplicate" even though it's a different instrument.
+async function fetchExistingRowKeys(bank, checkType, checkNos) {
   const found = new Set()
   for (const chunk of chunkArray(checkNos, DUPLICATE_CHECK_CHUNK_SIZE)) {
     const { data, error } = await supabase
       .from('checks')
-      .select('check_no, payee, payor, check_date')
+      .select('check_no, payee, payor, check_date, check_type')
       .eq('bank', bank)
+      .eq('check_type', checkType)
       .in('check_no', chunk)
     if (error) throw error
     data?.forEach((d) => {
-      if (d.check_no) found.add(fullRowKey(bank, d.check_no, d.payee, d.payor, d.check_date))
+      if (d.check_no) found.add(fullRowKey(bank, checkType, d.check_no, d.payee, d.payor, d.check_date))
     })
   }
   return found
@@ -564,6 +587,7 @@ export default function AdminUpload() {
   const [isDragging, setIsDragging] = useState(false)
   const [importedCount, setImportedCount] = useState(null) // set once import succeeds
   const [importedBank, setImportedBank] = useState('') // snapshot for the success screen
+  const [importedCheckType, setImportedCheckType] = useState('') // snapshot for the success screen
   const [showAllRows, setShowAllRows] = useState(false)
 
   // Which bank this file's checks belong to. Selected up front and required
@@ -572,17 +596,24 @@ export default function AdminUpload() {
   const [selectedBank, setSelectedBank] = useState('')
   const [customBank, setCustomBank] = useState('')
 
+  // Which check type (Manager Check or Corporate Check) this file's checks
+  // are. Just like bank, this is selected once per upload and applies to
+  // every row in the file — required before a file can be chosen, so every
+  // row that enters the pipeline is guaranteed to carry a valid check type.
+  const [checkType, setCheckType] = useState('')
+
   // Advanced preview controls
   const [excludedRows, setExcludedRows] = useState(() => new Set()) // indices (into rawRows) excluded from import
   const [previewSearch, setPreviewSearch] = useState('')
   const [showFlaggedOnly, setShowFlaggedOnly] = useState(false)
   const [showDupHelp, setShowDupHelp] = useState(false)
 
-  // Cross-checks the mapped (bank, check no., payee, payor, check date)
-  // combinations against what's already in the database, so re-uploading
-  // the same batch (or an overlapping one) gets caught before it creates
-  // duplicate register entries. Only an EXACT match across all five fields
-  // counts — change any one of them and it's a distinct, allowed entry.
+  // Cross-checks the mapped (bank, check type, check no., payee, payor,
+  // check date) combinations against what's already in the database, so
+  // re-uploading the same batch (or an overlapping one) gets caught before
+  // it creates duplicate register entries. Only an EXACT match across all
+  // six fields counts — change any one of them and it's a distinct,
+  // allowed entry.
   // NOTE: this is an advisory, point-in-time preview check only. The
   // actual guarantee against a second verifier importing the same rows at
   // the same time comes from the dedupe_key unique index + the final
@@ -615,15 +646,31 @@ export default function AdminUpload() {
   const bankValid = bankValue.length > 0
   const needsCustomBankName = selectedBank === OTHER_BANK_VALUE && customBank.trim().length === 0
 
+  // Check type is a plain, closed-set selection (MC or CC) — no free text,
+  // so there's nothing to resolve beyond validating it's one of the two
+  // allowed values.
+  const checkTypeValid = VALID_CHECK_TYPE_VALUES.has(checkType)
+
+  // Both a bank AND a check type must be chosen before a file can even be
+  // selected — every row that enters the pipeline needs both.
+  const canSelectFile = bankValid && checkTypeValid
+
+  function uploadBlockedReason() {
+    if (!bankValid) return 'Choose which bank this file is coming from before uploading.'
+    if (!checkTypeValid) return 'Choose whether these are Manager Checks (MC) or Corporate Checks (CC) before uploading.'
+    return ''
+  }
+
   // ---- Normalization + validation pipeline --------------------------------
   // Every row is normalized once here (trimmed text, parsed currency,
-  // standardized dates, the resolved payee name, and the selected bank)
-  // and tagged with every applicable validation flag. Everything
-  // downstream — the KPI cards, the preview table, the CSV export, and
-  // the actual import — reads from this single source of truth so
-  // normalization can never drift between what's shown and what's saved.
+  // standardized dates, the resolved payee name, and the selected bank +
+  // check type) and tagged with every applicable validation flag.
+  // Everything downstream — the KPI cards, the preview table, the CSV
+  // export, and the actual import — reads from this single source of
+  // truth so normalization can never drift between what's shown and
+  // what's saved.
   const normalizedRows = useMemo(() => {
-    if (!mappingComplete || !bankValid || rawRows.length === 0) return []
+    if (!mappingComplete || !bankValid || !checkTypeValid || rawRows.length === 0) return []
 
     const payeeCompanyIdx = mapping.payee_company ? headers.indexOf(mapping.payee_company) : -1
     const payeeFirstNameIdx = mapping.payee_first_name ? headers.indexOf(mapping.payee_first_name) : -1
@@ -675,6 +722,7 @@ export default function AdminUpload() {
         index: i,
         rowNumber: i + 2, // +2 accounts for the header row occupying row 1
         bank: bankValue,
+        check_type: checkType,
         // Resolved value — what actually gets saved as `payee`.
         payee: resolvedPayee,
         payee_company: company.value,
@@ -709,17 +757,17 @@ export default function AdminUpload() {
       }
     })
 
-    // Duplicate detection requires every one of bank, check no., payee,
-    // payor, AND check date to match — a row is only flagged if another
-    // row in the file is identical across all five. Any single field
-    // being different (a different payor, a different date, etc.) makes
-    // it a distinct row, not a duplicate. `payee` here is always the
-    // resolved name, so it stays correct whether a row used a company or
-    // an individual name.
+    // Duplicate detection requires every one of bank, check type, check
+    // no., payee, payor, AND check date to match — a row is only flagged
+    // if another row in the file is identical across all six. Any single
+    // field being different (a different payor, a different date, an MC
+    // vs. a CC, etc.) makes it a distinct row, not a duplicate. `payee`
+    // here is always the resolved name, so it stays correct whether a row
+    // used a company or an individual name.
     const rowCounts = new Map()
     draft.forEach((r) => {
       if (!r.check_no) return
-      const key = fullRowKey(r.bank, r.check_no, r.payee, r.payor, r.check_date)
+      const key = fullRowKey(r.bank, r.check_type, r.check_no, r.payee, r.payor, r.check_date)
       rowCounts.set(key, (rowCounts.get(key) || 0) + 1)
     })
 
@@ -748,7 +796,7 @@ export default function AdminUpload() {
         futureDate: !!r.check_date && new Date(r.check_date) > todayEnd,
         duplicateCheckNo:
           !!r.check_no &&
-          rowCounts.get(fullRowKey(r.bank, r.check_no, r.payee, r.payor, r.check_date)) > 1,
+          rowCounts.get(fullRowKey(r.bank, r.check_type, r.check_no, r.payee, r.payor, r.check_date)) > 1,
         missingClientRefNo: FIELD_DEFS_BY_KEY.client_ref_no.required && !r.clientRefPresent,
         invalidClientRefNo: r.clientRefPresent && !r.clientRefValid,
         missingAccountNumber: FIELD_DEFS_BY_KEY.account_number.required && !r.accountNumberPresent,
@@ -761,12 +809,12 @@ export default function AdminUpload() {
       const hasIssue = Object.values(flags).some(Boolean)
       return { ...r, flags, hasIssue }
     })
-  }, [mappingComplete, bankValid, bankValue, rawRows, headers, mapping])
+  }, [mappingComplete, bankValid, bankValue, checkTypeValid, checkType, rawRows, headers, mapping])
 
   // Looks up mapped check numbers against the database (narrowed further
-  // to an exact bank+payee+payor+date match client-side below). Debounced
-  // and best-effort in the sense that a failed/slow lookup never blocks
-  // the UI — but any exact match it does find is treated as a hard
+  // to an exact bank+check type+payee+payor+date match client-side below).
+  // Debounced and best-effort in the sense that a failed/slow lookup never
+  // blocks the UI — but any exact match it does find is treated as a hard
   // duplicate (see the force-exclude effect below), not just a warning.
   useEffect(() => {
     if (normalizedRows.length === 0) {
@@ -774,7 +822,7 @@ export default function AdminUpload() {
       return
     }
     const uniqueNos = [...new Set(normalizedRows.map((r) => r.check_no).filter(Boolean))]
-    if (uniqueNos.length === 0 || !bankValue) {
+    if (uniqueNos.length === 0 || !bankValue || !checkTypeValid) {
       setExistingCheckNos(new Set())
       return
     }
@@ -783,7 +831,7 @@ export default function AdminUpload() {
     setCheckingDuplicates(true)
     const t = setTimeout(async () => {
       try {
-        const found = await fetchExistingRowKeys(bankValue, uniqueNos)
+        const found = await fetchExistingRowKeys(bankValue, checkType, uniqueNos)
         if (!cancelled) setExistingCheckNos(found)
       } catch {
         // Best-effort only — a failed lookup just means this particular
@@ -797,29 +845,29 @@ export default function AdminUpload() {
       cancelled = true
       clearTimeout(t)
     }
-  }, [normalizedRows, bankValue])
+  }, [normalizedRows, bankValue, checkType, checkTypeValid])
 
   // Merges the synchronous validation flags with the async system-duplicate
   // check into the rows the rest of the UI actually renders from. `blocked`
-  // marks rows that are strictly disallowed — an exact bank+payee+payor+
-  // check no.+check date match, either within this file or already in the
-  // system — and can never be included in the import.
+  // marks rows that are strictly disallowed — an exact bank+check type+
+  // payee+payor+check no.+check date match, either within this file or
+  // already in the system — and can never be included in the import.
   const enrichedRows = useMemo(() => {
     if (normalizedRows.length === 0) return []
     return normalizedRows.map((r) => {
       const existsInSystem =
         !!r.check_no &&
-        existingCheckNos.has(fullRowKey(r.bank, r.check_no, r.payee, r.payor, r.check_date))
+        existingCheckNos.has(fullRowKey(r.bank, r.check_type, r.check_no, r.payee, r.payor, r.check_date))
       const flags = { ...r.flags, existsInSystem }
       const blocked = flags.duplicateCheckNo || existsInSystem
       return { ...r, flags, hasIssue: r.hasIssue || existsInSystem, blocked }
     })
   }, [normalizedRows, existingCheckNos])
 
-  // Exact-match rows (bank, check no., payee, payor & check date all the
-  // same) are strictly not allowed — force them out of the included set
-  // the moment they're detected, and keep them out even if excludedRows
-  // gets reset elsewhere (e.g. "Include all").
+  // Exact-match rows (bank, check type, check no., payee, payor & check
+  // date all the same) are strictly not allowed — force them out of the
+  // included set the moment they're detected, and keep them out even if
+  // excludedRows gets reset elsewhere (e.g. "Include all").
   useEffect(() => {
     const blockedIndices = enrichedRows.filter((r) => r.blocked).map((r) => r.index)
     if (blockedIndices.length === 0) return
@@ -903,25 +951,28 @@ export default function AdminUpload() {
     setImportStageMessage('')
     setImportedCount(null)
     setImportedBank('')
+    setImportedCheckType('')
     setShowAllRows(false)
     setExcludedRows(new Set())
     setPreviewSearch('')
     setShowFlaggedOnly(false)
     setExistingCheckNos(new Set())
-    // Deliberately NOT resetting selectedBank/customBank — admins commonly
-    // upload several files from the same bank back to back, so the choice
-    // persists until they explicitly change it.
+    // Deliberately NOT resetting selectedBank/customBank/checkType —
+    // admins commonly upload several files from the same bank and check
+    // type back to back, so the choice persists until they explicitly
+    // change it.
     if (inputRef.current) inputRef.current.value = ''
   }
 
   function processFile(file) {
     if (!file) return
 
-    if (!bankValid) {
+    const blockedReason = uploadBlockedReason()
+    if (blockedReason) {
       push({
         variant: 'error',
-        title: 'Select a bank first',
-        description: 'Choose which bank this file is coming from before uploading.',
+        title: !bankValid ? 'Select a bank first' : 'Select a check type first',
+        description: blockedReason,
       })
       return
     }
@@ -935,6 +986,7 @@ export default function AdminUpload() {
     setParseError('')
     setImportedCount(null)
     setImportedBank('')
+    setImportedCheckType('')
     setImportStageMessage('')
     setShowAllRows(false)
     setExcludedRows(new Set())
@@ -1012,11 +1064,12 @@ export default function AdminUpload() {
   function handleDrop(e) {
     e.preventDefault()
     setIsDragging(false)
-    if (!bankValid) {
+    const blockedReason = uploadBlockedReason()
+    if (blockedReason) {
       push({
         variant: 'error',
-        title: 'Select a bank first',
-        description: 'Choose which bank this file is coming from before uploading.',
+        title: !bankValid ? 'Select a bank first' : 'Select a check type first',
+        description: blockedReason,
       })
       return
     }
@@ -1034,6 +1087,10 @@ export default function AdminUpload() {
     const value = e.target.value
     setSelectedBank(value)
     if (value !== OTHER_BANK_VALUE) setCustomBank('')
+  }
+
+  function handleCheckTypeChange(e) {
+    setCheckType(e.target.value)
   }
 
   // Exact-match rows are strictly disallowed and cannot be manually
@@ -1060,13 +1117,13 @@ export default function AdminUpload() {
   }
 
   function includeAllRows() {
-    // Blocked rows (exact bank + check no. + payee + payor + date match)
-    // stay excluded even on bulk include.
+    // Blocked rows (exact bank + check type + check no. + payee + payor +
+    // date match) stay excluded even on bulk include.
     setExcludedRows(new Set(enrichedRows.filter((r) => r.blocked).map((r) => r.index)))
   }
 
   async function handleImport() {
-    if (!mappingComplete || !bankValid || saving) return
+    if (!mappingComplete || !bankValid || !checkTypeValid || saving) return
 
     // Defense in depth: never send a blocked (exact duplicate row) to the
     // database, regardless of what excludedRows currently holds.
@@ -1113,9 +1170,9 @@ export default function AdminUpload() {
       let rowsToImport = includedRows
       try {
         const checkNos = [...new Set(includedRows.map((r) => r.check_no).filter(Boolean))]
-        const freshExisting = await fetchExistingRowKeys(bankValue, checkNos)
+        const freshExisting = await fetchExistingRowKeys(bankValue, checkType, checkNos)
         rowsToImport = includedRows.filter(
-          (r) => !freshExisting.has(fullRowKey(r.bank, r.check_no, r.payee, r.payor, r.check_date)),
+          (r) => !freshExisting.has(fullRowKey(r.bank, r.check_type, r.check_no, r.payee, r.payor, r.check_date)),
         )
         raceExcludedCount = includedRows.length - rowsToImport.length
       } catch {
@@ -1138,11 +1195,12 @@ export default function AdminUpload() {
       await animateProgress({ from: 34, to: 52, durationMs: 400, onUpdate: setImportProgress })
 
       // Rows already carry their normalized values (including the resolved
-      // payee name and bank) from the pipeline above, so the saved data
-      // always matches exactly what the preview showed.
+      // payee name, bank, and check type) from the pipeline above, so the
+      // saved data always matches exactly what the preview showed.
       const preparedRows = rowsToImport.map((r) => ({
         row_number: r.rowNumber,
         bank: r.bank,
+        check_type: r.check_type,
         payee: r.payee,
         payee_company: r.payee_company || null,
         payee_first_name: r.payee_first_name || null,
@@ -1167,6 +1225,7 @@ export default function AdminUpload() {
         .insert({
           file_name: fileName,
           bank: bankValue,
+          check_type: checkType,
           total_rows: preparedRows.length,
           uploaded_by: user?.id,
         })
@@ -1212,6 +1271,7 @@ export default function AdminUpload() {
         batch_id: batch.id,
         file_name: fileName,
         bank: bankValue,
+        check_type: checkType,
         row_count: insertedTotal,
         excluded_count: enrichedRows.length - insertedTotal,
         race_excluded_count: raceExcludedCount,
@@ -1246,10 +1306,11 @@ export default function AdminUpload() {
         title: 'Import complete',
         description:
           (skippedNotes.length > 0
-            ? `${insertedTotal} ${bankValue} checks added from ${fileName} (${skippedNotes.join(', ')}).`
-            : `${insertedTotal} ${bankValue} checks added from ${fileName}.`) + migrationNote,
+            ? `${insertedTotal} ${bankValue} ${CHECK_TYPE_LABELS[checkType]} checks added from ${fileName} (${skippedNotes.join(', ')}).`
+            : `${insertedTotal} ${bankValue} ${CHECK_TYPE_LABELS[checkType]} checks added from ${fileName}.`) + migrationNote,
       })
       setImportedBank(bankValue)
+      setImportedCheckType(checkType)
       setImportedCount(insertedTotal)
     } catch (err) {
       push({
@@ -1263,25 +1324,26 @@ export default function AdminUpload() {
     }
   }
 
-  const currentStep = importedCount !== null ? 4 : hasFile ? 3 : bankValid ? 2 : 1
+  const currentStep = importedCount !== null ? 4 : hasFile ? 3 : canSelectFile ? 2 : 1
 
   return (
     <div>
       <div className="mb-6">
         <h1 className="font-display text-2xl font-semibold text-ink-900">Upload a file</h1>
         <p className="mt-1 text-sm text-ink-400">
-          Select the source bank, then import a CSV or Excel file (up to {formatFileSize(MAX_FILE_SIZE_BYTES)},{' '}
-          {MAX_ROWS.toLocaleString()} rows max) with Payor, Check No, Check Date, and Amount columns. For the
-          payee, map either a Payee Company column, or Payee First/Middle/Last Name columns for an individual —
-          whichever one is filled in for a row is what gets saved. Client Ref. No, Pickup Branch, Account
-          Number, and 2307 Attached are all required columns too: Pickup Branch must resolve to exactly{' '}
-          <span className="font-medium text-ink-600">CSBA - Parqal</span> or{' '}
-          <span className="font-medium text-ink-600">CSBA - BGC</span>, and 2307 Attached must be a single{' '}
+          Select the source bank and check type, then import a CSV or Excel file (up to{' '}
+          {formatFileSize(MAX_FILE_SIZE_BYTES)}, {MAX_ROWS.toLocaleString()} rows max) with Payor, Check No,
+          Check Date, and Amount columns. For the payee, map either a Payee Company column, or Payee
+          First/Middle/Last Name columns for an individual — whichever one is filled in for a row is what gets
+          saved. Client Ref. No, Pickup Branch, Account Number, and 2307 Attached are all required columns too:
+          Pickup Branch must resolve to exactly <span className="font-medium text-ink-600">CSBA - Parqal</span>{' '}
+          or <span className="font-medium text-ink-600">CSBA - BGC</span>, and 2307 Attached must be a single{' '}
           <span className="font-mono font-medium text-ink-600">Y</span> or{' '}
           <span className="font-mono font-medium text-ink-600">N</span> character. A row is only treated as a
-          duplicate if its bank, payee, payor, check no., and check date all match another row exactly — change
-          any one of those and it's a distinct row. Two verifiers importing overlapping rows at the same time are
-          each protected: the database rejects the second copy rather than both silently succeeding.
+          duplicate if its bank, check type, payee, payor, check no., and check date all match another row
+          exactly — change any one of those and it's a distinct row. Two verifiers importing overlapping rows
+          at the same time are each protected: the database rejects the second copy rather than both silently
+          succeeding.
         </p>
       </div>
 
@@ -1294,61 +1356,97 @@ export default function AdminUpload() {
               count={importedCount}
               fileName={fileName}
               bank={importedBank}
+              checkType={importedCheckType}
               onUploadAnother={resetFileState}
             />
           ) : (
             <>
-              <div className="mb-6">
-                <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-ink-500">
-                  <Landmark className="h-3.5 w-3.5 text-teal-500" />
-                  Bank <span className="text-red-500">*</span>
-                </label>
-                <div className="flex flex-wrap items-center gap-2">
-                  <Select
-                    value={selectedBank}
-                    onChange={handleBankSelectChange}
-                    disabled={saving}
-                    className={cn('max-w-xs', !bankValid && 'ring-1 ring-orange-400/60')}
-                  >
-                    <option value="">— Select bank —</option>
-                    {BANKS.map((b) => (
-                      <option key={b} value={b}>
-                        {b}
-                      </option>
-                    ))}
-                    <option value={OTHER_BANK_VALUE}>Other (type manually)</option>
-                  </Select>
-                  {selectedBank === OTHER_BANK_VALUE && (
-                    <input
-                      type="text"
-                      value={customBank}
-                      onChange={(e) => setCustomBank(e.target.value.slice(0, MAX_CUSTOM_BANK_LENGTH))}
+              <div className="mb-6 grid gap-5 sm:grid-cols-2">
+                <div>
+                  <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-ink-500">
+                    <Landmark className="h-3.5 w-3.5 text-teal-500" />
+                    Bank <span className="text-red-500">*</span>
+                  </label>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Select
+                      value={selectedBank}
+                      onChange={handleBankSelectChange}
                       disabled={saving}
-                      placeholder="Enter bank name"
-                      maxLength={MAX_CUSTOM_BANK_LENGTH}
-                      autoFocus
-                      className={cn(
-                        'w-56 rounded-md border px-3 py-1.5 text-sm text-ink-800 focus:outline-none focus:ring-1 focus:ring-teal-400',
-                        needsCustomBankName ? 'border-orange-300' : 'border-ink-200',
-                      )}
-                    />
+                      className={cn('max-w-xs', !bankValid && 'ring-1 ring-orange-400/60')}
+                    >
+                      <option value="">— Select bank —</option>
+                      {BANKS.map((b) => (
+                        <option key={b} value={b}>
+                          {b}
+                        </option>
+                      ))}
+                      <option value={OTHER_BANK_VALUE}>Other (type manually)</option>
+                    </Select>
+                    {selectedBank === OTHER_BANK_VALUE && (
+                      <input
+                        type="text"
+                        value={customBank}
+                        onChange={(e) => setCustomBank(e.target.value.slice(0, MAX_CUSTOM_BANK_LENGTH))}
+                        disabled={saving}
+                        placeholder="Enter bank name"
+                        maxLength={MAX_CUSTOM_BANK_LENGTH}
+                        autoFocus
+                        className={cn(
+                          'w-56 rounded-md border px-3 py-1.5 text-sm text-ink-800 focus:outline-none focus:ring-1 focus:ring-teal-400',
+                          needsCustomBankName ? 'border-orange-300' : 'border-ink-200',
+                        )}
+                      />
+                    )}
+                  </div>
+                  {!bankValid ? (
+                    <p className="mt-1.5 flex items-center gap-1.5 text-xs font-medium text-orange-600">
+                      <AlertTriangle className="h-3.5 w-3.5" />
+                      {needsCustomBankName
+                        ? 'Type the bank name to continue.'
+                        : 'Select which bank this file is coming from before uploading.'}
+                    </p>
+                  ) : (
+                    hasFile && (
+                      <p className="mt-1.5 text-xs text-ink-400">
+                        All {rawRows.length.toLocaleString()} rows will be tagged as{' '}
+                        <span className="font-medium text-ink-600">{bankValue}</span>.
+                      </p>
+                    )
                   )}
                 </div>
-                {!bankValid ? (
-                  <p className="mt-1.5 flex items-center gap-1.5 text-xs font-medium text-orange-600">
-                    <AlertTriangle className="h-3.5 w-3.5" />
-                    {needsCustomBankName
-                      ? 'Type the bank name to continue.'
-                      : 'Select which bank this file is coming from before uploading.'}
-                  </p>
-                ) : (
-                  hasFile && (
-                    <p className="mt-1.5 text-xs text-ink-400">
-                      All {rawRows.length.toLocaleString()} rows will be tagged as{' '}
-                      <span className="font-medium text-ink-600">{bankValue}</span>.
+
+                <div>
+                  <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-ink-500">
+                    <Stamp className="h-3.5 w-3.5 text-teal-500" />
+                    Check Type <span className="text-red-500">*</span>
+                  </label>
+                  <Select
+                    value={checkType}
+                    onChange={handleCheckTypeChange}
+                    disabled={saving}
+                    className={cn('max-w-xs', !checkTypeValid && 'ring-1 ring-orange-400/60')}
+                  >
+                    <option value="">— Select check type —</option>
+                    {CHECK_TYPES.map((t) => (
+                      <option key={t.value} value={t.value}>
+                        {t.label}
+                      </option>
+                    ))}
+                  </Select>
+                  {!checkTypeValid ? (
+                    <p className="mt-1.5 flex items-center gap-1.5 text-xs font-medium text-orange-600">
+                      <AlertTriangle className="h-3.5 w-3.5" />
+                      Select whether these are Manager Checks (MC) or Corporate Checks (CC).
                     </p>
-                  )
-                )}
+                  ) : (
+                    hasFile && (
+                      <p className="mt-1.5 text-xs text-ink-400">
+                        All {rawRows.length.toLocaleString()} rows will be tagged as{' '}
+                        <span className="font-medium text-ink-600">{CHECK_TYPE_LABELS[checkType]}</span>.
+                      </p>
+                    )
+                  )}
+                </div>
               </div>
 
               {!hasFile ? (
@@ -1357,24 +1455,25 @@ export default function AdminUpload() {
                     htmlFor="file-upload"
                     onDragOver={(e) => {
                       e.preventDefault()
-                      if (bankValid) setIsDragging(true)
+                      if (canSelectFile) setIsDragging(true)
                     }}
                     onDragLeave={() => setIsDragging(false)}
                     onDrop={handleDrop}
                     onClick={(e) => {
-                      if (!bankValid) {
+                      const blockedReason = uploadBlockedReason()
+                      if (blockedReason) {
                         e.preventDefault()
                         push({
                           variant: 'error',
-                          title: 'Select a bank first',
-                          description: 'Choose which bank this file is coming from before uploading.',
+                          title: !bankValid ? 'Select a bank first' : 'Select a check type first',
+                          description: blockedReason,
                         })
                       }
                     }}
                     className={cn(
                       'flex flex-col items-center gap-2 rounded-lg border-2 border-dashed py-12 text-center transition',
-                      !bankValid && 'cursor-not-allowed opacity-60',
-                      bankValid && 'cursor-pointer',
+                      !canSelectFile && 'cursor-not-allowed opacity-60',
+                      canSelectFile && 'cursor-pointer',
                       isDragging
                         ? 'border-teal-500 bg-teal-50'
                         : 'border-ink-200 hover:border-teal-400/60 hover:bg-teal-50/40'
@@ -1401,7 +1500,7 @@ export default function AdminUpload() {
                       type="file"
                       accept={ACCEPTED_EXTENSIONS.join(',')}
                       onChange={handleFile}
-                      disabled={!bankValid}
+                      disabled={!canSelectFile}
                       className="hidden"
                     />
                   </label>
@@ -1428,7 +1527,8 @@ export default function AdminUpload() {
                       <p className="font-mono text-xs text-ink-400">
                         {formatFileSize(fileSize)} / {formatFileSize(MAX_FILE_SIZE_BYTES)} ·{' '}
                         {rawRows.length.toLocaleString()} / {MAX_ROWS.toLocaleString()} rows ·{' '}
-                        <span className="text-teal-700">{bankValue}</span>
+                        <span className="text-teal-700">{bankValue}</span> ·{' '}
+                        <span className="text-teal-700">{CHECK_TYPE_LABELS[checkType]}</span>
                       </p>
                     </div>
                   </div>
@@ -1570,18 +1670,19 @@ export default function AdminUpload() {
                       <div>
                         <p className="font-medium">
                           {stats.blocked} row{stats.blocked === 1 ? '' : 's'} blocked — exact duplicate of another
-                          row under {bankValue}
+                          row under {bankValue} ({CHECK_TYPE_LABELS[checkType]})
                         </p>
                         <p className="mt-0.5 text-red-600/90">
                           {existsInSystemCount > 0
                             ? `${existsInSystemCount} of these ${
                                 existsInSystemCount === 1 ? 'is' : 'are'
-                              } already imported with the same bank, payee, payor, check no., and check date. `
+                              } already imported with the same bank, check type, payee, payor, check no., and
+                              check date. `
                             : ''}
-                          A row only counts as a duplicate when every one of bank, payee, payor, check no., and
-                          check date matches another row exactly — if even one field differs, it's allowed.
-                          Matching rows are highlighted red below and excluded automatically — they can't be
-                          re-included.
+                          A row only counts as a duplicate when every one of bank, check type, payee, payor,
+                          check no., and check date matches another row exactly — if even one field differs,
+                          it's allowed. Matching rows are highlighted red below and excluded automatically —
+                          they can't be re-included.
                         </p>
                       </div>
                     </div>
@@ -1603,9 +1704,9 @@ export default function AdminUpload() {
                           ))}
                       </ul>
                       <p className="mt-1.5 text-ink-400">
-                        Rows that exactly duplicate another row (same bank, payee, payor, check no. & check date)
-                        are locked and can't be re-included. Other flagged rows stay included by default — exclude
-                        them below if you don't want them imported.
+                        Rows that exactly duplicate another row (same bank, check type, payee, payor, check no.
+                        & check date) are locked and can't be re-included. Other flagged rows stay included by
+                        default — exclude them below if you don't want them imported.
                       </p>
                     </div>
                   )}
@@ -1698,6 +1799,7 @@ export default function AdminUpload() {
                           <th className="px-3 py-2 font-medium">Include</th>
                           <th className="px-3 py-2 font-medium">Row</th>
                           <th className="px-3 py-2 font-medium">Bank</th>
+                          <th className="px-3 py-2 font-medium">Type</th>
                           <th className="px-3 py-2 font-medium">Payee (Resolved)</th>
                           {CORE_FIELDS.map(({ key, label }) => (
                             <th key={key} className="px-3 py-2 font-medium">
@@ -1715,8 +1817,9 @@ export default function AdminUpload() {
                                   </button>
                                   {showDupHelp && (
                                     <span className="absolute left-0 top-5 z-10 w-64 rounded-md border border-ink-200 bg-white p-2.5 text-[11px] font-normal normal-case text-ink-600 shadow-lg">
-                                      A check no. can repeat freely — it's only a duplicate when the bank, payee,
-                                      payor, check no., AND check date all match another row exactly.
+                                      A check no. can repeat freely — it's only a duplicate when the bank, check
+                                      type, payee, payor, check no., AND check date all match another row
+                                      exactly.
                                     </span>
                                   )}
                                 </span>
@@ -1767,7 +1870,7 @@ export default function AdminUpload() {
                                   }
                                   title={
                                     r.blocked
-                                      ? 'Exact duplicate (same bank, payee, payor, check no. & check date) — cannot be imported'
+                                      ? 'Exact duplicate (same bank, check type, payee, payor, check no. & check date) — cannot be imported'
                                       : undefined
                                   }
                                   className={cn(
@@ -1789,6 +1892,9 @@ export default function AdminUpload() {
                               </td>
                               <td className="px-3 py-2 font-mono text-ink-300">{r.rowNumber}</td>
                               <td className="px-3 py-2 text-ink-700">{r.bank}</td>
+                              <td className="px-3 py-2 font-mono text-ink-700" title={CHECK_TYPE_LABELS[r.check_type]}>
+                                {r.check_type}
+                              </td>
 
                               {/* Resolved payee — what actually gets saved
                                   as `payee`: the company name when given,
@@ -2037,7 +2143,13 @@ export default function AdminUpload() {
                       </p>
                       <Button
                         onClick={handleImport}
-                        disabled={!mappingComplete || !bankValid || saving || (stats && stats.included === 0)}
+                        disabled={
+                          !mappingComplete ||
+                          !bankValid ||
+                          !checkTypeValid ||
+                          saving ||
+                          (stats && stats.included === 0)
+                        }
                         className="bg-orange-500 text-white hover:bg-orange-600 focus-visible:ring-orange-400 disabled:bg-ink-200 disabled:text-ink-400"
                       >
                         {saving ? (
@@ -2141,7 +2253,7 @@ function KpiCard({ icon: Icon, label, value, secondary, accent = 'teal' }) {
 
 function StepTracker({ step }) {
   const steps = [
-    { n: 1, label: 'Select bank' },
+    { n: 1, label: 'Select bank & type' },
     { n: 2, label: 'Upload file' },
     { n: 3, label: 'Map columns' },
     { n: 4, label: 'Imported' },
@@ -2199,7 +2311,7 @@ function StepTracker({ step }) {
   )
 }
 
-function ImportedState({ count, fileName, bank, onUploadAnother }) {
+function ImportedState({ count, fileName, bank, checkType, onUploadAnother }) {
   return (
     <div className="flex flex-col items-center py-10 text-center">
       <span className="stamp-pop flex h-16 w-16 rotate-[-8deg] items-center justify-center rounded-full border-2 border-dashed border-teal-500 bg-teal-50 text-orange-500">
@@ -2213,7 +2325,9 @@ function ImportedState({ count, fileName, bank, onUploadAnother }) {
         {bank && (
           <>
             {' '}
-            (<span className="font-medium text-ink-600">{bank}</span>)
+            (<span className="font-medium text-ink-600">{bank}</span>
+            {checkType && <> · <span className="font-medium text-ink-600">{CHECK_TYPE_LABELS[checkType]}</span></>}
+            )
           </>
         )}
         . They're now available for collectors to search and reserve.

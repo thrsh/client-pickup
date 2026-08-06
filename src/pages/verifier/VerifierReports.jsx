@@ -55,6 +55,12 @@ const ALL_PAYEES_LABEL = 'All Payees'
 const ALL_BANKS_LABEL = 'All Banks'
 const STALE_FIXED_MONTHS = 6
 
+const CHECK_TYPE_OPTIONS = [
+  { value: 'all', label: 'All Types' },
+  { value: 'MC', label: 'MC' },
+  { value: 'CC', label: 'CC' },
+]
+
 const LOGO_URL = '/logo.png'
 
 // NOTE: bank logos have intentionally been removed from every generated
@@ -933,6 +939,7 @@ function CheckReportsWizard() {
 
   const [reportType, setReportType] = useState('released')
   const [includeAuditTrail, setIncludeAuditTrail] = useState(false)
+  const [checkType, setCheckType] = useState('all')
   const [stalenessFilter, setStalenessFilter] = useState('all')
   const [extraDateFrom, setExtraDateFrom] = useState('')
   const [extraDateTo, setExtraDateTo] = useState('')
@@ -1028,6 +1035,7 @@ async function fetchAllChecks({
   extraTo,
   staleFilter,
   cwtAttachedOnly,
+  checkType, // NEW — 'all' | 'MC' | 'CC'
   branchScope, // NEW — pickupBranch to restrict to, or null for "all branches"
 }) {
   const PAGE = 1000
@@ -1047,6 +1055,11 @@ async function fetchAllChecks({
     // not just in the UI — so it can't be bypassed by any combination of
     // the other filters below.
     if (branchScope) req = req.eq('pickup_branch', branchScope)
+
+    // Check type (MC / CC) narrows every report type generated from this
+    // wizard the same way the branch scope does above — 'all' means no
+    // filter is applied.
+    if (checkType && checkType !== 'all') req = req.eq('check_type', checkType)
 
     if (!payeeAll && payees.length > 0) req = req.in('payee', payees)
     if (payor && payor.trim()) req = req.ilike('payor', `%${payor.trim()}%`)
@@ -1229,6 +1242,7 @@ async function handlePreview() {
       extraTo: config.extraDateColumn ? extraDateTo : '',
       staleFilter: config.showStaleness ? stalenessFilter : 'all',
       cwtAttachedOnly: !!config.cwtAttachedOnly,
+      checkType,
       branchScope,
     })
 
@@ -1255,6 +1269,7 @@ async function handlePreview() {
       configKey,
       referenceNumber,
       includeAuditTrail: configKey === 'released_audit',
+      checkType,
       payees: reportPayeeAll ? [] : reportPayees,
       payeeAll: reportPayeeAll,
       banks: reportBankAll ? [] : reportBanks,
@@ -1301,6 +1316,7 @@ async function handleRefresh() {
       extraTo: previewMeta.extraDateTo,
       staleFilter: previewMeta.stalenessFilter,
       cwtAttachedOnly: !!config.cwtAttachedOnly,
+      checkType: previewMeta.checkType,
       branchScope: previewMeta.branchScope, // NEW — same scope as the original preview
     })
     const referenceNumber = generateReportReferenceNumber({
@@ -1337,13 +1353,14 @@ async function handleRefresh() {
 
   function buildHeaderLines(
     configKey,
-    { referenceNumber, payeeDisplay, bankDisplay, payor, releasedDateValue, dateFrom, dateTo, extraDateLabel, extraDateFrom, extraDateTo }
+    { referenceNumber, payeeDisplay, bankDisplay, payor, checkTypeDisplay, releasedDateValue, dateFrom, dateTo, extraDateLabel, extraDateFrom, extraDateTo }
   ) {
     const config = REPORT_CONFIG[configKey]
     const lines = [{ text: `Reference No: ${referenceNumber || '—'}`, size: 10.5, bold: true, color: HEADER_FILL_COLOR }]
     lines.push({ text: `Client Name: ${payor || '—'}`, size: 11, bold: true })
     lines.push({ text: `Payee: ${payeeDisplay || '—'}`, size: 10 })
     lines.push({ text: `Bank: ${bankDisplay || '—'}`, size: 10 })
+    if (checkTypeDisplay) lines.push({ text: `Check Type: ${checkTypeDisplay}`, size: 10 })
     lines.push({ text: `Report Date: ${formatExcelDateLabel(new Date())}`, size: 10 })
     if (dateFrom || dateTo) {
       const fromLabel = dateFrom ? formatExcelDateLabel(new Date(dateFrom)) : '—'
@@ -1592,6 +1609,7 @@ async function handleRefresh() {
       payeeDisplay: formatMultiSelectDisplay(previewMeta.payeeAll, previewMeta.payees, ALL_PAYEES_LABEL),
       bankDisplay: formatMultiSelectDisplay(previewMeta.bankAll, previewMeta.banks, ALL_BANKS_LABEL),
       payor: previewMeta.payor,
+      checkTypeDisplay: previewMeta.checkType && previewMeta.checkType !== 'all' ? previewMeta.checkType : '',
       releasedDateValue: previewMeta.releasedDate,
       dateFrom: previewMeta.dateFrom,
       dateTo: previewMeta.dateTo,
@@ -1605,7 +1623,8 @@ async function handleRefresh() {
     const safePayor = (previewMeta.payor || 'all-clients').replace(/[^a-z0-9]+/gi, '_')
     const payeeTag = multiSelectFileTag(previewMeta.payeeAll, previewMeta.payees, 'all-payees')
     const bankTag = multiSelectFileTag(previewMeta.bankAll, previewMeta.banks, 'all-banks')
-    return `${config.fileTag}-${safePayor}-${payeeTag}-${bankTag}-${previewMeta.referenceNumber}`
+    const checkTypeTag = previewMeta.checkType && previewMeta.checkType !== 'all' ? previewMeta.checkType.toLowerCase() : 'all-types'
+    return `${config.fileTag}-${safePayor}-${payeeTag}-${bankTag}-${checkTypeTag}-${previewMeta.referenceNumber}`
   }
 
   async function handleDownload() {
@@ -1881,6 +1900,28 @@ async function handleRefresh() {
               )}
             </div>
 
+            <div>
+              <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-gray-500">
+                <Layers className="h-3.5 w-3.5" /> Check type
+              </label>
+              <div className="inline-flex rounded-md border border-gray-200 bg-white p-0.5">
+                {CHECK_TYPE_OPTIONS.map((opt) => (
+                  <button
+                    key={opt.value}
+                    type="button"
+                    onClick={() => setCheckType(opt.value)}
+                    className={
+                      'rounded px-3 py-1.5 text-xs font-medium transition-colors ' +
+                      (checkType === opt.value ? 'bg-teal-600 text-white' : 'text-gray-600 hover:bg-gray-100')
+                    }
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+              <p className="mt-1.5 text-xs text-gray-500">Filters by check type (MC or CC) recorded on each check.</p>
+            </div>
+
             {reportType === 'released' && (
               <label className="flex cursor-pointer items-start gap-2 rounded-md border border-gray-200 bg-gray-50/60 px-3 py-2.5 text-sm text-gray-700">
                 <input
@@ -2041,6 +2082,11 @@ async function handleRefresh() {
                   {activeConfig.cwtAttachedOnly && (
                     <span className="rounded-full bg-teal-50 px-2 py-0.5 text-xs font-medium text-teal-700">2307 on file only</span>
                   )}
+                  {previewMeta.checkType && previewMeta.checkType !== 'all' && (
+                    <span className="rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium text-gray-700">
+                      Check Type: {previewMeta.checkType}
+                    </span>
+                  )}
                   {previewMeta.reportType === 'unreleased' && previewMeta.stalenessFilter !== 'all' && (
                     <span className="rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-700">
                       {previewMeta.stalenessFilter === 'stale' ? `Stale only (${STALE_FIXED_MONTHS}mo+)` : 'Not yet stale only'}
@@ -2059,6 +2105,11 @@ async function handleRefresh() {
                   <span className="font-medium text-gray-700">
                     {formatMultiSelectDisplay(previewMeta.payeeAll, previewMeta.payees, ALL_PAYEES_LABEL)}
                   </span>
+                  {previewMeta.checkType && previewMeta.checkType !== 'all' && (
+                    <>
+                      {' · '}Check Type: <span className="font-medium text-gray-700">{previewMeta.checkType}</span>
+                    </>
+                  )}
                   {(previewMeta.dateFrom || previewMeta.dateTo) && (
                     <>
                       {' · '}Check dates:{' '}
@@ -2340,9 +2391,9 @@ function SummaryStat({ label, value, accent }) {
 
 // Business runs on Philippine time regardless of the browser's local
 // timezone, so billing periods and per-day buckets are always computed
-// against Asia/Manila (UTC+8). This keeps "uploaded" / "delivered" counts
-// from silently dropping records that fall near a period's midnight
-// boundary when a user's browser is set to a different timezone.
+// against Asia/Manila (UTC+8). This keeps "uploaded" counts from silently
+// dropping records that fall near a period's midnight boundary when a
+// user's browser is set to a different timezone.
 const MANILA_OFFSET_MINUTES = 8 * 60
 
 function toManilaDateKey(isoString) {
@@ -2453,7 +2504,6 @@ function BillingReport() {
   const [branchOptions, setBranchOptions] = useState([])
 
   const [unitCost, setUnitCost] = useState('') // rate per item UPLOADED
-  const [deliveredRate, setDeliveredRate] = useState('') // rate per item DELIVERED
   const [checkDateFrom, setCheckDateFrom] = useState('')
   const [checkDateTo, setCheckDateTo] = useState('')
   const [rows, setRows] = useState(null)
@@ -2527,11 +2577,6 @@ function BillingReport() {
       setError('Please enter an uploaded rate greater than zero.')
       return
     }
-    const deliveredRateNum = Number(deliveredRate)
-    if (!deliveredRate || Number.isNaN(deliveredRateNum) || deliveredRateNum <= 0) {
-      setError('Please enter a delivered rate greater than zero.')
-      return
-    }
     if (checkDateFrom && checkDateTo && checkDateFrom > checkDateTo) {
       setError('The check date "from" must be before the check date "to".')
       return
@@ -2559,26 +2604,12 @@ function BillingReport() {
         return query
       })
 
-      const releasedRows = await fetchAllRows(() => {
-        let query = supabase
-          .from('checks')
-          .select('id, picked_up_at, check_date, pickup_branch')
-          .eq('bank', bank)
-          .eq('status', 'picked_up')
-          .gte('picked_up_at', startIso)
-          .lte('picked_up_at', endIso)
-        if (!aggregateAllBranches) query = query.eq('pickup_branch', effectiveBranch)
-        if (checkDateFrom) query = query.gte('check_date', checkDateFrom)
-        if (checkDateTo) query = query.lte('check_date', checkDateTo)
-        return query
-      })
-
-    const byDay = new Map(days.map((d) => [dateKey(d), { uploaded: 0, released: 0 }]))
+    const byDay = new Map(days.map((d) => [dateKey(d), { uploaded: 0 }]))
       const byBranch = new Map()
       function branchBucket(branchName) {
         const key = branchName || '(unassigned)'
         if (!byBranch.has(key)) {
-          byBranch.set(key, { branch: key, uploaded: 0, released: 0, uploadedAmount: 0, releasedAmount: 0 })
+          byBranch.set(key, { branch: key, uploaded: 0, uploadedAmount: 0 })
         }
         return byBranch.get(key)
       }
@@ -2590,15 +2621,6 @@ function BillingReport() {
           const b = branchBucket(r.pickup_branch)
           b.uploaded += 1
           b.uploadedAmount += uploadedRateNum
-        }
-      }
-      for (const r of releasedRows || []) {
-        const k = toManilaDateKey(r.picked_up_at)
-        if (k && byDay.has(k)) byDay.get(k).released += 1
-        if (aggregateAllBranches) {
-          const b = branchBucket(r.pickup_branch)
-          b.released += 1
-          b.releasedAmount += deliveredRateNum
         }
       }
 
@@ -2615,31 +2637,22 @@ function BillingReport() {
             uploaded: null,
             unitCost: uploadedRateNum,
             subtotal: null,
-            released: null,
-            deliveredRate: deliveredRateNum,
-            deliveredSubtotal: null,
-            totalBilling: null,
           }
         }
         const bucket = byDay.get(dateKey(d))
         const uploadedSubtotal = bucket.uploaded * uploadedRateNum
-        const deliveredSubtotal = bucket.released * deliveredRateNum
         return {
           date: d,
           hasData: true,
           uploaded: bucket.uploaded,
           unitCost: uploadedRateNum,
           subtotal: uploadedSubtotal,
-          released: bucket.released,
-          deliveredRate: deliveredRateNum,
-          deliveredSubtotal,
-          totalBilling: uploadedSubtotal + deliveredSubtotal,
         }
       })
 
       const builtBranchBreakdown = aggregateAllBranches
         ? [...byBranch.values()]
-            .map((b) => ({ ...b, totalAmount: b.uploadedAmount + b.releasedAmount }))
+            .map((b) => ({ ...b, totalAmount: b.uploadedAmount }))
             .sort((a, b) => b.totalAmount - a.totalAmount)
         : []
 
@@ -2660,7 +2673,6 @@ function BillingReport() {
         branchLabel,
         branchTag: !isAllBranches ? pickupBranch : aggregateAllBranches ? 'all_branches' : effectiveBranch,
         uploadedRate: uploadedRateNum,
-        deliveredRate: deliveredRateNum,
         periodLabel: selectedPeriod.label,
         checkDateFrom,
         checkDateTo,
@@ -2676,10 +2688,8 @@ function BillingReport() {
 const totals = useMemo(() => {
     if (!rows) return null
     const totalUploadedAmount = rows.reduce((sum, r) => sum + (r.hasData ? r.subtotal : 0), 0)
-    const totalDeliveredAmount = rows.reduce((sum, r) => sum + (r.hasData ? r.deliveredSubtotal : 0), 0)
-    const totalNetOfVat = totalUploadedAmount + totalDeliveredAmount
-    const vat = totalNetOfVat * 0.12
-    return { totalUploadedAmount, totalDeliveredAmount, totalNetOfVat, vat, grandTotal: totalNetOfVat + vat }
+    const vat = totalUploadedAmount * 0.12
+    return { totalUploadedAmount, vat, grandTotal: totalUploadedAmount + vat }
   }, [rows])
 function filenameBase() {
     const safeBank = (reportMeta?.bank || bank || 'bank').replace(/[^a-z0-9]+/gi, '_')
@@ -2701,15 +2711,14 @@ async function handleDownloadExcel() {
       })
       // RTS ("Volume of RTS") column removed — it was never tracked by
       // this system and existed only as a manual-entry placeholder.
+      // Delivered volume/rate/subtotal removed — this report now tracks
+      // Uploaded volume only, with the totals below giving the overall
+      // billing amount.
       const columns = [
         { header: 'Productivity Date', width: 16 },
         { header: 'Uploaded Dispatch Soft File Volume', width: 22 },
         { header: 'Uploaded Rate', width: 14 },
         { header: 'Subtotal Amount Uploaded', width: 20 },
-        { header: 'Volume of Processed Delivered', width: 20 },
-        { header: 'Delivered Rate', width: 14 },
-        { header: 'Subtotal Amount Delivered', width: 20 },
-        { header: 'Total Amount of Billing', width: 18 },
       ]
       sheet.columns = columns.map((c) => ({ width: c.width }))
 
@@ -2782,7 +2791,7 @@ async function handleDownloadExcel() {
 
       // Named indices instead of re-counted by eye — a future column
       // insertion can't silently misalign the numFmt/fill logic below.
-      const MONEY_COL_INDICES = [2, 3, 5, 6, 7] // both rates, both subtotals, total (0-based)
+      const MONEY_COL_INDICES = [2, 3] // uploaded rate, uploaded subtotal (0-based)
 
       for (const row of rows) {
         const excelRow = sheet.getRow(r)
@@ -2792,14 +2801,10 @@ async function handleDownloadExcel() {
               row.uploaded,
               row.unitCost,
               row.subtotal,
-              row.released,
-              row.deliveredRate,
-              row.deliveredSubtotal,
-              row.totalBilling,
             ]
           : [
               row.date.toLocaleDateString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric' }),
-              '', '', '', '', '', '', '',
+              '', '', '',
             ]
         values.forEach((v, i) => {
           const cell = excelRow.getCell(i + 1)
@@ -2823,8 +2828,6 @@ async function handleDownloadExcel() {
       const totalsStartRow = summaryTitleRow + 1
       const totalLines = [
         ['Total Amount Uploaded', totals.totalUploadedAmount],
-        ['Total Amount Delivered', totals.totalDeliveredAmount],
-        ['Total Net of VAT', totals.totalNetOfVat],
         ['12% VAT', totals.vat],
         ['Total Billing Amount', totals.grandTotal],
       ]
@@ -2856,7 +2859,7 @@ async function handleDownloadExcel() {
       })
 
       // Only present when the report aggregated every branch — a second
-      // table showing the same Uploaded/Delivered breakdown PER BRANCH.
+      // table showing the same Uploaded breakdown PER BRANCH.
       if (branchBreakdown.length > 0) {
         let br = totalsStartRow + totalLines.length + 2
         sheet.mergeCells(br, 1, br, columns.length)
@@ -2864,7 +2867,7 @@ async function handleDownloadExcel() {
         sheet.getCell(br, 1).font = { bold: true, size: 11, color: { argb: HEADER_FILL_COLOR } }
         br++
 
-        const breakdownHeaders = ['Branch', 'Uploaded Vol.', 'Uploaded Amount', 'Delivered Vol.', 'Delivered Amount', 'Total Amount']
+        const breakdownHeaders = ['Branch', 'Uploaded Vol.', 'Uploaded Amount']
         const breakdownHeaderRow = sheet.getRow(br)
         breakdownHeaders.forEach((h, i) => {
           const cell = breakdownHeaderRow.getCell(i + 1)
@@ -2878,11 +2881,11 @@ async function handleDownloadExcel() {
 
         for (const b of branchBreakdown) {
           const row = sheet.getRow(br)
-          const values = [b.branch, b.uploaded, b.uploadedAmount, b.released, b.releasedAmount, b.totalAmount]
+          const values = [b.branch, b.uploaded, b.uploadedAmount]
           values.forEach((v, i) => {
             const cell = row.getCell(i + 1)
             cell.value = v
-            if (i === 2 || i === 4 || i === 5) cell.numFmt = '#,##0.00'
+            if (i === 2) cell.numFmt = '#,##0.00'
             cell.alignment = { horizontal: i === 0 ? 'left' : 'right' }
             cell.border = thinBorder()
           })
@@ -2909,7 +2912,6 @@ async function handleDownloadExcel() {
         branch: reportMeta.branchTag,
         period: reportMeta.periodLabel,
         uploaded_rate: reportMeta.uploadedRate,
-        delivered_rate: reportMeta.deliveredRate,
       }).catch(() => {})
     } catch (err) {
       push?.({ variant: 'error', title: 'Download failed', description: friendlyError(err) })
@@ -2962,10 +2964,10 @@ async function handleDownloadExcel() {
         80
       )
 
-      // RTS column removed — see the Excel export note above.
+      // RTS column removed — see the Excel export note above. Delivered
+      // volume/rate/subtotal removed — Uploaded is the only tracked volume.
       const head = [[
         'Productivity Date', 'Uploaded Vol.', 'Uploaded Rate', 'Subtotal Uploaded',
-        'Delivered Vol.', 'Delivered Rate', 'Subtotal Delivered', 'Total Billing',
       ]]
       const body = rows.map((row) =>
         row.hasData
@@ -2974,12 +2976,8 @@ async function handleDownloadExcel() {
               String(row.uploaded),
               row.unitCost.toLocaleString('en-US', { minimumFractionDigits: 2 }),
               row.subtotal.toLocaleString('en-US', { minimumFractionDigits: 2 }),
-              String(row.released),
-              row.deliveredRate.toLocaleString('en-US', { minimumFractionDigits: 2 }),
-              row.deliveredSubtotal.toLocaleString('en-US', { minimumFractionDigits: 2 }),
-              row.totalBilling.toLocaleString('en-US', { minimumFractionDigits: 2 }),
             ]
-          : [row.date.toLocaleDateString('en-US'), '—', '—', '—', '—', '—', '—', '—']
+          : [row.date.toLocaleDateString('en-US'), '—', '—', '—']
       )
 
       autoTable(doc, {
@@ -2989,7 +2987,7 @@ async function handleDownloadExcel() {
         margin: { left: margin, right: margin },
         styles: { fontSize: 8, cellPadding: 4, lineColor: [209, 213, 219], lineWidth: 0.5, textColor: [55, 65, 81] },
         headStyles: { fillColor: BRAND_TEAL_RGB, textColor: 255, fontStyle: 'bold', halign: 'center' },
-        columnStyles: { 2: { halign: 'right' }, 3: { halign: 'right' }, 5: { halign: 'right' }, 6: { halign: 'right' }, 7: { halign: 'right' } },
+        columnStyles: { 2: { halign: 'right' }, 3: { halign: 'right' } },
         didParseCell: (data) => {
           const isFutureRow = rows[data.row.index] && !rows[data.row.index].hasData
           if (data.row.section === 'body' && isFutureRow) {
@@ -3016,10 +3014,6 @@ async function handleDownloadExcel() {
       doc.setTextColor(40, 40, 40)
       doc.text(`Total Amount Uploaded: ${totals.totalUploadedAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, margin, y)
       y += 16
-      doc.text(`Total Amount Delivered: ${totals.totalDeliveredAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, margin, y)
-      y += 16
-      doc.text(`Total Net of VAT: ${totals.totalNetOfVat.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, margin, y)
-      y += 16
       doc.text(`12% VAT: ${totals.vat.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, margin, y)
       y += 20
 
@@ -3035,20 +3029,17 @@ async function handleDownloadExcel() {
         doc.setTextColor(...BRAND_TEAL_RGB)
         doc.text(`VOLUME BY BRANCH — BANK: ${reportMeta.bank}`, margin, y)
         autoTable(doc, {
-          head: [['Branch', 'Uploaded Vol.', 'Uploaded Amount', 'Delivered Vol.', 'Delivered Amount', 'Total Amount']],
+          head: [['Branch', 'Uploaded Vol.', 'Uploaded Amount']],
           body: branchBreakdown.map((b) => [
             b.branch,
             String(b.uploaded),
             b.uploadedAmount.toLocaleString('en-US', { minimumFractionDigits: 2 }),
-            String(b.released),
-            b.releasedAmount.toLocaleString('en-US', { minimumFractionDigits: 2 }),
-            b.totalAmount.toLocaleString('en-US', { minimumFractionDigits: 2 }),
           ]),
           startY: y + 8,
           margin: { left: margin, right: margin },
           styles: { fontSize: 8, cellPadding: 4, lineColor: [209, 213, 219], lineWidth: 0.5, textColor: [55, 65, 81] },
           headStyles: { fillColor: BRAND_TEAL_RGB, textColor: 255, fontStyle: 'bold', halign: 'center' },
-          columnStyles: { 2: { halign: 'right' }, 4: { halign: 'right' }, 5: { halign: 'right' } },
+          columnStyles: { 2: { halign: 'right' } },
         })
       }
 
@@ -3061,7 +3052,6 @@ async function handleDownloadExcel() {
         branch: reportMeta.branchTag,
         period: reportMeta.periodLabel,
         uploaded_rate: reportMeta.uploadedRate,
-        delivered_rate: reportMeta.deliveredRate,
       }).catch(() => {})
     } catch (err) {
       push?.({ variant: 'error', title: 'PDF download failed', description: friendlyError(err) })
@@ -3093,7 +3083,7 @@ return (
       <CardHeader>
         <CardTitle className="text-lg">Billing report</CardTitle>
         <CardDescription>
-          Half-month daily breakdown of uploaded and delivered volume, with VAT totals.
+          Half-month daily breakdown of uploaded volume, with VAT totals.
           {!profileLoading && !isAllBranches && pickupBranch && <> Scoped to your branch: <span className="font-medium text-gray-700">{pickupBranch}</span>.</>}
         </CardDescription>
       </CardHeader>
@@ -3150,11 +3140,6 @@ return (
                 <Input type="number" min="0" step="0.01" value={unitCost} onChange={(e) => setUnitCost(e.target.value)} placeholder="e.g. 5.00" />
                 <p className="mt-1 text-xs text-gray-400">Applied to the daily "Uploaded" volume.</p>
               </div>
-              <div>
-                <label className="mb-1 block text-xs font-medium text-gray-500">Delivered rate (₱ per item)</label>
-                <Input type="number" min="0" step="0.01" value={deliveredRate} onChange={(e) => setDeliveredRate(e.target.value)} placeholder="e.g. 7.00" />
-                <p className="mt-1 text-xs text-gray-400">Applied to the daily "Delivered" volume — intentionally a different rate.</p>
-              </div>
             </div>
 
             <div className="grid gap-4 rounded-md border border-gray-200 bg-gray-50/60 px-3 py-3 sm:grid-cols-2">
@@ -3197,7 +3182,7 @@ return (
              <table className="w-full border-collapse text-sm">
                 <thead className="sticky top-0 z-10">
                   <tr>
-                    {['Date', 'Uploaded Vol.', 'Uploaded Rate', 'Subtotal Uploaded', 'Delivered Vol.', 'Delivered Rate', 'Subtotal Delivered', 'Total Billing'].map((h) => (
+                    {['Date', 'Uploaded Vol.', 'Uploaded Rate', 'Subtotal Uploaded'].map((h) => (
                       <th key={h} className="whitespace-nowrap border-b border-gray-200 bg-teal-600 px-3 py-2 text-left text-xs font-semibold text-white">{h}</th>
                     ))}
                   </tr>
@@ -3214,12 +3199,8 @@ return (
                       <td className="px-3 py-1.5 text-center">{row.date.toLocaleDateString('en-US')}</td>
                       <td className="px-3 py-1.5 text-center">{row.hasData ? row.uploaded : '—'}</td>
                       <td className="px-3 py-1.5 text-right">{row.hasData ? row.unitCost.toFixed(2) : '—'}</td>
-                      <td className="px-3 py-1.5 text-right">{row.hasData ? row.subtotal.toFixed(2) : '—'}</td>
-                      <td className="px-3 py-1.5 text-center">{row.hasData ? row.released : '—'}</td>
-                      <td className="px-3 py-1.5 text-right">{row.hasData ? row.deliveredRate.toFixed(2) : '—'}</td>
-                      <td className="px-3 py-1.5 text-right">{row.hasData ? row.deliveredSubtotal.toFixed(2) : '—'}</td>
                       <td className="px-3 py-1.5 text-right font-medium">
-                        {row.hasData ? row.totalBilling.toFixed(2) : '—'}
+                        {row.hasData ? row.subtotal.toFixed(2) : '—'}
                       </td>
                     </tr>
                   ))}
@@ -3241,7 +3222,7 @@ return (
                   <table className="w-full border-collapse text-xs">
                     <thead>
                       <tr>
-                        {['Branch', 'Uploaded Vol.', 'Uploaded Amount', 'Delivered Vol.', 'Delivered Amount', 'Total Amount'].map((h) => (
+                        {['Branch', 'Uploaded Vol.', 'Uploaded Amount'].map((h) => (
                           <th key={h} className="whitespace-nowrap border-b border-teal-100 px-3 py-1.5 text-left font-semibold text-teal-700">{h}</th>
                         ))}
                       </tr>
@@ -3251,10 +3232,7 @@ return (
                         <tr key={b.branch} className="border-b border-gray-100 last:border-0">
                           <td className="px-3 py-1.5">{b.branch}</td>
                           <td className="px-3 py-1.5 text-right">{b.uploaded}</td>
-                          <td className="px-3 py-1.5 text-right">{formatCurrency(b.uploadedAmount)}</td>
-                          <td className="px-3 py-1.5 text-right">{b.released}</td>
-                          <td className="px-3 py-1.5 text-right">{formatCurrency(b.releasedAmount)}</td>
-                          <td className="px-3 py-1.5 text-right font-medium">{formatCurrency(b.totalAmount)}</td>
+                          <td className="px-3 py-1.5 text-right font-medium">{formatCurrency(b.uploadedAmount)}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -3267,8 +3245,6 @@ return (
               <div className="space-y-0.5 text-gray-700">
                 <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-teal-700">Billing Summary</div>
                 <div>Total Amount Uploaded: <span className="font-semibold">{formatCurrency(totals.totalUploadedAmount)}</span></div>
-                <div>Total Amount Delivered: <span className="font-semibold">{formatCurrency(totals.totalDeliveredAmount)}</span></div>
-                <div>Total Net of VAT: <span className="font-semibold">{formatCurrency(totals.totalNetOfVat)}</span></div>
                 <div>12% VAT: <span className="font-semibold">{formatCurrency(totals.vat)}</span></div>
                 <div className="mt-1 text-base">Total Billing Amount: <span className="font-bold text-teal-700">{formatCurrency(totals.grandTotal)}</span></div>
               </div>
