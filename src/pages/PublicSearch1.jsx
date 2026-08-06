@@ -1542,9 +1542,9 @@ function Hero() {
       <div className="grid grid-cols-1 md:grid-cols-2 gap-8 items-center h-full">
         <div className="relative z-10 flex flex-col justify-center px-6 py-11 sm:px-12 sm:py-14 md:pr-0">
           <h1 className="font-display text-4xl font-extrabold leading-tight sm:text-5xl lg:text-6xl">
-            Scan &amp; Collect
+            Check Releasing
             <br />
-            <span className="text-[var(--accent)]">Checks</span>
+            <span className="text-[var(--accent)]">System</span>
           </h1>
           <p className="mt-6 max-w-sm text-base font-medium leading-relaxed text-[var(--brand-light)]">
             Enter a payee and payor to see how many checks are ready across every branch — then reserve them for
